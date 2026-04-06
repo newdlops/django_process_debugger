@@ -2,13 +2,27 @@
   "name": "django-process-debugger",
   "displayName": "Django Process Debugger",
   "description": "Attach debugpy to a running Django process for runtime debugging without modifying your codebase",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "publisher": "lky",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lky/django-process-debugger"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
     "Debuggers"
+  ],
+  "keywords": [
+    "django",
+    "python",
+    "debugger",
+    "debugpy",
+    "attach",
+    "macos",
+    "apple-silicon"
   ],
   "activationEvents": [],
   "main": "./out/extension.js",
