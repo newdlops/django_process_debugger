@@ -318,6 +318,10 @@ export class DebugpyInjector {
    * Check if a port is being listened on WITHOUT connecting to it.
    * Uses lsof to avoid consuming debugpy's single-client slot.
    */
+  async isPortListeningPublic(port: number): Promise<boolean> {
+    return this.isPortListening(port);
+  }
+
   private async isPortListening(port: number): Promise<boolean> {
     try {
       const { stdout } = await execFileAsync('lsof', [

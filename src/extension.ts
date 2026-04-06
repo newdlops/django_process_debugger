@@ -267,27 +267,23 @@ export function activate(context: vscode.ExtensionContext) {
       // Check if another VS Code window already has an active debug session
       const existingLock = readLock();
       if (existingLock && existingLock.workspaceId !== getWorkspaceId()) {
-        // Verify the lock is still valid (process still alive)
-        let lockStale = false;
+        // Verify the lock is still valid: process alive AND port still listening
+        let lockValid = false;
         try {
-          process.kill(existingLock.pid, 0);
+          process.kill(existingLock.pid, 0); // process alive?
+          lockValid = await injector.isPortListeningPublic(existingLock.port);
         } catch {
-          lockStale = true;
+          lockValid = false;
         }
 
-        if (!lockStale) {
+        if (lockValid) {
           log(`Active debug session detected from workspace "${existingLock.workspaceName}" (PID ${existingLock.pid})`);
-          const choice = await vscode.window.showWarningMessage(
-            `A debug session is already active in workspace "${existingLock.workspaceName}" ` +
-            `(PID ${existingLock.pid}, port ${existingLock.port}).\n` +
-            `Starting another session may cause conflicts.`,
-            'Attach Anyway',
-            'Cancel',
+          vscode.window.showErrorMessage(
+            `Cannot attach: a debug session is already active in workspace "${existingLock.workspaceName}" ` +
+            `(PID ${existingLock.pid}, port ${existingLock.port}). ` +
+            `Stop the existing session first.`
           );
-          if (choice !== 'Attach Anyway') {
-            log('User cancelled due to existing debug session');
-            return;
-          }
+          return;
         } else {
           log('Found stale lock file, removing');
           removeLock();
