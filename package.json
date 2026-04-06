@@ -1,0 +1,83 @@
+{
+  "name": "django-process-debugger",
+  "displayName": "Django Process Debugger",
+  "description": "Attach debugpy to a running Django process for runtime debugging without modifying your codebase",
+  "version": "0.0.1",
+  "publisher": "lky",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "djangoProcessDebugger.findDjangoProcesses",
+        "title": "Django Debugger: Find Django Processes"
+      },
+      {
+        "command": "djangoProcessDebugger.attachToProcess",
+        "title": "Django Debugger: Attach to Django Process"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "django-process",
+        "label": "Django Process Debugger",
+        "languages": [
+          "python"
+        ],
+        "configurationAttributes": {
+          "attach": {
+            "properties": {
+              "pid": {
+                "type": "number",
+                "description": "PID of the Django process to attach to"
+              },
+              "host": {
+                "type": "string",
+                "default": "127.0.0.1",
+                "description": "Host for debugpy listener"
+              },
+              "port": {
+                "type": "number",
+                "default": 5678,
+                "description": "Port for debugpy listener"
+              }
+            }
+          }
+        },
+        "configurationSnippets": [
+          {
+            "label": "Django Process Debugger: Attach",
+            "description": "Attach to a running Django process",
+            "body": {
+              "type": "django-process",
+              "request": "attach",
+              "name": "Attach to Django Process",
+              "host": "127.0.0.1",
+              "port": 5678
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "typescript": "^5.3.0"
+  }
+}
