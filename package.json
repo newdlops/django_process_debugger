@@ -3,7 +3,7 @@
   "displayName": "Django Process Debugger",
   "description": "Attach debugpy to a running Django process for runtime debugging without modifying your codebase",
   "version": "0.1.0",
-  "publisher": "lky",
+  "publisher": "newdlops",
   "license": "MIT",
   "repository": {
     "type": "git",
