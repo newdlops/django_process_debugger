@@ -1,87 +1,385 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import { log, logError } from './logger';
 
 const execFileAsync = promisify(execFile);
 
+const PTH_FILENAME = 'django_process_debugger.pth';
+const BOOTSTRAP_MODULE = '_django_debug_bootstrap';
+
+/**
+ * Bootstrap script installed into the target venv's site-packages.
+ * Installs a SIGUSR1 handler that starts debugpy on demand.
+ *
+ * The bundled debugpy path is read from a companion config file
+ * so we don't need env vars.
+ */
+/**
+ * Port file path: the extension writes the desired port here before
+ * sending SIGUSR1. The bootstrap reads it to know which port to listen on.
+ * Using a file avoids the problem of not being able to set env vars on
+ * an already-running process.
+ */
+const PORT_FILE_DIR = '/tmp/django-process-debugger';
+function portFilePath(pid: number): string {
+  return `${PORT_FILE_DIR}/${pid}.port`;
+}
+
+function makeBootstrapScript(bundledDebugpyPath: string): string {
+  // Build Python source as plain string concatenation to avoid
+  // JS template literal ${} clashing with Python f-string {}.
+  const lines = [
+    'import signal as _signal',
+    'import sys as _sys',
+    'import os as _os',
+    'import traceback as _traceback',
+    '',
+    '_PORT_FILE_DIR = ' + JSON.stringify(PORT_FILE_DIR),
+    '_LOG_FILE = _PORT_FILE_DIR + "/bootstrap.log"',
+    '',
+    'def _dbg_log(msg):',
+    '    try:',
+    '        with open(_LOG_FILE, "a") as _f:',
+    '            _f.write(f"[PID {_os.getpid()}] {msg}\\n")',
+    '    except Exception:',
+    '        pass',
+    '',
+    '_dbg_log("Bootstrap module loaded, installing SIGUSR1 handler")',
+    '',
+    'def _django_debugger_signal_handler(signum, frame):',
+    '    """Start debugpy listener on SIGUSR1."""',
+    '    _dbg_log("SIGUSR1 received")',
+    '    # Check if debugpy is already active for this process',
+    '    _active_file = f"{_PORT_FILE_DIR}/{_os.getpid()}.active"',
+    '    try:',
+    '        with open(_active_file) as _f:',
+    '            _existing_port = _f.read().strip()',
+    '        _dbg_log(f"debugpy already active on port {_existing_port}, skipping")',
+    '        return',
+    '    except FileNotFoundError:',
+    '        pass',
+    '    _bundled = ' + JSON.stringify(bundledDebugpyPath),
+    '    if _bundled and _bundled not in _sys.path:',
+    '        _sys.path.insert(0, _bundled)',
+    '        _dbg_log(f"Added bundled path: {_bundled}")',
+    '    try:',
+    '        import debugpy',
+    '        _dbg_log(f"debugpy imported from {debugpy.__file__}")',
+    '        _port_file = f"{_PORT_FILE_DIR}/{_os.getpid()}.port"',
+    '        _port = 5678',
+    '        try:',
+    '            with open(_port_file) as _f:',
+    '                _port = int(_f.read().strip())',
+    '            _os.unlink(_port_file)',
+    '            _dbg_log(f"Read port {_port} from {_port_file}")',
+    '        except FileNotFoundError:',
+    '            _dbg_log(f"Port file not found: {_port_file}, using default {_port}")',
+    '        except ValueError as ve:',
+    '            _dbg_log(f"Bad port file content: {ve}")',
+    '        debugpy.listen(("127.0.0.1", _port))',
+    '        # Write active file so subsequent SIGUSR1s know debugpy is running',
+    '        with open(_active_file, "w") as _f:',
+    '            _f.write(str(_port))',
+    '        _dbg_log(f"debugpy listening on 127.0.0.1:{_port}")',
+    '    except RuntimeError as e:',
+    '        if "already" in str(e).lower():',
+    '            _dbg_log(f"debugpy already listening: {e}")',
+    '        else:',
+    '            _dbg_log(f"RuntimeError: {e}\\n{_traceback.format_exc()}")',
+    '    except Exception as e:',
+    '        _dbg_log(f"ERROR: {e}\\n{_traceback.format_exc()}")',
+    '',
+    '_signal.signal(_signal.SIGUSR1, _django_debugger_signal_handler)',
+    '_dbg_log("SIGUSR1 handler installed")',
+    '',
+  ];
+  return lines.join('\n');
+}
+
+/**
+ * .pth file content — Python executes lines starting with "import" in .pth
+ * files during site-packages initialization.
+ */
+const PTH_CONTENT = `import ${BOOTSTRAP_MODULE}\n`;
+
 export class DebugpyInjector {
+  private bundledDebugpyPath: string | null = null;
+
+  setBundledDebugpyPath(dir: string): void {
+    this.bundledDebugpyPath = dir;
+    log(`[Injector] Bundled debugpy path set to: ${dir}`);
+  }
+
   /**
-   * Inject debugpy into a running Python process.
-   *
-   * This uses the target process's Python interpreter to execute a
-   * small bootstrap script that imports debugpy and starts listening,
-   * without modifying any workspace files.
+   * Install the debug bootstrap into a venv's site-packages.
+   * This makes ALL Python processes using this venv load the SIGUSR1 handler.
+   * Requires restarting the Django server after installation.
    */
-  async inject(pid: number, port: number): Promise<void> {
-    const pythonPath = await this.resolvePythonForPid(pid);
+  async installBootstrap(venvSitePackages: string): Promise<void> {
+    if (!this.bundledDebugpyPath) {
+      throw new Error('Bundled debugpy path not set');
+    }
 
-    // Verify debugpy is available in the target environment
-    await this.ensureDebugpyAvailable(pythonPath);
+    const pthPath = path.join(venvSitePackages, PTH_FILENAME);
+    const modulePath = path.join(venvSitePackages, `${BOOTSTRAP_MODULE}.py`);
 
-    // Use debugpy's ability to attach to a running process by PID
-    // This injects the debug adapter into the target process at runtime
-    const script = `
-import debugpy
-debugpy.listen(("127.0.0.1", ${port}))
-print("debugpy listening on port ${port}")
-`;
+    log(`[Injector] Installing bootstrap to ${venvSitePackages}`);
+    log(`[Injector]   .pth file: ${pthPath}`);
+    log(`[Injector]   module: ${modulePath}`);
 
-    try {
-      await execFileAsync(pythonPath, [
-        '-c',
-        `import debugpy; debugpy.attach_pid(${pid}, ("127.0.0.1", ${port}))`,
-      ], {
-        timeout: 10_000,
-      });
-    } catch (err: unknown) {
-      throw new DebugpyInjectionError(
-        `Failed to inject debugpy into PID ${pid}`,
-        pid,
-        port,
-        err instanceof Error ? err : new Error(String(err)),
-      );
+    await fs.writeFile(modulePath, makeBootstrapScript(this.bundledDebugpyPath), 'utf-8');
+    await fs.writeFile(pthPath, PTH_CONTENT, 'utf-8');
+
+    log(`[Injector] Bootstrap installed successfully`);
+  }
+
+  /**
+   * Remove the debug bootstrap from a venv's site-packages.
+   */
+  async uninstallBootstrap(venvSitePackages: string): Promise<void> {
+    const pthPath = path.join(venvSitePackages, PTH_FILENAME);
+    const modulePath = path.join(venvSitePackages, `${BOOTSTRAP_MODULE}.py`);
+
+    for (const f of [pthPath, modulePath]) {
+      try {
+        await fs.unlink(f);
+        log(`[Injector] Removed: ${f}`);
+      } catch {
+        // already gone
+      }
     }
   }
 
-  private async resolvePythonForPid(pid: number): Promise<string> {
+  /**
+   * Check if the bootstrap is installed in a venv.
+   */
+  async isBootstrapInstalled(venvSitePackages: string): Promise<boolean> {
     try {
-      // On macOS, resolve the python path from /proc equivalent
+      await fs.access(path.join(venvSitePackages, PTH_FILENAME));
+      await fs.access(path.join(venvSitePackages, `${BOOTSTRAP_MODULE}.py`));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Resolve the site-packages directory for a venv from a running process's
+   * python path.
+   */
+  async resolveSitePackages(pythonPath: string): Promise<string> {
+    try {
+      const { stdout } = await execFileAsync(pythonPath, [
+        '-c',
+        'import site; print(site.getsitepackages()[0])',
+      ]);
+      const dir = stdout.trim();
+      log(`[Injector] Resolved site-packages: ${dir}`);
+      return dir;
+    } catch (err) {
+      logError(`[Injector] Failed to resolve site-packages for ${pythonPath}`, err);
+      // Fallback: guess from pythonPath
+      // e.g. /path/to/.venv/bin/python3 -> /path/to/.venv/lib/python3.X/site-packages
+      const venvDir = path.resolve(path.dirname(pythonPath), '..');
+      const libDir = path.join(venvDir, 'lib');
+      try {
+        const entries = await fs.readdir(libDir);
+        const pyDir = entries.find((e) => e.startsWith('python'));
+        if (pyDir) {
+          return path.join(libDir, pyDir, 'site-packages');
+        }
+      } catch {
+        // ignore
+      }
+      throw new Error(`Could not determine site-packages for ${pythonPath}`);
+    }
+  }
+
+  /**
+   * Resolve the python path from a running process PID.
+   */
+  async resolvePythonForPid(pid: number): Promise<string> {
+    try {
       const { stdout } = await execFileAsync('ps', [
         '-p', String(pid), '-o', 'command=',
       ]);
-      const match = stdout.trim().match(/^(\S*python\S*)/);
+      const fullCmd = stdout.trim();
+      log(`[Injector] ps output for PID=${pid}: ${fullCmd}`);
+      const match = fullCmd.match(/^(\S*python\S*)/);
       return match ? match[1] : 'python3';
-    } catch {
+    } catch (err) {
+      logError(`[Injector] Failed to resolve python path for PID=${pid}`, err);
       return 'python3';
     }
   }
 
-  private async ensureDebugpyAvailable(pythonPath: string): Promise<void> {
+  /**
+   * Verify the bootstrap is loaded in the target process by checking
+   * if the module is importable from the process's python.
+   * This prevents sending SIGUSR1 to an unprotected process (which would kill it).
+   */
+  async verifyBootstrapLoaded(pythonPath: string): Promise<boolean> {
     try {
-      await execFileAsync(pythonPath, ['-c', 'import debugpy']);
+      await execFileAsync(pythonPath, [
+        '-c', `import ${BOOTSTRAP_MODULE}`,
+      ], { timeout: 5000 });
+      return true;
     } catch {
-      throw new DebugpyNotFoundError(pythonPath);
+      return false;
     }
   }
-}
 
-export class DebugpyInjectionError extends Error {
-  constructor(
-    message: string,
-    public readonly pid: number,
-    public readonly port: number,
-    public readonly cause: Error,
-  ) {
-    super(message);
-    this.name = 'DebugpyInjectionError';
+  /**
+   * Check if debugpy is already active for a given PID.
+   * Returns the port if active, null otherwise.
+   */
+  async getActivePort(pid: number): Promise<number | null> {
+    const activeFile = path.join(PORT_FILE_DIR, `${pid}.active`);
+    try {
+      const content = await fs.readFile(activeFile, 'utf-8');
+      const port = parseInt(content.trim(), 10);
+      if (!isNaN(port) && await this.isPortListening(port)) {
+        return port;
+      }
+      // Stale active file — debugpy no longer listening
+      await fs.unlink(activeFile).catch(() => {});
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Activate debugpy in a running Django process by sending SIGUSR1.
+   * Returns the port debugpy is listening on.
+   *
+   * If debugpy is already active, returns the existing port.
+   * SAFETY: Will NOT send SIGUSR1 unless the bootstrap module is confirmed
+   * importable, because Python's default SIGUSR1 handler terminates the process.
+   */
+  async activate(pid: number, port: number): Promise<number> {
+    log(`[Injector] Activating debugpy for PID=${pid} port=${port}`);
+
+    this.verifyProcessAlive(pid);
+    log(`[Injector] Process ${pid} is alive`);
+
+    // Check if debugpy is already active for this PID
+    const existingPort = await this.getActivePort(pid);
+    if (existingPort !== null) {
+      log(`[Injector] debugpy already active for PID=${pid} on port ${existingPort}`);
+      return existingPort;
+    }
+
+    // SAFETY: Verify bootstrap is installed before sending SIGUSR1
+    const pythonPath = await this.resolvePythonForPid(pid);
+    const bootstrapReady = await this.verifyBootstrapLoaded(pythonPath);
+    if (!bootstrapReady) {
+      log(`[Injector] Bootstrap module not importable from ${pythonPath}`);
+      throw new BootstrapNotInstalledError(pid);
+    }
+    log(`[Injector] Bootstrap module verified as importable`);
+
+    // Write the desired port to a file the bootstrap will read
+    await fs.mkdir(PORT_FILE_DIR, { recursive: true });
+    await fs.writeFile(portFilePath(pid), String(port), 'utf-8');
+    log(`[Injector] Wrote port file: ${portFilePath(pid)} = ${port}`);
+
+    // Send SIGUSR1 to trigger the bootstrap signal handler
+    log(`[Injector] Sending SIGUSR1 to PID=${pid}`);
+    try {
+      process.kill(pid, 'SIGUSR1');
+    } catch (err) {
+      logError(`[Injector] Failed to send SIGUSR1 to PID=${pid}`, err);
+      throw new SignalError(pid, err instanceof Error ? err : new Error(String(err)));
+    }
+
+    // Wait for debugpy to start listening (via lsof, non-invasive)
+    log(`[Injector] Waiting for debugpy to listen on port ${port}...`);
+    const listening = await this.waitForPortListening(port, 5000);
+    if (!listening) {
+      log(`[Injector] Port ${port} not open after SIGUSR1`);
+      throw new BootstrapNotLoadedError(pid, port);
+    }
+    log(`[Injector] debugpy is listening on port ${port}`);
+    return port;
+  }
+
+  private verifyProcessAlive(pid: number): void {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      throw new ProcessNotFoundError(pid);
+    }
+  }
+
+  /**
+   * Check if a port is being listened on WITHOUT connecting to it.
+   * Uses lsof to avoid consuming debugpy's single-client slot.
+   */
+  private async isPortListening(port: number): Promise<boolean> {
+    try {
+      const { stdout } = await execFileAsync('lsof', [
+        '-i', `TCP:${port}`, '-sTCP:LISTEN', '-P', '-n',
+      ]);
+      return stdout.trim().length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Wait for a port to start listening, checked via lsof (non-invasive).
+   */
+  private async waitForPortListening(port: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await this.isPortListening(port)) {
+        return true;
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return false;
   }
 }
 
-export class DebugpyNotFoundError extends Error {
-  constructor(public readonly pythonPath: string) {
+export class ProcessNotFoundError extends Error {
+  constructor(public readonly pid: number) {
+    super(`Process ${pid} does not exist or has already exited.`);
+    this.name = 'ProcessNotFoundError';
+  }
+}
+
+export class SignalError extends Error {
+  constructor(
+    public readonly pid: number,
+    public readonly cause: Error,
+  ) {
+    super(`Failed to send SIGUSR1 to PID ${pid}: ${cause.message}`);
+    this.name = 'SignalError';
+  }
+}
+
+export class BootstrapNotInstalledError extends Error {
+  constructor(public readonly pid: number) {
     super(
-      `debugpy is not installed in the Python environment at "${pythonPath}". ` +
-      `Install it with: ${pythonPath} -m pip install debugpy`
+      `Debug bootstrap is not installed in the target venv. ` +
+      `Run "Django Debugger: Setup" first, then restart your Django server.`
     );
-    this.name = 'DebugpyNotFoundError';
+    this.name = 'BootstrapNotInstalledError';
+  }
+}
+
+export class BootstrapNotLoadedError extends Error {
+  constructor(
+    public readonly pid: number,
+    public readonly port: number,
+  ) {
+    super(
+      `Sent SIGUSR1 to PID ${pid} but debugpy did not start listening on port ${port}. ` +
+      `The Django process was likely not started with the debug bootstrap loaded.`
+    );
+    this.name = 'BootstrapNotLoadedError';
   }
 }

@@ -1,19 +1,18 @@
 import * as vscode from 'vscode';
 import { DebugpyInjector } from './debugpyInjector';
-import { DiagnosticReporter } from './diagnostics';
+import { log, logError, getLogger } from './logger';
 
 /**
  * Bridges between our "django-process" debug type and the underlying
  * debugpy debug adapter. When VS Code starts a "django-process" attach
- * session, this factory injects debugpy into the target process first,
- * then delegates to the debugpy extension's adapter.
+ * session, this factory activates debugpy via SIGUSR1 first,
+ * then delegates to debugpy's adapter via TCP.
  */
 export class DjangoDebugSessionFactory
   implements vscode.DebugAdapterDescriptorFactory
 {
   constructor(
     private readonly injector: DebugpyInjector,
-    private readonly diagnostics: DiagnosticReporter,
   ) {}
 
   async createDebugAdapterDescriptor(
@@ -24,17 +23,22 @@ export class DjangoDebugSessionFactory
     const host: string = config.host ?? '127.0.0.1';
     const port: number = config.port ?? 5678;
 
+    log(`[DebugSession] createDebugAdapterDescriptor: pid=${pid} host=${host} port=${port}`);
+
     if (pid) {
       try {
-        await this.injector.inject(pid, port);
+        await this.injector.activate(pid, port);
+        log(`[DebugSession] Activation succeeded, connecting to ${host}:${port}`);
       } catch (err) {
-        const message = this.diagnostics.diagnoseAttachFailure(err, { pid, arch: process.arch });
-        vscode.window.showErrorMessage(message);
+        logError(`[DebugSession] Activation failed`, err);
+        const msg = err instanceof Error ? err.message : String(err);
+        vscode.window.showErrorMessage(msg, 'Show Logs').then((c) => {
+          if (c === 'Show Logs') { getLogger().show(); }
+        });
         return null;
       }
     }
 
-    // Delegate to debugpy's debug adapter via TCP connection
     return new vscode.DebugAdapterServer(port, host);
   }
 }

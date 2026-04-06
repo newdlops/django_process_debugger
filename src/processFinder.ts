@@ -1,5 +1,6 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { log, logError } from './logger';
 
 const execFileAsync = promisify(execFile);
 
@@ -17,10 +18,8 @@ export class DjangoProcessFinder {
    */
   async findDjangoProcesses(): Promise<DjangoProcess[]> {
     try {
-      // ps on macOS: list all processes with full command
-      const { stdout } = await execFileAsync('ps', [
-        'aux',
-      ]);
+      const { stdout } = await execFileAsync('ps', ['aux']);
+      log(`[ProcessFinder] ps aux returned ${stdout.split('\n').length} lines`);
 
       const lines = stdout.split('\n');
       const processes: DjangoProcess[] = [];
@@ -30,14 +29,17 @@ export class DjangoProcessFinder {
           continue;
         }
 
+        log(`[ProcessFinder] Matched line: ${line.trim()}`);
         const parsed = this.parsePsLine(line);
         if (parsed) {
           processes.push(parsed);
         }
       }
 
+      log(`[ProcessFinder] Found ${processes.length} Django process(es)`);
       return processes;
-    } catch {
+    } catch (err) {
+      logError('[ProcessFinder] Failed to run ps', err);
       return [];
     }
   }
