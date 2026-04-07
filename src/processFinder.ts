@@ -93,6 +93,7 @@ export class DjangoProcessFinder {
     }
 
     const command = parts.slice(10).join(' ');
+
     const pythonPath = this.extractPythonPath(command);
     const type = this.classifyProcess(command) ?? 'django';
 
@@ -164,5 +165,73 @@ export class DjangoProcessFinder {
       // lsof may fail for permission reasons — that's fine
     }
     return undefined;
+  }
+
+  /**
+   * Given a selected PID, resolve to the actual debuggable Python process.
+   *
+   * Django process tree:
+   *   uv run python manage.py runserver 8004     (wrapper — not Python)
+   *     └─ .venv/bin/python3 manage.py runserver 8004  (parent — autoreloader)
+   *          └─ .venv/bin/python3 manage.py runserver 8004  (child — actual server)
+   *
+   * We want the deepest Python child that matches the same server pattern.
+   * If the selected PID is already the leaf, return it as-is.
+   */
+  async resolveDebuggablePid(pid: number): Promise<{ pid: number; pythonPath: string }> {
+    // Build a map of pid -> { command, children }
+    const { stdout } = await execFileAsync('ps', ['-eo', 'pid,ppid,command']);
+    const lines = stdout.trim().split('\n').slice(1); // skip header
+
+    interface ProcInfo { pid: number; ppid: number; command: string }
+    const procs: ProcInfo[] = [];
+    for (const line of lines) {
+      const parts = line.trim().split(/\s+/);
+      const p = parseInt(parts[0], 10);
+      const pp = parseInt(parts[1], 10);
+      const cmd = parts.slice(2).join(' ');
+      if (!isNaN(p) && !isNaN(pp)) {
+        procs.push({ pid: p, ppid: pp, command: cmd });
+      }
+    }
+
+    const childrenOf = (parentPid: number): ProcInfo[] =>
+      procs.filter((p) => p.ppid === parentPid);
+
+    const isPythonProcess = (cmd: string): boolean =>
+      /python\d?(\.\d+)*\s/.test(cmd) || /\/python\d?(\.\d+)*$/.test(cmd);
+
+    const extractPython = (cmd: string): string => {
+      const m = cmd.match(/(\S*python\S*)/);
+      return m ? m[1] : 'python3';
+    };
+
+    // Walk down from selected PID to find the deepest Python child
+    let current = pid;
+    let bestPid = pid;
+    let bestPythonPath = 'python3';
+
+    // First, check the selected process itself
+    const selectedProc = procs.find((p) => p.pid === pid);
+    if (selectedProc && isPythonProcess(selectedProc.command)) {
+      bestPythonPath = extractPython(selectedProc.command);
+    }
+
+    // Walk down the tree (max 5 levels to avoid infinite loops)
+    for (let depth = 0; depth < 5; depth++) {
+      const children = childrenOf(current);
+      // Find a Python child that matches our server patterns
+      const pythonChild = children.find((c) =>
+        isPythonProcess(c.command) && this.classifyProcess(c.command) !== null
+      );
+      if (!pythonChild) { break; }
+
+      bestPid = pythonChild.pid;
+      bestPythonPath = extractPython(pythonChild.command);
+      current = pythonChild.pid;
+    }
+
+    log(`[ProcessFinder] resolveDebuggablePid: ${pid} → ${bestPid} (${bestPythonPath})`);
+    return { pid: bestPid, pythonPath: bestPythonPath };
   }
 }

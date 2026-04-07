@@ -372,19 +372,44 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      const items = await Promise.all(processes.map(async (p) => {
-        const icon = p.type === 'celery' ? '$(server-process)' : '$(globe)';
-        const typeLabel = p.type === 'celery' ? 'Celery Worker' : 'Django Server';
-        const activePort = await injector.getActivePort(p.pid);
+      // Group by port to deduplicate parent/child processes on the same server
+      // Show one entry per port (or per unique celery worker)
+      const portGroups = new Map<string, typeof processes>();
+      for (const p of processes) {
+        const key = p.type === 'celery'
+          ? `celery-${p.pid}`  // each celery worker is unique
+          : `${p.port ?? 'no-port'}-${p.type}`;
+        const group = portGroups.get(key) ?? [];
+        group.push(p);
+        portGroups.set(key, group);
+      }
+
+      const items = await Promise.all([...portGroups.values()].map(async (group) => {
+        // Pick the representative: prefer the one with the highest CPU (active child)
+        const representative = group[0];
+        const allPids = group.map((p) => p.pid);
+        const icon = representative.type === 'celery' ? '$(server-process)' : '$(globe)';
+        const typeLabel = representative.type === 'celery' ? 'Celery Worker' : 'Django Server';
+
+        // Check debugpy status for any pid in the group
+        let activePort: number | null = null;
+        for (const p of group) {
+          activePort = await injector.getActivePort(p.pid);
+          if (activePort) { break; }
+        }
         const portStatus = activePort
-          ? `$(debug-alt) Port ${activePort} — debugpy active`
+          ? `$(debug-alt) debugpy active on ${activePort}`
           : '$(circle-slash) debugpy not attached';
-        const portLabel = p.port ? ` | Port: ${p.port}` : '';
+        const portLabel = representative.port ? ` | Port: ${representative.port}` : '';
+        const pidLabel = allPids.length > 1
+          ? `PIDs: ${allPids.join(', ')}`
+          : `PID: ${allPids[0]}`;
+
         return {
-          label: `${icon} [${typeLabel}] PID: ${p.pid}${portLabel}`,
-          description: p.command,
-          detail: `${portStatus}  |  Python: ${p.pythonPath}`,
-          process: p,
+          label: `${icon} [${typeLabel}] ${pidLabel}${portLabel}`,
+          description: representative.command,
+          detail: `${portStatus}  |  Python: ${representative.pythonPath}`,
+          process: representative,
         };
       }));
 
@@ -397,9 +422,12 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      const pid = selected.process.pid;
+      // Resolve to the actual debuggable Python process
+      // (walks down from uv wrapper → autoreloader → actual server)
+      const resolved = await processFinder.resolveDebuggablePid(selected.process.pid);
+      const pid = resolved.pid;
       const port = await findFreePort();
-      log(`Attaching to PID=${pid} on port=${port}`);
+      log(`Selected PID=${selected.process.pid} → resolved to PID=${pid} (${resolved.pythonPath})`);
 
       // Check if another VS Code window already has an active debug session
       const existingLock = readLock();
@@ -663,29 +691,64 @@ export function activate(context: vscode.ExtensionContext) {
         }
       } catch { /* not found */ }
 
-      // ── 3. Kill zombie language server & debugpy processes ──
+      // ── 3. Kill ALL Python processes (thorough clean) ──
+      // Clean All is a full reset — kill every Python process except VS Code internals.
       try {
         const { stdout } = await execFileAsync('ps', ['aux']);
-        const lsPatterns = [
-          /jedi[-_]language[-_]server/i,
-          /pylance/i,
-          /pyright/i,
-          /python.*language.server/i,
-        ];
-        const killed: number[] = [];
+        const myPid = process.pid;
+        const myPpid = (await execFileAsync('ps', ['-o', 'ppid=', '-p', String(myPid)])).stdout.trim();
+
+        // Match any line with a python binary in the command
+        const pythonBinPattern = /python\d?(\.\d+)*/;
+
+        const killed: { pid: number; label: string; command: string }[] = [];
+
         for (const line of stdout.split('\n')) {
-          if (!lsPatterns.some((p) => p.test(line))) { continue; }
           const parts = line.trim().split(/\s+/);
+          if (parts.length < 11) { continue; }
           const pid = parseInt(parts[1], 10);
           if (isNaN(pid)) { continue; }
+
+          const command = parts.slice(10).join(' ');
+
+          // Must be a Python process
+          if (!pythonBinPattern.test(command)) { continue; }
+
+          // Never kill ourselves or our parent (VS Code extension host)
+          if (pid === myPid || String(pid) === myPpid) { continue; }
+
+          // Categorize for logging
+          let label = 'python';
+          if (/manage\.py\s+runserver|uvicorn\s|gunicorn\s|daphne\s/.test(command)) {
+            label = 'django';
+          } else if (/celery\s+.*worker|-m\s+celery\s+worker/.test(command)) {
+            label = 'celery';
+          } else if (/jedi|pylance|pyright|language.server/i.test(command)) {
+            label = 'language-server';
+          } else if (/debugpy|_django_debug_bootstrap/.test(command)) {
+            label = 'debugpy';
+          }
+
           try {
-            process.kill(pid, 'SIGKILL');
-            killed.push(pid);
-            log(`[Clean] Killed PID=${pid}: ${parts.slice(10).join(' ')}`);
+            // SIGTERM for servers (graceful), SIGKILL for everything else
+            const signal = (label === 'django' || label === 'celery') ? 'SIGTERM' : 'SIGKILL';
+            process.kill(pid, signal);
+            killed.push({ pid, label, command });
+            log(`[Clean] ${signal} PID=${pid} [${label}]: ${command}`);
           } catch { /* already dead */ }
         }
+
         if (killed.length > 0) {
-          actions.push(`Killed ${killed.length} language server process(es): PID ${killed.join(', ')}`);
+          // Group by label for summary
+          const groups = new Map<string, number[]>();
+          for (const k of killed) {
+            const arr = groups.get(k.label) ?? [];
+            arr.push(k.pid);
+            groups.set(k.label, arr);
+          }
+          for (const [label, pids] of groups) {
+            actions.push(`Killed ${pids.length} ${label} process(es): PID ${pids.join(', ')}`);
+          }
         }
       } catch (err) {
         logError('[Clean] Failed to scan processes', err);
@@ -723,22 +786,30 @@ export function activate(context: vscode.ExtensionContext) {
       // ── 6. Remove debug session lock ──
       removeLock();
 
-      // ── 7. Re-sign Python binaries (macOS code signature recovery) ──
-      // Repeated Python crashes (caused by bad bootstrap) can trigger macOS
-      // AppleSystemPolicy to block the binary. Re-signing with ad-hoc signature fixes it.
+      // ── 7. Restore Python binaries (macOS code signature + quarantine) ──
+      // Repeated crashes can trigger macOS AppleSystemPolicy to block binaries.
+      // We need to: remove quarantine xattr, re-sign, and verify execution.
       if (process.platform === 'darwin') {
         const pythonBinaries = new Set<string>();
         const home = os.homedir();
 
+        // Collect all Python binaries (resolve symlinks to get real files)
         const collectBinaries = async (dir: string) => {
           try {
             const files = await fsPromises.readdir(dir);
             for (const f of files) {
               if (/^python3?(\.\d+)*$/.test(f)) {
+                const fullPath = path.join(dir, f);
+                // Add both symlink path and resolved real path
                 try {
-                  const realPath = await fsPromises.realpath(path.join(dir, f));
+                  const realPath = await fsPromises.realpath(fullPath);
                   pythonBinaries.add(realPath);
                 } catch { /* broken symlink */ }
+                // Also add the symlink itself if it's a different path
+                try {
+                  await fsPromises.access(fullPath);
+                  pythonBinaries.add(fullPath);
+                } catch { /* skip */ }
               }
             }
           } catch { /* dir not found */ }
@@ -746,17 +817,31 @@ export function activate(context: vscode.ExtensionContext) {
 
         // Workspace venvs
         for (const folder of vscode.workspace.workspaceFolders ?? []) {
-          for (const venvName of ['.venv', 'venv', '.virtualenv', 'env']) {
+          for (const venvName of ['.venv', 'venv', '.virtualenv', 'env', '.env']) {
             await collectBinaries(path.join(folder.uri.fsPath, venvName, 'bin'));
           }
         }
 
-        // Version managers: asdf, pyenv
+        // Sibling project venvs
+        for (const folder of vscode.workspace.workspaceFolders ?? []) {
+          const parentDir = path.dirname(folder.uri.fsPath);
+          try {
+            const siblings = await fsPromises.readdir(parentDir);
+            for (const sibling of siblings) {
+              for (const venvName of ['.venv', 'venv']) {
+                await collectBinaries(path.join(parentDir, sibling, venvName, 'bin'));
+              }
+            }
+          } catch { /* skip */ }
+        }
+
+        // Version managers: asdf, pyenv, mise
         const versionManagerDirs = [
           path.join(home, '.asdf', 'installs', 'python'),
           process.env.PYENV_ROOT
             ? path.join(process.env.PYENV_ROOT, 'versions')
             : path.join(home, '.pyenv', 'versions'),
+          path.join(home, '.local', 'share', 'mise', 'installs', 'python'),
         ];
         for (const baseDir of versionManagerDirs) {
           try {
@@ -772,6 +857,7 @@ export function activate(context: vscode.ExtensionContext) {
           path.join(home, 'miniconda3', 'envs'),
           path.join(home, 'anaconda3', 'envs'),
           path.join(home, 'miniforge3', 'envs'),
+          path.join(home, '.conda', 'envs'),
         ];
         for (const condaDir of condaDirs) {
           try {
@@ -802,25 +888,71 @@ export function activate(context: vscode.ExtensionContext) {
           await collectBinaries(brewPrefix);
         }
 
-        // Verify & re-sign broken ones
-        let resignCount = 0;
+        // Deduplicate by resolving all to real paths
+        const uniqueBinaries = new Set<string>();
         for (const pyBin of pythonBinaries) {
           try {
-            await execFileAsync('codesign', ['--verify', pyBin], { timeout: 5_000 });
+            const realPath = await fsPromises.realpath(pyBin);
+            uniqueBinaries.add(realPath);
           } catch {
-            try {
-              await execFileAsync('codesign', ['--force', '--sign', '-', pyBin], { timeout: 5_000 });
-              resignCount++;
-              log(`[Clean] Re-signed: ${pyBin}`);
-            } catch (err) {
-              logError(`[Clean] Failed to re-sign ${pyBin}`, err);
-            }
+            uniqueBinaries.add(pyBin);
           }
         }
-        if (resignCount > 0) {
-          actions.push(`Re-signed ${resignCount} Python binary(ies)`);
+
+        log(`[Clean] Found ${uniqueBinaries.size} unique Python binaries to check`);
+
+        let repairCount = 0;
+        for (const pyBin of uniqueBinaries) {
+          let needsRepair = false;
+
+          // Step A: Check if binary is currently broken by trying to run it
+          try {
+            await execFileAsync(pyBin, ['-S', '-c', 'print("ok")'], { timeout: 5_000 });
+          } catch {
+            needsRepair = true;
+            log(`[Clean] Broken binary detected: ${pyBin}`);
+          }
+
+          if (!needsRepair) { continue; }
+
+          // Step B: Remove quarantine extended attribute
+          try {
+            await execFileAsync('xattr', ['-dr', 'com.apple.quarantine', pyBin], { timeout: 5_000 });
+            log(`[Clean] Removed quarantine xattr: ${pyBin}`);
+          } catch { /* no quarantine attr — fine */ }
+
+          // Step C: Clear macOS security assessment (revoke any cached deny)
+          try {
+            const binDir = path.dirname(pyBin);
+            await execFileAsync('xattr', ['-cr', binDir], { timeout: 5_000 });
+            log(`[Clean] Cleared xattrs on dir: ${binDir}`);
+          } catch { /* skip */ }
+
+          // Step D: Re-sign with ad-hoc signature
+          try {
+            await execFileAsync('codesign', [
+              '--force', '--deep', '--sign', '-', pyBin,
+            ], { timeout: 10_000 });
+            log(`[Clean] Re-signed: ${pyBin}`);
+          } catch (err) {
+            logError(`[Clean] codesign failed for ${pyBin}`, err);
+          }
+
+          // Step E: Verify it actually works now
+          try {
+            await execFileAsync(pyBin, ['-S', '-c', 'print("ok")'], { timeout: 5_000 });
+            repairCount++;
+            log(`[Clean] Verified working: ${pyBin}`);
+          } catch {
+            log(`[Clean] Still broken after repair: ${pyBin} — may need manual reinstall`);
+            actions.push(`WARNING: Could not repair ${pyBin} — consider reinstalling this Python version`);
+          }
         }
-        log(`[Clean] Checked ${pythonBinaries.size} Python binaries, re-signed ${resignCount}`);
+
+        if (repairCount > 0) {
+          actions.push(`Repaired ${repairCount} Python binary(ies) (quarantine + codesign)`);
+        }
+        log(`[Clean] Checked ${uniqueBinaries.size} binaries, repaired ${repairCount}`);
       }
 
       // ── Summary ──

@@ -159,17 +159,11 @@ export class DebugpyInjector {
       throw new Error('Bundled debugpy path not set');
     }
 
-    // Safety: refuse to install into global/system site-packages
-    // Only allow venv or virtualenv directories (contain bin/activate or pyvenv.cfg)
+    // Warn (but allow) installing into global/system site-packages
     const parentDir = path.resolve(venvSitePackages, '..', '..', '..');
     const isVenv = await this.isVenvDir(parentDir);
     if (!isVenv) {
-      log(`[Injector] WARNING: ${venvSitePackages} does not appear to be inside a virtualenv (checked ${parentDir})`);
-      throw new Error(
-        `Refusing to install bootstrap into non-venv site-packages: ${venvSitePackages}. ` +
-        `This would affect ALL Python processes using this interpreter. ` +
-        `Please select a virtualenv Python instead.`
-      );
+      log(`[Injector] WARNING: ${venvSitePackages} is a global/system site-packages (not a virtualenv)`);
     }
 
     const pthPath = path.join(venvSitePackages, PTH_FILENAME);
@@ -262,16 +256,81 @@ export class DebugpyInjector {
 
   /**
    * Resolve the python path from a running process PID.
+   * Handles uv, poetry run, etc. where the wrapper is not python itself.
    */
   async resolvePythonForPid(pid: number): Promise<string> {
     try {
-      const { stdout } = await execFileAsync('ps', [
+      const { stdout: fullCmd } = await execFileAsync('ps', [
         '-p', String(pid), '-o', 'command=',
       ]);
-      const fullCmd = stdout.trim();
-      log(`[Injector] ps output for PID=${pid}: ${fullCmd}`);
-      const match = fullCmd.match(/^(\S*python\S*)/);
-      return match ? match[1] : 'python3';
+      const cmd = fullCmd.trim();
+      log(`[Injector] ps output for PID=${pid}: ${cmd}`);
+
+      // Strategy 1: Direct python binary in command
+      const pythonMatch = cmd.match(/(\S*python\S*)/);
+      if (pythonMatch && pythonMatch[1] !== 'python' && pythonMatch[1] !== 'python3') {
+        // Absolute or relative path to python — use it
+        return pythonMatch[1];
+      }
+
+      // Strategy 2: For wrappers like `uv run python`, find the actual
+      // python executable via /proc or lsof -p PID to get the real binary.
+      // On macOS, use `lsof -p PID -Fn` to find the executable path.
+      try {
+        const { stdout: lsofOut } = await execFileAsync('lsof', [
+          '-p', String(pid), '-Fn',
+        ], { timeout: 5_000 });
+        // lsof output: first "n" line after "ftxt" is the executable path
+        const lines = lsofOut.split('\n');
+        let foundTxt = false;
+        for (const line of lines) {
+          if (line === 'ftxt') { foundTxt = true; continue; }
+          if (foundTxt && line.startsWith('n')) {
+            const exePath = line.slice(1); // remove leading 'n'
+            if (exePath.includes('python') || exePath.includes('Python')) {
+              log(`[Injector] lsof resolved executable: ${exePath}`);
+              return exePath;
+            }
+          }
+        }
+      } catch {
+        // lsof may fail
+      }
+
+      // Strategy 3: Check child processes — for `uv run python`, the child
+      // is the actual python binary
+      try {
+        const { stdout: psOut } = await execFileAsync('ps', [
+          '-o', 'pid=,command=', '--ppid', String(pid),
+        ]);
+        for (const line of psOut.trim().split('\n')) {
+          const childMatch = line.trim().match(/^\d+\s+(\S*python\S*)/);
+          if (childMatch) {
+            log(`[Injector] Found child python process: ${childMatch[1]}`);
+            return childMatch[1];
+          }
+        }
+      } catch {
+        // --ppid may not be supported on macOS ps, try pgrep
+        try {
+          const { stdout: pgrepOut } = await execFileAsync('pgrep', ['-P', String(pid)]);
+          for (const childPidStr of pgrepOut.trim().split('\n').filter(Boolean)) {
+            const childPid = childPidStr.trim();
+            const { stdout: childCmd } = await execFileAsync('ps', [
+              '-p', childPid, '-o', 'command=',
+            ]);
+            const childMatch = childCmd.trim().match(/(\S*python\S*)/);
+            if (childMatch) {
+              log(`[Injector] Found child python via pgrep: ${childMatch[1]}`);
+              return childMatch[1];
+            }
+          }
+        } catch { /* skip */ }
+      }
+
+      // Fallback
+      if (pythonMatch) { return pythonMatch[1]; }
+      return 'python3';
     } catch (err) {
       logError(`[Injector] Failed to resolve python path for PID=${pid}`, err);
       return 'python3';

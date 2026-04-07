@@ -2,7 +2,7 @@
   "name": "django-process-debugger",
   "displayName": "Django Process Debugger",
   "description": "Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "icon.png",
@@ -12,7 +12,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/newdlops/django-process-debugger"
+    "url": "https://github.com/newdlops/django_process_debugger"
   },
   "engines": {
     "vscode": "^1.85.0"
