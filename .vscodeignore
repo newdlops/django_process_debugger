@@ -3,9 +3,12 @@
 .claude/**
 src/**
 node_modules/**
+.git/**
 .gitignore
 tsconfig.json
 **/*.ts
 **/*.map
 .eslintrc*
 *.vsix
+CLAUDE.md
+.tool-versions

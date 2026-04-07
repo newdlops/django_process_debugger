@@ -30,70 +30,106 @@ function portFilePath(pid: number): string {
 function makeBootstrapScript(bundledDebugpyPath: string): string {
   // Build Python source as plain string concatenation to avoid
   // JS template literal ${} clashing with Python f-string {}.
+  //
+  // SAFETY: The entire module is wrapped in try/except so that
+  // a failure here NEVER kills the host Python process (pip, jedi, tests, etc.).
+  // The .pth file runs this on every Python startup in the venv.
   const lines = [
-    'import signal as _signal',
-    'import sys as _sys',
-    'import os as _os',
-    'import traceback as _traceback',
+    'try:',
+    '    import sys as _sys',
+    '    import os as _os',
     '',
-    '_PORT_FILE_DIR = ' + JSON.stringify(PORT_FILE_DIR),
-    '_LOG_FILE = _PORT_FILE_DIR + "/bootstrap.log"',
+    '    def _is_target_process():',
+    '        """Strict check: only match long-running server processes, not tools."""',
+    '        # Skip non-main scripts (pip, jedi, pytest, etc.)',
+    '        _exe = _os.path.basename(_sys.executable).lower()',
+    '        _blocked = ("pip", "jedi", "pylance", "pyright", "pytest", "mypy", "ruff", "black", "isort")',
+    '        if any(_b in _exe for _b in _blocked):',
+    '            return False',
+    '        _cmd = " ".join(_sys.argv).lower()',
+    '        # Block tool commands that happen to contain target words',
+    '        _blocked_cmds = (',
+    '            "-m pip", "-m pytest", "-m jedi", "-m pylint", "-m mypy",',
+    '            "-m black", "-m isort", "-m ruff", "language-server", "language_server",',
+    '            "site-packages", "setup.py", "pyproject.toml",',
+    '        )',
+    '        if any(_b in _cmd for _b in _blocked_cmds):',
+    '            return False',
+    '        # Only match known server process patterns',
+    '        _server_patterns = [',
+    '            "manage.py runserver",',
+    '            "manage.py run_huey",',
+    '            "uvicorn ",',
+    '            "gunicorn ",',
+    '            "daphne ",',
+    '            "celery worker",',
+    '            "-m celery worker",',
+    '        ]',
+    '        return any(_p in _cmd for _p in _server_patterns)',
     '',
-    'def _dbg_log(msg):',
-    '    try:',
-    '        with open(_LOG_FILE, "a") as _f:',
-    '            _f.write(f"[PID {_os.getpid()}] {msg}\\n")',
-    '    except Exception:',
-    '        pass',
+    '    if _is_target_process():',
+    '        import signal as _signal',
+    '        import traceback as _traceback',
     '',
-    '_dbg_log("Bootstrap module loaded, installing SIGUSR1 handler")',
+    '        _PORT_FILE_DIR = ' + JSON.stringify(PORT_FILE_DIR),
+    '        _LOG_FILE = _PORT_FILE_DIR + "/bootstrap.log"',
     '',
-    'def _django_debugger_signal_handler(signum, frame):',
-    '    """Start debugpy listener on SIGUSR1."""',
-    '    _dbg_log("SIGUSR1 received")',
-    '    # Check if debugpy is already active for this process',
-    '    _active_file = f"{_PORT_FILE_DIR}/{_os.getpid()}.active"',
-    '    try:',
-    '        with open(_active_file) as _f:',
-    '            _existing_port = _f.read().strip()',
-    '        _dbg_log(f"debugpy already active on port {_existing_port}, skipping")',
-    '        return',
-    '    except FileNotFoundError:',
-    '        pass',
-    '    _bundled = ' + JSON.stringify(bundledDebugpyPath),
-    '    if _bundled and _bundled not in _sys.path:',
-    '        _sys.path.insert(0, _bundled)',
-    '        _dbg_log(f"Added bundled path: {_bundled}")',
-    '    try:',
-    '        import debugpy',
-    '        _dbg_log(f"debugpy imported from {debugpy.__file__}")',
-    '        _port_file = f"{_PORT_FILE_DIR}/{_os.getpid()}.port"',
-    '        _port = 5678',
-    '        try:',
-    '            with open(_port_file) as _f:',
-    '                _port = int(_f.read().strip())',
-    '            _os.unlink(_port_file)',
-    '            _dbg_log(f"Read port {_port} from {_port_file}")',
-    '        except FileNotFoundError:',
-    '            _dbg_log(f"Port file not found: {_port_file}, using default {_port}")',
-    '        except ValueError as ve:',
-    '            _dbg_log(f"Bad port file content: {ve}")',
-    '        debugpy.listen(("127.0.0.1", _port))',
-    '        # Write active file so subsequent SIGUSR1s know debugpy is running',
-    '        with open(_active_file, "w") as _f:',
-    '            _f.write(str(_port))',
-    '        _dbg_log(f"debugpy listening on 127.0.0.1:{_port}")',
-    '    except RuntimeError as e:',
-    '        if "already" in str(e).lower():',
-    '            _dbg_log(f"debugpy already listening: {e}")',
-    '        else:',
-    '            _dbg_log(f"RuntimeError: {e}\\n{_traceback.format_exc()}")',
-    '    except Exception as e:',
-    '        _dbg_log(f"ERROR: {e}\\n{_traceback.format_exc()}")',
+    '        def _dbg_log(msg):',
+    '            try:',
+    '                with open(_LOG_FILE, "a") as _f:',
+    '                    _f.write(f"[PID {_os.getpid()}] {msg}\\n")',
+    '            except Exception:',
+    '                pass',
     '',
-    '_signal.signal(_signal.SIGUSR1, _django_debugger_signal_handler)',
-    '_signal.signal(_signal.SIGUSR2, _django_debugger_signal_handler)',
-    '_dbg_log("SIGUSR1+SIGUSR2 handlers installed")',
+    '        _dbg_log("Bootstrap module loaded, installing signal handlers")',
+    '',
+    '        def _django_debugger_signal_handler(signum, frame):',
+    '            _dbg_log(f"Signal {signum} received")',
+    '            _active_file = f"{_PORT_FILE_DIR}/{_os.getpid()}.active"',
+    '            try:',
+    '                with open(_active_file) as _f:',
+    '                    _existing_port = _f.read().strip()',
+    '                _dbg_log(f"debugpy already active on port {_existing_port}, skipping")',
+    '                return',
+    '            except FileNotFoundError:',
+    '                pass',
+    '            _bundled = ' + JSON.stringify(bundledDebugpyPath),
+    '            if _bundled and _bundled not in _sys.path:',
+    '                _sys.path.insert(0, _bundled)',
+    '                _dbg_log(f"Added bundled path: {_bundled}")',
+    '            try:',
+    '                import debugpy',
+    '                _dbg_log(f"debugpy imported from {debugpy.__file__}")',
+    '                _port_file = f"{_PORT_FILE_DIR}/{_os.getpid()}.port"',
+    '                _port = 5678',
+    '                try:',
+    '                    with open(_port_file) as _f:',
+    '                        _port = int(_f.read().strip())',
+    '                    _os.unlink(_port_file)',
+    '                    _dbg_log(f"Read port {_port} from {_port_file}")',
+    '                except FileNotFoundError:',
+    '                    _dbg_log(f"Port file not found, using default {_port}")',
+    '                except ValueError as ve:',
+    '                    _dbg_log(f"Bad port file content: {ve}")',
+    '                debugpy.listen(("127.0.0.1", _port))',
+    '                with open(_active_file, "w") as _f:',
+    '                    _f.write(str(_port))',
+    '                _dbg_log(f"debugpy listening on 127.0.0.1:{_port}")',
+    '            except RuntimeError as e:',
+    '                if "already" in str(e).lower():',
+    '                    _dbg_log(f"debugpy already listening: {e}")',
+    '                else:',
+    '                    _dbg_log(f"RuntimeError: {e}\\n{_traceback.format_exc()}")',
+    '            except Exception as e:',
+    '                _dbg_log(f"ERROR: {e}\\n{_traceback.format_exc()}")',
+    '',
+    '        _signal.signal(_signal.SIGUSR1, _django_debugger_signal_handler)',
+    '        _signal.signal(_signal.SIGUSR2, _django_debugger_signal_handler)',
+    '        _dbg_log("SIGUSR1+SIGUSR2 handlers installed")',
+    '',
+    'except Exception:',
+    '    # NEVER let bootstrap errors propagate — this runs on every Python startup',
+    '    pass',
     '',
   ];
   return lines.join('\n');
@@ -123,6 +159,19 @@ export class DebugpyInjector {
       throw new Error('Bundled debugpy path not set');
     }
 
+    // Safety: refuse to install into global/system site-packages
+    // Only allow venv or virtualenv directories (contain bin/activate or pyvenv.cfg)
+    const parentDir = path.resolve(venvSitePackages, '..', '..', '..');
+    const isVenv = await this.isVenvDir(parentDir);
+    if (!isVenv) {
+      log(`[Injector] WARNING: ${venvSitePackages} does not appear to be inside a virtualenv (checked ${parentDir})`);
+      throw new Error(
+        `Refusing to install bootstrap into non-venv site-packages: ${venvSitePackages}. ` +
+        `This would affect ALL Python processes using this interpreter. ` +
+        `Please select a virtualenv Python instead.`
+      );
+    }
+
     const pthPath = path.join(venvSitePackages, PTH_FILENAME);
     const modulePath = path.join(venvSitePackages, `${BOOTSTRAP_MODULE}.py`);
 
@@ -134,6 +183,19 @@ export class DebugpyInjector {
     await fs.writeFile(pthPath, PTH_CONTENT, 'utf-8');
 
     log(`[Injector] Bootstrap installed successfully`);
+  }
+
+  private async isVenvDir(dir: string): Promise<boolean> {
+    // Check for pyvenv.cfg (standard venv marker) or bin/activate (virtualenv marker)
+    for (const marker of ['pyvenv.cfg', path.join('bin', 'activate')]) {
+      try {
+        await fs.access(path.join(dir, marker));
+        return true;
+      } catch {
+        // continue
+      }
+    }
+    return false;
   }
 
   /**

@@ -1,7 +1,9 @@
 import * as vscode from 'vscode';
 import * as net from 'net';
 import * as fs from 'fs';
+import * as fsPromises from 'fs/promises';
 import * as path from 'path';
+import * as os from 'os';
 import { DjangoProcessFinder } from './processFinder';
 import { DebugpyInjector, BootstrapNotLoadedError, BootstrapNotInstalledError } from './debugpyInjector';
 import { DebugpyManager } from './debugpyManager';
@@ -95,23 +97,181 @@ export function activate(context: vscode.ExtensionContext) {
     }
   );
 
-  async function detectPythonPath(): Promise<string | undefined> {
-    const items: vscode.QuickPickItem[] = [];
-
-    // Add running Django processes as options
-    const processes = await processFinder.findDjangoProcesses();
+  async function findVenvPythons(): Promise<{ pythonPath: string; source: string }[]> {
+    const results: { pythonPath: string; source: string }[] = [];
     const seen = new Set<string>();
+
+    const addIfExists = async (pythonPath: string, source: string) => {
+      // Resolve symlinks to avoid duplicates
+      let resolved = pythonPath;
+      try {
+        resolved = await fsPromises.realpath(pythonPath);
+      } catch { /* use original */ }
+      if (seen.has(resolved)) { return; }
+      try {
+        await fsPromises.access(pythonPath);
+        seen.add(resolved);
+        results.push({ pythonPath, source });
+      } catch { /* not found */ }
+    };
+
+    const home = os.homedir();
+    const venvNames = ['.venv', 'venv', '.virtualenv', 'env', '.env'];
+
+    // 1. Workspace venv directories
+    for (const folder of vscode.workspace.workspaceFolders ?? []) {
+      const root = folder.uri.fsPath;
+      for (const venvName of venvNames) {
+        await addIfExists(path.join(root, venvName, 'bin', 'python'), `${folder.name}/${venvName}`);
+      }
+    }
+
+    // 2. Sibling project directories
+    for (const folder of vscode.workspace.workspaceFolders ?? []) {
+      const parentDir = path.dirname(folder.uri.fsPath);
+      try {
+        const siblings = await fsPromises.readdir(parentDir);
+        for (const sibling of siblings) {
+          if (sibling === path.basename(folder.uri.fsPath)) { continue; }
+          const siblingPath = path.join(parentDir, sibling);
+          for (const venvName of ['.venv', 'venv']) {
+            await addIfExists(path.join(siblingPath, venvName, 'bin', 'python'), `../${sibling}/${venvName}`);
+          }
+        }
+      } catch { /* can't read parent */ }
+    }
+
+    // 3. asdf Python versions
+    const asdfDir = path.join(home, '.asdf', 'installs', 'python');
+    try {
+      const versions = await fsPromises.readdir(asdfDir);
+      for (const ver of versions) {
+        await addIfExists(path.join(asdfDir, ver, 'bin', 'python3'), `asdf: ${ver}`);
+      }
+    } catch { /* not found */ }
+
+    // 4. pyenv Python versions
+    const pyenvDir = process.env.PYENV_ROOT
+      ? path.join(process.env.PYENV_ROOT, 'versions')
+      : path.join(home, '.pyenv', 'versions');
+    try {
+      const versions = await fsPromises.readdir(pyenvDir);
+      for (const ver of versions) {
+        await addIfExists(path.join(pyenvDir, ver, 'bin', 'python3'), `pyenv: ${ver}`);
+        // pyenv virtualenvs
+        await addIfExists(path.join(pyenvDir, ver, 'bin', 'python'), `pyenv: ${ver}`);
+      }
+    } catch { /* not found */ }
+
+    // 5. conda environments
+    const condaDirs = [
+      path.join(home, 'miniconda3', 'envs'),
+      path.join(home, 'anaconda3', 'envs'),
+      path.join(home, 'miniforge3', 'envs'),
+      path.join(home, '.conda', 'envs'),
+    ];
+    for (const condaDir of condaDirs) {
+      try {
+        const envs = await fsPromises.readdir(condaDir);
+        for (const env of envs) {
+          await addIfExists(path.join(condaDir, env, 'bin', 'python'), `conda: ${env}`);
+        }
+      } catch { /* not found */ }
+    }
+
+    // 6. Poetry virtualenvs
+    const poetryDirs = [
+      path.join(home, 'Library', 'Caches', 'pypoetry', 'virtualenvs'),  // macOS
+      path.join(home, '.cache', 'pypoetry', 'virtualenvs'),              // Linux
+    ];
+    for (const poetryDir of poetryDirs) {
+      try {
+        const entries = await fsPromises.readdir(poetryDir);
+        for (const entry of entries) {
+          await addIfExists(path.join(poetryDir, entry, 'bin', 'python'), `poetry: ${entry}`);
+        }
+      } catch { /* not found */ }
+    }
+
+    // 7. pipenv virtualenvs
+    const pipenvDirs = [
+      path.join(home, '.local', 'share', 'virtualenvs'),
+    ];
+    for (const pipenvDir of pipenvDirs) {
+      try {
+        const entries = await fsPromises.readdir(pipenvDir);
+        for (const entry of entries) {
+          await addIfExists(path.join(pipenvDir, entry, 'bin', 'python'), `pipenv: ${entry}`);
+        }
+      } catch { /* not found */ }
+    }
+
+    // 8. Homebrew Python
+    for (const brewPrefix of ['/opt/homebrew', '/usr/local']) {
+      await addIfExists(path.join(brewPrefix, 'bin', 'python3'), `homebrew`);
+    }
+
+    return results;
+  }
+
+  async function detectPythonPath(): Promise<string | undefined> {
+    const items: (vscode.QuickPickItem & { pythonPath?: string })[] = [];
+    const seen = new Set<string>();
+
+    // 1. Running Django processes
+    const processes = await processFinder.findDjangoProcesses();
     for (const p of processes) {
       if (!seen.has(p.pythonPath)) {
         seen.add(p.pythonPath);
+        const portLabel = p.port ? `:${p.port}` : '';
         items.push({
-          label: p.pythonPath,
-          description: 'Detected from running process',
+          label: `$(play) ${p.pythonPath}`,
+          description: `Running ${p.type}${portLabel} (PID ${p.pid})`,
+          pythonPath: p.pythonPath,
         });
       }
     }
 
-    // Always show browse option
+    // 2. Discovered venvs
+    const venvs = await findVenvPythons();
+    for (const v of venvs) {
+      if (!seen.has(v.pythonPath)) {
+        seen.add(v.pythonPath);
+        items.push({
+          label: `$(folder) ${v.pythonPath}`,
+          description: v.source,
+          pythonPath: v.pythonPath,
+        });
+      }
+    }
+
+    // 3. VS Code Python extension's selected interpreter
+    try {
+      const pyExt = vscode.extensions.getExtension('ms-python.python');
+      if (pyExt?.isActive) {
+        const execDetails = await vscode.commands.executeCommand<{ path?: string[] }>(
+          'python.interpreterPath',
+          { workspaceFolder: vscode.workspace.workspaceFolders?.[0]?.uri.toString() },
+        );
+        // The command may return a string directly in some versions
+        const pyPath = typeof execDetails === 'string'
+          ? execDetails
+          : (execDetails as { path?: string[] })?.path?.[0];
+        if (pyPath && !seen.has(pyPath)) {
+          seen.add(pyPath);
+          items.push({
+            label: `$(symbol-misc) ${pyPath}`,
+            description: 'VS Code selected interpreter',
+            pythonPath: pyPath,
+          });
+        }
+      }
+    } catch { /* extension not available */ }
+
+    // Separator + browse
+    if (items.length > 0) {
+      items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
+    }
     items.push({
       label: '$(file-directory) Browse...',
       description: 'Select Python executable from file browser',
@@ -119,7 +279,8 @@ export function activate(context: vscode.ExtensionContext) {
     });
 
     const selected = await vscode.window.showQuickPick(items, {
-      placeHolder: 'Select Python interpreter for your venv',
+      placeHolder: 'Select Python interpreter',
+      matchOnDescription: true,
     });
 
     if (!selected) { return undefined; }
@@ -139,8 +300,9 @@ export function activate(context: vscode.ExtensionContext) {
       return undefined;
     }
 
-    log(`User selected python: ${selected.label}`);
-    return selected.label;
+    const result = (selected as { pythonPath?: string }).pythonPath ?? selected.label;
+    log(`User selected python: ${result}`);
+    return result;
   }
 
   async function ensureDebugpy(pythonPath: string): Promise<string> {
@@ -179,40 +341,6 @@ export function activate(context: vscode.ExtensionContext) {
     }
   );
 
-  // Command: Teardown
-  const teardownCmd = vscode.commands.registerCommand(
-    'djangoProcessDebugger.teardown',
-    async () => {
-      log('Command: teardown');
-      const pythonPath = await detectPythonPath();
-      if (!pythonPath) { return; }
-
-      try {
-        const sitePackages = await injector.resolveSitePackages(pythonPath);
-        await injector.uninstallBootstrap(sitePackages);
-        vscode.window.showInformationMessage('Debug bootstrap removed.');
-      } catch (err) {
-        logError('[Teardown] Failed', err);
-        const msg = err instanceof Error ? err.message : String(err);
-        vscode.window.showErrorMessage(`Teardown failed: ${msg}`);
-      }
-    }
-  );
-
-  // Command: Find processes
-  const findCmd = vscode.commands.registerCommand(
-    'djangoProcessDebugger.findDjangoProcesses',
-    async () => {
-      log('Command: findDjangoProcesses');
-      const processes = await processFinder.findDjangoProcesses();
-      log(`Found ${processes.length} Django process(es)`);
-      if (processes.length === 0) {
-        vscode.window.showInformationMessage('No running Django processes found.');
-        return [];
-      }
-      return processes;
-    }
-  );
 
   // Command: Attach to process
   const attachCmd = vscode.commands.registerCommand(
@@ -244,16 +372,21 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      const items = processes.map((p) => {
+      const items = await Promise.all(processes.map(async (p) => {
         const icon = p.type === 'celery' ? '$(server-process)' : '$(globe)';
         const typeLabel = p.type === 'celery' ? 'Celery Worker' : 'Django Server';
+        const activePort = await injector.getActivePort(p.pid);
+        const portStatus = activePort
+          ? `$(debug-alt) Port ${activePort} — debugpy active`
+          : '$(circle-slash) debugpy not attached';
+        const portLabel = p.port ? ` | Port: ${p.port}` : '';
         return {
-          label: `${icon} [${typeLabel}] PID: ${p.pid}`,
+          label: `${icon} [${typeLabel}] PID: ${p.pid}${portLabel}`,
           description: p.command,
-          detail: `Python: ${p.pythonPath}`,
+          detail: `${portStatus}  |  Python: ${p.pythonPath}`,
           process: p,
         };
-      });
+      }));
 
       const selected = await vscode.window.showQuickPick(items, {
         placeHolder: 'Select a Django process to attach debugger',
@@ -357,12 +490,353 @@ export function activate(context: vscode.ExtensionContext) {
       const started = await vscode.debug.startDebugging(undefined, debugConfig);
       log(`Debug session started: ${started}`);
 
-      if (!started) {
+      if (started) {
+        vscode.window.showInformationMessage(
+          `$(debug-alt) ${sessionLabel} (PID: ${pid}) attached on port ${debugPort}`
+        );
+      } else {
         removeLock();
         vscode.window.showErrorMessage(
           'Failed to start debug session. Check logs for details.',
           'Show Logs',
         ).then((c) => { if (c === 'Show Logs') { getLogger().show(); } });
+      }
+    }
+  );
+
+  // Command: Kill Django/Celery process
+  const killCmd = vscode.commands.registerCommand(
+    'djangoProcessDebugger.killProcess',
+    async () => {
+      log('Command: killProcess');
+
+      const processes = await processFinder.findDjangoProcesses();
+      if (processes.length === 0) {
+        vscode.window.showWarningMessage('No running Django/Celery processes found.');
+        return;
+      }
+
+      const items = processes.map((p) => {
+        const icon = p.type === 'celery' ? '$(server-process)' : '$(globe)';
+        const typeLabel = p.type === 'celery' ? 'Celery Worker' : 'Django Server';
+        const portLabel = p.port ? ` | Port: ${p.port}` : '';
+        return {
+          label: `${icon} [${typeLabel}] PID: ${p.pid}${portLabel}`,
+          description: p.command,
+          detail: `Python: ${p.pythonPath}`,
+          process: p,
+        };
+      });
+
+      const selected = await vscode.window.showQuickPick(items, {
+        placeHolder: 'Select a process to kill',
+        canPickMany: true,
+      });
+
+      if (!selected || selected.length === 0) {
+        log('User cancelled process kill');
+        return;
+      }
+
+      for (const item of selected) {
+        const pid = item.process.pid;
+        try {
+          process.kill(pid, 'SIGTERM');
+          log(`Sent SIGTERM to PID=${pid}`);
+        } catch (err) {
+          logError(`Failed to kill PID=${pid}`, err);
+          const msg = err instanceof Error ? err.message : String(err);
+          vscode.window.showErrorMessage(`Failed to kill PID ${pid}: ${msg}`);
+        }
+      }
+
+      const pids = selected.map((s) => s.process.pid).join(', ');
+      vscode.window.showInformationMessage(`Sent SIGTERM to PID: ${pids}`);
+    }
+  );
+
+  // Command: Reinstall debugpy
+  const reinstallCmd = vscode.commands.registerCommand(
+    'djangoProcessDebugger.reinstallDebugpy',
+    async () => {
+      log('Command: reinstallDebugpy');
+
+      const pythonPath = await detectPythonPath();
+      if (!pythonPath) { return; }
+
+      try {
+        await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: 'Reinstalling debugpy...' },
+          async () => {
+            const dir = await debugpyManager.reinstall(pythonPath);
+            injector.setBundledDebugpyPath(dir);
+          },
+        );
+        vscode.window.showInformationMessage(
+          `debugpy reinstalled successfully using ${pythonPath}. Restart your Django server to apply.`
+        );
+      } catch (err) {
+        logError('[Reinstall] Failed', err);
+        const msg = err instanceof Error ? err.message : String(err);
+        vscode.window.showErrorMessage(`Reinstall failed: ${msg}`, 'Show Logs').then((c) => {
+          if (c === 'Show Logs') { getLogger().show(); }
+        });
+      }
+    }
+  );
+
+  // Command: Clean Python Language Server
+  const cleanLsCmd = vscode.commands.registerCommand(
+    'djangoProcessDebugger.cleanPythonLanguageServer',
+    async () => {
+      log('Command: cleanPythonLanguageServer');
+
+      const { execFile: execFileCb } = await import('child_process');
+      const { promisify } = await import('util');
+      const execFileAsync = promisify(execFileCb);
+
+      const actions: string[] = [];
+
+      // ── 1. Remove ALL bootstrap .pth and _django_debug_bootstrap.py files ──
+      // These are the root cause of Python process poisoning.
+      // Search workspace venvs, asdf installs, and common Python locations.
+      const home = os.homedir();
+      const pyenvRoot = process.env.PYENV_ROOT ?? path.join(home, '.pyenv');
+      const searchRoots = [
+        ...(vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? []),
+        // Version managers
+        path.join(home, '.asdf', 'installs', 'python'),
+        path.join(pyenvRoot, 'versions'),
+        // Conda
+        path.join(home, 'miniconda3', 'envs'),
+        path.join(home, 'anaconda3', 'envs'),
+        path.join(home, 'miniforge3', 'envs'),
+        path.join(home, '.conda', 'envs'),
+        // Poetry / pipenv
+        path.join(home, 'Library', 'Caches', 'pypoetry', 'virtualenvs'),
+        path.join(home, '.cache', 'pypoetry', 'virtualenvs'),
+        path.join(home, '.local', 'share', 'virtualenvs'),
+        // Homebrew
+        '/usr/local/lib',
+        '/opt/homebrew/lib',
+      ];
+
+      const bootstrapFiles = [
+        'django_process_debugger.pth',
+        '_django_debug_bootstrap.py',
+      ];
+
+      for (const root of searchRoots) {
+        try {
+          await fsPromises.access(root);
+        } catch { continue; }
+
+        try {
+          const { stdout } = await execFileAsync('find', [
+            root, '-maxdepth', '8',
+            '(', '-name', 'django_process_debugger.pth', '-o', '-name', '_django_debug_bootstrap.py', ')',
+            '-type', 'f',
+          ], { timeout: 10_000 });
+
+          for (const filePath of stdout.trim().split('\n').filter(Boolean)) {
+            try {
+              await fsPromises.unlink(filePath);
+              actions.push(`Removed bootstrap: ${filePath}`);
+              log(`[Clean] Removed: ${filePath}`);
+            } catch (err) {
+              logError(`[Clean] Failed to remove ${filePath}`, err);
+            }
+          }
+        } catch {
+          // find may fail on some dirs, that's ok
+        }
+      }
+
+      // ── 2. Clean up /tmp/django-process-debugger/ temp files ──
+      const tmpDir = '/tmp/django-process-debugger';
+      try {
+        const stat = await fsPromises.stat(tmpDir);
+        if (stat.isDirectory()) {
+          await fsPromises.rm(tmpDir, { recursive: true, force: true });
+          actions.push(`Removed temp dir: ${tmpDir}`);
+          log(`[Clean] Removed: ${tmpDir}`);
+        }
+      } catch { /* not found */ }
+
+      // ── 3. Kill zombie language server & debugpy processes ──
+      try {
+        const { stdout } = await execFileAsync('ps', ['aux']);
+        const lsPatterns = [
+          /jedi[-_]language[-_]server/i,
+          /pylance/i,
+          /pyright/i,
+          /python.*language.server/i,
+        ];
+        const killed: number[] = [];
+        for (const line of stdout.split('\n')) {
+          if (!lsPatterns.some((p) => p.test(line))) { continue; }
+          const parts = line.trim().split(/\s+/);
+          const pid = parseInt(parts[1], 10);
+          if (isNaN(pid)) { continue; }
+          try {
+            process.kill(pid, 'SIGKILL');
+            killed.push(pid);
+            log(`[Clean] Killed PID=${pid}: ${parts.slice(10).join(' ')}`);
+          } catch { /* already dead */ }
+        }
+        if (killed.length > 0) {
+          actions.push(`Killed ${killed.length} language server process(es): PID ${killed.join(', ')}`);
+        }
+      } catch (err) {
+        logError('[Clean] Failed to scan processes', err);
+      }
+
+      // ── 4. Clear Jedi & parso caches ──
+      const cacheDirs = [
+        path.join(os.homedir(), '.cache', 'jedi'),
+        path.join(os.homedir(), 'Library', 'Caches', 'jedi'),
+        path.join(os.homedir(), '.cache', 'parso'),
+        path.join(os.homedir(), 'Library', 'Caches', 'parso'),
+      ];
+      for (const dir of cacheDirs) {
+        try {
+          const stat = await fsPromises.stat(dir);
+          if (stat.isDirectory()) {
+            await fsPromises.rm(dir, { recursive: true, force: true });
+            actions.push(`Removed cache: ${dir}`);
+            log(`[Clean] Removed cache: ${dir}`);
+          }
+        } catch { /* not found */ }
+      }
+
+      // ── 5. Remove bundled debugpy (will be reinstalled on next Setup) ──
+      const debugpyDir = debugpyManager.getDebugpyDir();
+      try {
+        const stat = await fsPromises.stat(debugpyDir);
+        if (stat.isDirectory()) {
+          await fsPromises.rm(debugpyDir, { recursive: true, force: true });
+          actions.push(`Removed bundled debugpy: ${debugpyDir}`);
+          log(`[Clean] Removed bundled debugpy: ${debugpyDir}`);
+        }
+      } catch { /* not found */ }
+
+      // ── 6. Remove debug session lock ──
+      removeLock();
+
+      // ── 7. Re-sign Python binaries (macOS code signature recovery) ──
+      // Repeated Python crashes (caused by bad bootstrap) can trigger macOS
+      // AppleSystemPolicy to block the binary. Re-signing with ad-hoc signature fixes it.
+      if (process.platform === 'darwin') {
+        const pythonBinaries = new Set<string>();
+        const home = os.homedir();
+
+        const collectBinaries = async (dir: string) => {
+          try {
+            const files = await fsPromises.readdir(dir);
+            for (const f of files) {
+              if (/^python3?(\.\d+)*$/.test(f)) {
+                try {
+                  const realPath = await fsPromises.realpath(path.join(dir, f));
+                  pythonBinaries.add(realPath);
+                } catch { /* broken symlink */ }
+              }
+            }
+          } catch { /* dir not found */ }
+        };
+
+        // Workspace venvs
+        for (const folder of vscode.workspace.workspaceFolders ?? []) {
+          for (const venvName of ['.venv', 'venv', '.virtualenv', 'env']) {
+            await collectBinaries(path.join(folder.uri.fsPath, venvName, 'bin'));
+          }
+        }
+
+        // Version managers: asdf, pyenv
+        const versionManagerDirs = [
+          path.join(home, '.asdf', 'installs', 'python'),
+          process.env.PYENV_ROOT
+            ? path.join(process.env.PYENV_ROOT, 'versions')
+            : path.join(home, '.pyenv', 'versions'),
+        ];
+        for (const baseDir of versionManagerDirs) {
+          try {
+            const versions = await fsPromises.readdir(baseDir);
+            for (const ver of versions) {
+              await collectBinaries(path.join(baseDir, ver, 'bin'));
+            }
+          } catch { /* not found */ }
+        }
+
+        // conda
+        const condaDirs = [
+          path.join(home, 'miniconda3', 'envs'),
+          path.join(home, 'anaconda3', 'envs'),
+          path.join(home, 'miniforge3', 'envs'),
+        ];
+        for (const condaDir of condaDirs) {
+          try {
+            const envs = await fsPromises.readdir(condaDir);
+            for (const env of envs) {
+              await collectBinaries(path.join(condaDir, env, 'bin'));
+            }
+          } catch { /* not found */ }
+        }
+
+        // Poetry / pipenv
+        const venvCacheDirs = [
+          path.join(home, 'Library', 'Caches', 'pypoetry', 'virtualenvs'),
+          path.join(home, '.cache', 'pypoetry', 'virtualenvs'),
+          path.join(home, '.local', 'share', 'virtualenvs'),
+        ];
+        for (const cacheDir of venvCacheDirs) {
+          try {
+            const entries = await fsPromises.readdir(cacheDir);
+            for (const entry of entries) {
+              await collectBinaries(path.join(cacheDir, entry, 'bin'));
+            }
+          } catch { /* not found */ }
+        }
+
+        // Homebrew
+        for (const brewPrefix of ['/opt/homebrew/bin', '/usr/local/bin']) {
+          await collectBinaries(brewPrefix);
+        }
+
+        // Verify & re-sign broken ones
+        let resignCount = 0;
+        for (const pyBin of pythonBinaries) {
+          try {
+            await execFileAsync('codesign', ['--verify', pyBin], { timeout: 5_000 });
+          } catch {
+            try {
+              await execFileAsync('codesign', ['--force', '--sign', '-', pyBin], { timeout: 5_000 });
+              resignCount++;
+              log(`[Clean] Re-signed: ${pyBin}`);
+            } catch (err) {
+              logError(`[Clean] Failed to re-sign ${pyBin}`, err);
+            }
+          }
+        }
+        if (resignCount > 0) {
+          actions.push(`Re-signed ${resignCount} Python binary(ies)`);
+        }
+        log(`[Clean] Checked ${pythonBinaries.size} Python binaries, re-signed ${resignCount}`);
+      }
+
+      // ── Summary ──
+      const summary = actions.join('\n');
+      if (summary) { log(`[Clean] Done:\n${summary}`); }
+
+      const choice = await vscode.window.showInformationMessage(
+        actions.length > 0
+          ? `Cleaned ${actions.length} item(s). Python environment restored. Reload window?`
+          : 'Nothing to clean. Reload window to restart language server?',
+        'Reload Window', 'Show Logs',
+      );
+      if (choice === 'Reload Window') {
+        await vscode.commands.executeCommand('workbench.action.reloadWindow');
+      } else if (choice === 'Show Logs') {
+        getLogger().show();
       }
     }
   );
@@ -381,7 +855,7 @@ export function activate(context: vscode.ExtensionContext) {
     }),
   );
 
-  context.subscriptions.push(factory, tracker, findCmd, attachCmd, setupCmd, teardownCmd, getLogger());
+  context.subscriptions.push(factory, tracker, attachCmd, setupCmd, killCmd, reinstallCmd, cleanLsCmd, getLogger());
   log('Extension activated');
 }
 

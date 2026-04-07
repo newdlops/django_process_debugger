@@ -1,10 +1,15 @@
 {
   "name": "django-process-debugger",
   "displayName": "Django Process Debugger",
-  "description": "Attach debugpy to a running Django process for runtime debugging without modifying your codebase",
-  "version": "0.1.0",
+  "description": "Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase",
+  "version": "0.2.0",
   "publisher": "newdlops",
   "license": "MIT",
+  "icon": "icon.png",
+  "galleryBanner": {
+    "color": "#0C4B33",
+    "theme": "dark"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/newdlops/django-process-debugger"
@@ -21,6 +26,7 @@
     "debugger",
     "debugpy",
     "attach",
+    "celery",
     "macos",
     "apple-silicon"
   ],
@@ -30,7 +36,42 @@
     "debuggers": [
       {
         "type": "django-process",
-        "label": "Django Process Debugger"
+        "label": "Django Process Debugger",
+        "configurationAttributes": {
+          "attach": {
+            "properties": {
+              "host": {
+                "type": "string",
+                "default": "127.0.0.1",
+                "description": "Host address of the debugpy server"
+              },
+              "port": {
+                "type": "number",
+                "default": 5678,
+                "description": "Port of the debugpy server"
+              },
+              "justMyCode": {
+                "type": "boolean",
+                "default": true,
+                "description": "Only debug user-written code"
+              }
+            }
+          }
+        },
+        "configurationSnippets": [
+          {
+            "label": "Django Process Debugger: Attach",
+            "description": "Attach to a running Django/Celery process",
+            "body": {
+              "type": "django-process",
+              "request": "attach",
+              "name": "Attach to Django Process",
+              "host": "127.0.0.1",
+              "port": 5678,
+              "justMyCode": true
+            }
+          }
+        ]
       }
     ],
     "configuration": {
@@ -49,16 +90,20 @@
         "title": "Django Debugger: Setup"
       },
       {
-        "command": "djangoProcessDebugger.teardown",
-        "title": "Django Debugger: Remove Debug Support"
-      },
-      {
-        "command": "djangoProcessDebugger.findDjangoProcesses",
-        "title": "Django Debugger: Find Django Processes"
-      },
-      {
         "command": "djangoProcessDebugger.attachToProcess",
         "title": "Django Debugger: Attach to Django Process"
+      },
+      {
+        "command": "djangoProcessDebugger.killProcess",
+        "title": "Django Debugger: Kill Django/Celery Process"
+      },
+      {
+        "command": "djangoProcessDebugger.reinstallDebugpy",
+        "title": "Django Debugger: Reinstall debugpy"
+      },
+      {
+        "command": "djangoProcessDebugger.cleanPythonLanguageServer",
+        "title": "Django Debugger: Clean All (Remove Bootstrap & Restore Python)"
       }
     ]
   },

@@ -1,11 +1,8 @@
-import { execFile } from 'child_process';
-import { promisify } from 'util';
+import { spawn } from 'child_process';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { log, logError } from './logger';
-
-const execFileAsync = promisify(execFile);
 
 /**
  * Manages a private debugpy installation bundled within the extension's
@@ -41,29 +38,51 @@ export class DebugpyManager {
     log(`[DebugpyManager] Installing debugpy into ${this.debugpyDir} using ${pythonPath}...`);
     await fs.mkdir(this.debugpyDir, { recursive: true });
 
-    try {
-      const { stdout, stderr } = await execFileAsync(pythonPath, [
-        '-m', 'pip', 'install',
-        '--target', this.debugpyDir,
-        '--no-user',
-        '--upgrade',
-        'debugpy',
-      ], {
-        timeout: 120_000,
-      });
-      if (stdout) { log(`[DebugpyManager] pip stdout: ${stdout.trim()}`); }
-      if (stderr) { log(`[DebugpyManager] pip stderr: ${stderr.trim()}`); }
+    // Try python -m pip first, then fall back to pip binary directly
+    const pipArgs = [
+      'install',
+      '--target', this.debugpyDir,
+      '--no-user',
+      '--upgrade',
+      'debugpy',
+    ];
 
-      await fs.writeFile(markerFile, new Date().toISOString(), 'utf-8');
-      log(`[DebugpyManager] debugpy installed successfully`);
-      return this.debugpyDir;
-    } catch (err) {
-      logError('[DebugpyManager] Failed to install debugpy', err);
+    // Strategy 1: python -m pip
+    const args1 = ['-m', 'pip', ...pipArgs];
+    log(`[DebugpyManager] Running: ${pythonPath} ${args1.join(' ')}`);
+    let result = await this.runProcess(pythonPath, args1);
+
+    // Strategy 2: If python -m pip failed, try pip binary next to python
+    if (result.code !== 0) {
+      log(`[DebugpyManager] python -m pip failed (code=${result.code}, signal=${result.signal}). Trying pip binary...`);
+      if (result.stdout) { log(`[DebugpyManager] stdout:\n${result.stdout}`); }
+      if (result.stderr) { log(`[DebugpyManager] stderr:\n${result.stderr}`); }
+
+      const pipBin = path.join(path.dirname(pythonPath), 'pip3');
+      try {
+        await fs.access(pipBin);
+        log(`[DebugpyManager] Running: ${pipBin} ${pipArgs.join(' ')}`);
+        result = await this.runProcess(pipBin, pipArgs);
+      } catch {
+        log(`[DebugpyManager] pip3 binary not found at ${pipBin}`);
+      }
+    }
+
+    if (result.stdout) { log(`[DebugpyManager] pip stdout:\n${result.stdout}`); }
+    if (result.stderr) { log(`[DebugpyManager] pip stderr:\n${result.stderr}`); }
+
+    if (result.code !== 0) {
+      const signalInfo = result.signal ? ` (signal: ${result.signal})` : '';
+      logError(`[DebugpyManager] pip exited with code ${result.code}${signalInfo}`);
+      const detail = result.stderr || result.stdout || `exit code ${result.code}${signalInfo}`;
       throw new Error(
-        `Failed to install debugpy using ${pythonPath}. ` +
-        `Ensure pip is available: ${pythonPath} -m pip --version`
+        `Failed to install debugpy using ${pythonPath}.\n${detail}`
       );
     }
+
+    await fs.writeFile(markerFile, new Date().toISOString(), 'utf-8');
+    log(`[DebugpyManager] debugpy installed successfully`);
+    return this.debugpyDir;
   }
 
   /**
@@ -76,5 +95,46 @@ export class DebugpyManager {
     } catch {
       return false;
     }
+  }
+
+  private runProcess(command: string, args: string[]): Promise<{ code: number; signal: string | null; stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+      const proc = spawn(command, args, {
+        timeout: 120_000,
+        env: { ...process.env },
+      });
+      const stdoutChunks: string[] = [];
+      const stderrChunks: string[] = [];
+
+      proc.stdout.on('data', (data: Buffer) => { stdoutChunks.push(data.toString()); });
+      proc.stderr.on('data', (data: Buffer) => { stderrChunks.push(data.toString()); });
+
+      proc.on('error', (err) => {
+        reject(new Error(`Failed to spawn ${command}: ${err.message}`));
+      });
+
+      proc.on('close', (code, signal) => {
+        resolve({
+          code: code ?? (signal ? 1 : 0),
+          signal: signal,
+          stdout: stdoutChunks.join('').trim(),
+          stderr: stderrChunks.join('').trim(),
+        });
+      });
+    });
+  }
+
+  /**
+   * Remove existing debugpy installation and reinstall using the given pythonPath.
+   */
+  async reinstall(pythonPath: string): Promise<string> {
+    log(`[DebugpyManager] Removing existing debugpy at ${this.debugpyDir}...`);
+    try {
+      await fs.rm(this.debugpyDir, { recursive: true, force: true });
+    } catch {
+      // directory may not exist
+    }
+    log(`[DebugpyManager] Reinstalling debugpy with ${pythonPath}...`);
+    return this.ensureInstalled(pythonPath);
   }
 }

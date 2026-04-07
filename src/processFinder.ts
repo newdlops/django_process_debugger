@@ -12,6 +12,7 @@ export interface DjangoProcess {
   pythonPath: string;
   arch: string;
   type: ProcessType;
+  port?: number;
 }
 
 export class DjangoProcessFinder {
@@ -38,6 +39,11 @@ export class DjangoProcessFinder {
           processes.push(parsed);
         }
       }
+
+      // Resolve listening ports for each process
+      await Promise.all(processes.map(async (p) => {
+        p.port = this.extractPortFromCommand(p.command) ?? await this.findListeningPort(p.pid);
+      }));
 
       log(`[ProcessFinder] Found ${processes.length} Django process(es)`);
       return processes;
@@ -103,5 +109,60 @@ export class DjangoProcessFinder {
     // Extract the python executable path from the command
     const match = command.match(/^(\S*python\S*)/);
     return match ? match[1] : 'python';
+  }
+
+  /**
+   * Extract port from the command line arguments.
+   * Handles: manage.py runserver 8080, manage.py runserver 0.0.0.0:8000,
+   *          uvicorn --port 8080, gunicorn -b :8000, gunicorn --bind 0.0.0.0:8000
+   */
+  extractPortFromCommand(command: string): number | undefined {
+    // manage.py runserver [addr:]port
+    const runserverMatch = command.match(/runserver\s+(?:\S+:)?(\d+)/);
+    if (runserverMatch) {
+      return parseInt(runserverMatch[1], 10);
+    }
+
+    // uvicorn --port PORT or --host X --port PORT
+    const uvicornPortMatch = command.match(/--port\s+(\d+)/);
+    if (uvicornPortMatch) {
+      return parseInt(uvicornPortMatch[1], 10);
+    }
+
+    // gunicorn -b / --bind [addr:]port
+    const gunicornMatch = command.match(/(?:-b|--bind)\s+(?:\S+:)?(\d+)/);
+    if (gunicornMatch) {
+      return parseInt(gunicornMatch[1], 10);
+    }
+
+    // daphne -p PORT or --port PORT
+    const daphneMatch = command.match(/(?:-p|--port)\s+(\d+)/);
+    if (daphneMatch) {
+      return parseInt(daphneMatch[1], 10);
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Find the TCP listening port for a given PID using lsof.
+   */
+  private async findListeningPort(pid: number): Promise<number | undefined> {
+    try {
+      const { stdout } = await execFileAsync('lsof', [
+        '-iTCP', '-sTCP:LISTEN', '-nP', '-p', String(pid),
+      ]);
+      // Parse lsof output: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+      // NAME looks like *:8000 or 127.0.0.1:8000
+      for (const line of stdout.split('\n')) {
+        const match = line.match(/:(\d+)\s*$/);
+        if (match) {
+          return parseInt(match[1], 10);
+        }
+      }
+    } catch {
+      // lsof may fail for permission reasons — that's fine
+    }
+    return undefined;
   }
 }
