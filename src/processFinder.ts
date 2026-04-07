@@ -4,11 +4,14 @@ import { log, logError } from './logger';
 
 const execFileAsync = promisify(execFile);
 
+export type ProcessType = 'django' | 'celery';
+
 export interface DjangoProcess {
   pid: number;
   command: string;
   pythonPath: string;
   arch: string;
+  type: ProcessType;
 }
 
 export class DjangoProcessFinder {
@@ -45,14 +48,30 @@ export class DjangoProcessFinder {
   }
 
   private isDjangoProcess(line: string): boolean {
-    const patterns = [
+    return this.classifyProcess(line) !== null;
+  }
+
+  classifyProcess(line: string): ProcessType | null {
+    const celeryPatterns = [
+      /celery\s+.*worker/,
+      /-m\s+celery\s+worker/,
+    ];
+    if (celeryPatterns.some((p) => p.test(line))) {
+      return 'celery';
+    }
+
+    const djangoPatterns = [
       /manage\.py\s+runserver/,
       /django.*runserver/i,
       /uvicorn.*\.asgi/,
       /gunicorn.*\.wsgi/,
       /daphne.*\.asgi/,
     ];
-    return patterns.some((p) => p.test(line));
+    if (djangoPatterns.some((p) => p.test(line))) {
+      return 'django';
+    }
+
+    return null;
   }
 
   private parsePsLine(line: string): DjangoProcess | null {
@@ -69,12 +88,14 @@ export class DjangoProcessFinder {
 
     const command = parts.slice(10).join(' ');
     const pythonPath = this.extractPythonPath(command);
+    const type = this.classifyProcess(command) ?? 'django';
 
     return {
       pid,
       command,
       pythonPath,
       arch: process.arch, // arm64 on Apple Silicon
+      type,
     };
   }
 

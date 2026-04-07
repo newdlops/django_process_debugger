@@ -244,12 +244,16 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      const items = processes.map((p) => ({
-        label: `PID: ${p.pid}`,
-        description: p.command,
-        detail: `Python: ${p.pythonPath}`,
-        process: p,
-      }));
+      const items = processes.map((p) => {
+        const icon = p.type === 'celery' ? '$(server-process)' : '$(globe)';
+        const typeLabel = p.type === 'celery' ? 'Celery Worker' : 'Django Server';
+        return {
+          label: `${icon} [${typeLabel}] PID: ${p.pid}`,
+          description: p.command,
+          detail: `Python: ${p.pythonPath}`,
+          process: p,
+        };
+      });
 
       const selected = await vscode.window.showQuickPick(items, {
         placeHolder: 'Select a Django process to attach debugger',
@@ -327,12 +331,16 @@ export function activate(context: vscode.ExtensionContext) {
       log(`Starting debug session for PID=${pid}`);
 
       // Use our own debug type — connects directly to debugpy DAP server
+      const justMyCode = vscode.workspace.getConfiguration('djangoProcessDebugger').get<boolean>('justMyCode', true);
+      const processType = selected.process.type;
+      const sessionLabel = processType === 'celery' ? 'Celery Worker' : 'Django';
       const debugConfig: vscode.DebugConfiguration = {
         type: 'django-process',
         request: 'attach',
-        name: `Django (PID: ${pid})`,
+        name: `${sessionLabel} (PID: ${pid})`,
         host: '127.0.0.1',
         port: debugPort,
+        justMyCode,
       };
 
       log(`Debug config: ${JSON.stringify(debugConfig)}`);

@@ -92,7 +92,8 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '        _dbg_log(f"ERROR: {e}\\n{_traceback.format_exc()}")',
     '',
     '_signal.signal(_signal.SIGUSR1, _django_debugger_signal_handler)',
-    '_dbg_log("SIGUSR1 handler installed")',
+    '_signal.signal(_signal.SIGUSR2, _django_debugger_signal_handler)',
+    '_dbg_log("SIGUSR1+SIGUSR2 handlers installed")',
     '',
   ];
   return lines.join('\n');
@@ -286,12 +287,17 @@ export class DebugpyInjector {
     await fs.writeFile(portFilePath(pid), String(port), 'utf-8');
     log(`[Injector] Wrote port file: ${portFilePath(pid)} = ${port}`);
 
-    // Send SIGUSR1 to trigger the bootstrap signal handler
-    log(`[Injector] Sending SIGUSR1 to PID=${pid}`);
+    // Determine which signal to send: celery overrides SIGUSR1 for log reopen,
+    // so we use SIGUSR2 for celery workers and SIGUSR1 for everything else.
+    const command = await this.getProcessCommand(pid);
+    const isCelery = /celery\s+.*worker|-m\s+celery\s+worker/.test(command);
+    const signal = isCelery ? 'SIGUSR2' : 'SIGUSR1';
+
+    log(`[Injector] Sending ${signal} to PID=${pid} (${isCelery ? 'celery' : 'django'})`);
     try {
-      process.kill(pid, 'SIGUSR1');
+      process.kill(pid, signal);
     } catch (err) {
-      logError(`[Injector] Failed to send SIGUSR1 to PID=${pid}`, err);
+      logError(`[Injector] Failed to send ${signal} to PID=${pid}`, err);
       throw new SignalError(pid, err instanceof Error ? err : new Error(String(err)));
     }
 
@@ -304,6 +310,15 @@ export class DebugpyInjector {
     }
     log(`[Injector] debugpy is listening on port ${port}`);
     return port;
+  }
+
+  private async getProcessCommand(pid: number): Promise<string> {
+    try {
+      const { stdout } = await execFileAsync('ps', ['-p', String(pid), '-o', 'command=']);
+      return stdout.trim();
+    } catch {
+      return '';
+    }
   }
 
   private verifyProcessAlive(pid: number): void {

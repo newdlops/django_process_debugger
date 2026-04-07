@@ -7,7 +7,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/lky/django-process-debugger"
+    "url": "https://github.com/newdlops/django-process-debugger"
   },
   "engines": {
     "vscode": "^1.85.0"
@@ -33,6 +33,16 @@
         "label": "Django Process Debugger"
       }
     ],
+    "configuration": {
+      "title": "Django Process Debugger",
+      "properties": {
+        "djangoProcessDebugger.justMyCode": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true, the debugger only steps through your code. When false, it also steps into library/framework code (e.g., Django, Celery internals)."
+        }
+      }
+    },
     "commands": [
       {
         "command": "djangoProcessDebugger.setup",
