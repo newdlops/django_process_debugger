@@ -4,10 +4,23 @@ import * as fs from 'fs';
 import * as fsPromises from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
-import { DjangoProcessFinder } from './processFinder';
+import { DjangoProcess, DjangoProcessFinder } from './processFinder';
 import { DebugpyInjector, BootstrapNotLoadedError, BootstrapNotInstalledError } from './debugpyInjector';
-import { DebugpyManager } from './debugpyManager';
+import { DebugpyManager, DebugpyProvisioningInfo } from './debugpyManager';
 import { log, logError, getLogger } from './logger';
+import {
+  RuntimeCandidate,
+  SetupProfile,
+  buildSavedProfileCandidate,
+  clearSetupProfile,
+  createSetupProfile,
+  discoverRuntimeCandidates,
+  formatPreflightForConfirmation,
+  getSetupProfile,
+  inspectRuntimePreflight,
+  isProfileStillInstalled,
+  saveSetupProfile,
+} from './runtimeSetup';
 
 const LOCK_DIR = '/tmp/django-process-debugger';
 const LOCK_FILE = path.join(LOCK_DIR, 'debug-session.lock');
@@ -97,218 +110,262 @@ export function activate(context: vscode.ExtensionContext) {
     }
   );
 
-  async function findVenvPythons(): Promise<{ pythonPath: string; source: string }[]> {
-    const results: { pythonPath: string; source: string }[] = [];
-    const seen = new Set<string>();
-
-    const addIfExists = async (pythonPath: string, source: string) => {
-      // Resolve symlinks to avoid duplicates
-      let resolved = pythonPath;
-      try {
-        resolved = await fsPromises.realpath(pythonPath);
-      } catch { /* use original */ }
-      if (seen.has(resolved)) { return; }
-      try {
-        await fsPromises.access(pythonPath);
-        seen.add(resolved);
-        results.push({ pythonPath, source });
-      } catch { /* not found */ }
-    };
-
-    const home = os.homedir();
-    const venvNames = ['.venv', 'venv', '.virtualenv', 'env', '.env'];
-
-    // 1. Workspace venv directories
-    for (const folder of vscode.workspace.workspaceFolders ?? []) {
-      const root = folder.uri.fsPath;
-      for (const venvName of venvNames) {
-        await addIfExists(path.join(root, venvName, 'bin', 'python'), `${folder.name}/${venvName}`);
-      }
-    }
-
-    // 2. Sibling project directories
-    for (const folder of vscode.workspace.workspaceFolders ?? []) {
-      const parentDir = path.dirname(folder.uri.fsPath);
-      try {
-        const siblings = await fsPromises.readdir(parentDir);
-        for (const sibling of siblings) {
-          if (sibling === path.basename(folder.uri.fsPath)) { continue; }
-          const siblingPath = path.join(parentDir, sibling);
-          for (const venvName of ['.venv', 'venv']) {
-            await addIfExists(path.join(siblingPath, venvName, 'bin', 'python'), `../${sibling}/${venvName}`);
-          }
-        }
-      } catch { /* can't read parent */ }
-    }
-
-    // 3. asdf Python versions
-    const asdfDir = path.join(home, '.asdf', 'installs', 'python');
-    try {
-      const versions = await fsPromises.readdir(asdfDir);
-      for (const ver of versions) {
-        await addIfExists(path.join(asdfDir, ver, 'bin', 'python3'), `asdf: ${ver}`);
-      }
-    } catch { /* not found */ }
-
-    // 4. pyenv Python versions
-    const pyenvDir = process.env.PYENV_ROOT
-      ? path.join(process.env.PYENV_ROOT, 'versions')
-      : path.join(home, '.pyenv', 'versions');
-    try {
-      const versions = await fsPromises.readdir(pyenvDir);
-      for (const ver of versions) {
-        await addIfExists(path.join(pyenvDir, ver, 'bin', 'python3'), `pyenv: ${ver}`);
-        // pyenv virtualenvs
-        await addIfExists(path.join(pyenvDir, ver, 'bin', 'python'), `pyenv: ${ver}`);
-      }
-    } catch { /* not found */ }
-
-    // 5. conda environments
-    const condaDirs = [
-      path.join(home, 'miniconda3', 'envs'),
-      path.join(home, 'anaconda3', 'envs'),
-      path.join(home, 'miniforge3', 'envs'),
-      path.join(home, '.conda', 'envs'),
-    ];
-    for (const condaDir of condaDirs) {
-      try {
-        const envs = await fsPromises.readdir(condaDir);
-        for (const env of envs) {
-          await addIfExists(path.join(condaDir, env, 'bin', 'python'), `conda: ${env}`);
-        }
-      } catch { /* not found */ }
-    }
-
-    // 6. Poetry virtualenvs
-    const poetryDirs = [
-      path.join(home, 'Library', 'Caches', 'pypoetry', 'virtualenvs'),  // macOS
-      path.join(home, '.cache', 'pypoetry', 'virtualenvs'),              // Linux
-    ];
-    for (const poetryDir of poetryDirs) {
-      try {
-        const entries = await fsPromises.readdir(poetryDir);
-        for (const entry of entries) {
-          await addIfExists(path.join(poetryDir, entry, 'bin', 'python'), `poetry: ${entry}`);
-        }
-      } catch { /* not found */ }
-    }
-
-    // 7. pipenv virtualenvs
-    const pipenvDirs = [
-      path.join(home, '.local', 'share', 'virtualenvs'),
-    ];
-    for (const pipenvDir of pipenvDirs) {
-      try {
-        const entries = await fsPromises.readdir(pipenvDir);
-        for (const entry of entries) {
-          await addIfExists(path.join(pipenvDir, entry, 'bin', 'python'), `pipenv: ${entry}`);
-        }
-      } catch { /* not found */ }
-    }
-
-    // 8. Homebrew Python
-    for (const brewPrefix of ['/opt/homebrew', '/usr/local']) {
-      await addIfExists(path.join(brewPrefix, 'bin', 'python3'), `homebrew`);
-    }
-
-    return results;
+  interface RuntimeQuickPickItem extends vscode.QuickPickItem {
+    action?: 'browse';
+    candidate?: RuntimeCandidate;
   }
 
-  async function detectPythonPath(): Promise<string | undefined> {
-    const items: (vscode.QuickPickItem & { pythonPath?: string })[] = [];
-    const seen = new Set<string>();
+  interface StatusQuickPickItem extends vscode.QuickPickItem {
+    action?: 'setup' | 'logs' | 'reinstall';
+  }
 
-    // 1. Running Django processes
-    const processes = await processFinder.findDjangoProcesses();
-    for (const p of processes) {
-      if (!seen.has(p.pythonPath)) {
-        seen.add(p.pythonPath);
-        const portLabel = p.port ? `:${p.port}` : '';
+  function makeRuntimeCandidate(
+    pythonPath: string,
+    sourceKind: RuntimeCandidate['sourceKind'],
+    sourceLabel: string,
+    displayLabel: string,
+    displayDescription: string,
+    displayDetail: string,
+    process?: DjangoProcess,
+  ): RuntimeCandidate {
+    return {
+      pythonPath,
+      resolvedPythonPath: pythonPath,
+      sourceKind,
+      sourceLabel,
+      displayLabel,
+      displayDescription,
+      displayDetail,
+      sortOrder: 0,
+      isRecommended: true,
+      process,
+    };
+  }
+
+  async function ensureDebugpy(pythonPath?: string): Promise<DebugpyProvisioningInfo> {
+    const info = await debugpyManager.ensureInstalled(pythonPath);
+    injector.setBundledDebugpyPath(info.path);
+    return info;
+  }
+
+  async function browseForPythonCandidate(): Promise<RuntimeCandidate | undefined> {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectFolders: false,
+      canSelectMany: false,
+      title: 'Select Python Interpreter',
+      openLabel: 'Select Python',
+    });
+    if (!uris || uris.length === 0) {
+      return undefined;
+    }
+
+    const pythonPath = uris[0].fsPath;
+    log(`User browsed python: ${pythonPath}`);
+    return makeRuntimeCandidate(
+      pythonPath,
+      'browse',
+      'Browsed interpreter',
+      `$(file-directory) ${path.basename(pythonPath)}`,
+      'Manually selected interpreter',
+      pythonPath,
+    );
+  }
+
+  async function selectSetupRuntime(
+    presetCandidate?: RuntimeCandidate,
+  ): Promise<{ candidate: RuntimeCandidate; preflight: Awaited<ReturnType<typeof inspectRuntimePreflight>> } | undefined> {
+    let candidate = presetCandidate;
+
+    if (!candidate) {
+      const savedProfile = await getSetupProfile(context);
+      const items: RuntimeQuickPickItem[] = [];
+
+      if (savedProfile) {
         items.push({
-          label: `$(play) ${p.pythonPath}`,
-          description: `Running ${p.type}${portLabel} (PID ${p.pid})`,
-          pythonPath: p.pythonPath,
+          label: buildSavedProfileCandidate(savedProfile).displayLabel,
+          description: buildSavedProfileCandidate(savedProfile).displayDescription,
+          detail: buildSavedProfileCandidate(savedProfile).displayDetail,
+          candidate: buildSavedProfileCandidate(savedProfile),
+        });
+        items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
+      }
+
+      const discovered = await discoverRuntimeCandidates(processFinder, injector);
+      for (const discoveredCandidate of discovered) {
+        items.push({
+          label: discoveredCandidate.displayLabel,
+          description: discoveredCandidate.displayDescription,
+          detail: discoveredCandidate.displayDetail,
+          candidate: discoveredCandidate,
         });
       }
-    }
 
-    // 2. Discovered venvs
-    const venvs = await findVenvPythons();
-    for (const v of venvs) {
-      if (!seen.has(v.pythonPath)) {
-        seen.add(v.pythonPath);
-        items.push({
-          label: `$(folder) ${v.pythonPath}`,
-          description: v.source,
-          pythonPath: v.pythonPath,
-        });
+      if (items.length > 0) {
+        items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
       }
-    }
-
-    // 3. VS Code Python extension's selected interpreter
-    try {
-      const pyExt = vscode.extensions.getExtension('ms-python.python');
-      if (pyExt?.isActive) {
-        const execDetails = await vscode.commands.executeCommand<{ path?: string[] }>(
-          'python.interpreterPath',
-          { workspaceFolder: vscode.workspace.workspaceFolders?.[0]?.uri.toString() },
-        );
-        // The command may return a string directly in some versions
-        const pyPath = typeof execDetails === 'string'
-          ? execDetails
-          : (execDetails as { path?: string[] })?.path?.[0];
-        if (pyPath && !seen.has(pyPath)) {
-          seen.add(pyPath);
-          items.push({
-            label: `$(symbol-misc) ${pyPath}`,
-            description: 'VS Code selected interpreter',
-            pythonPath: pyPath,
-          });
-        }
-      }
-    } catch { /* extension not available */ }
-
-    // Separator + browse
-    if (items.length > 0) {
-      items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
-    }
-    items.push({
-      label: '$(file-directory) Browse...',
-      description: 'Select Python executable from file browser',
-      alwaysShow: true,
-    });
-
-    const selected = await vscode.window.showQuickPick(items, {
-      placeHolder: 'Select Python interpreter',
-      matchOnDescription: true,
-    });
-
-    if (!selected) { return undefined; }
-
-    if (selected.label.includes('Browse...')) {
-      const uris = await vscode.window.showOpenDialog({
-        canSelectFiles: true,
-        canSelectFolders: false,
-        canSelectMany: false,
-        title: 'Select Python Interpreter',
-        openLabel: 'Select Python',
+      items.push({
+        label: '$(file-directory) Browse...',
+        description: 'Manually select a Python executable',
+        action: 'browse',
+        alwaysShow: true,
       });
-      if (uris && uris.length > 0) {
-        log(`User browsed python: ${uris[0].fsPath}`);
-        return uris[0].fsPath;
+
+      const selected = await vscode.window.showQuickPick(items, {
+        placeHolder: 'Select the Python runtime that will run Django or Celery',
+        matchOnDescription: true,
+        matchOnDetail: true,
+      });
+
+      if (!selected) {
+        return undefined;
+      }
+
+      if (selected.action === 'browse') {
+        candidate = await browseForPythonCandidate();
+      } else {
+        candidate = selected.candidate;
+      }
+    }
+
+    if (!candidate) {
+      return undefined;
+    }
+
+    const preflight = await inspectRuntimePreflight(
+      candidate.pythonPath,
+      vscode.workspace.workspaceFolders,
+      injector,
+      debugpyManager,
+    );
+    log(`[Setup] Preflight for ${candidate.pythonPath}\n${formatPreflightForConfirmation(preflight)}`);
+
+    if (preflight.errors.length > 0) {
+      const choice = await vscode.window.showErrorMessage(
+        `Setup blocked for ${candidate.pythonPath}: ${preflight.errors[0]}`,
+        'Show Logs',
+      );
+      if (choice === 'Show Logs') {
+        getLogger().show();
       }
       return undefined;
     }
 
-    const result = (selected as { pythonPath?: string }).pythonPath ?? selected.label;
-    log(`User selected python: ${result}`);
-    return result;
+    if (preflight.warnings.length > 0) {
+      const choice = await vscode.window.showWarningMessage(
+        `Setup warning for ${candidate.pythonPath}: ${preflight.warnings[0]}`,
+        { modal: true },
+        'Continue',
+        'Show Logs',
+      );
+      if (choice === 'Show Logs') {
+        getLogger().show();
+        return undefined;
+      }
+      if (choice !== 'Continue') {
+        return undefined;
+      }
+    }
+
+    return { candidate, preflight };
   }
 
-  async function ensureDebugpy(pythonPath: string): Promise<string> {
-    const dir = await debugpyManager.ensureInstalled(pythonPath);
-    injector.setBundledDebugpyPath(dir);
-    return dir;
+  async function installSetupForRuntime(
+    reason: string,
+    presetCandidate?: RuntimeCandidate,
+  ): Promise<SetupProfile | undefined> {
+    const selection = await selectSetupRuntime(presetCandidate);
+    if (!selection) {
+      return undefined;
+    }
+
+    let debugpyInfo: DebugpyProvisioningInfo | undefined;
+    try {
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Preparing Django Process Debugger runtime...',
+        },
+        async (progress) => {
+          progress.report({ message: 'Preparing bundled debugpy...' });
+          debugpyInfo = await ensureDebugpy(selection.preflight.resolvedPythonPath);
+          progress.report({ message: `Installing bootstrap into ${selection.preflight.sitePackages}...` });
+          await injector.installBootstrap(selection.preflight.sitePackages);
+        },
+      );
+
+      if (!debugpyInfo) {
+        throw new Error('Bundled debugpy was not prepared.');
+      }
+
+      const profile = createSetupProfile(selection.candidate, selection.preflight, debugpyInfo, reason);
+      await saveSetupProfile(context, profile);
+      return profile;
+    } catch (err) {
+      logError('[Setup] Failed', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      const choice = await vscode.window.showErrorMessage(`Setup failed: ${msg}`, 'Show Logs');
+      if (choice === 'Show Logs') {
+        getLogger().show();
+      }
+      return undefined;
+    }
+  }
+
+  async function showSetupStatus(): Promise<void> {
+    const profile = await getSetupProfile(context);
+    const debugpyInfo = await debugpyManager.getProvisioningInfo();
+    const bootstrapInstalled = profile
+      ? await isProfileStillInstalled(profile, injector)
+      : false;
+
+    const items: StatusQuickPickItem[] = [];
+    if (profile) {
+      items.push({
+        label: '$(checklist) Configured Runtime',
+        description: profile.pythonPath,
+        detail: `${profile.sourceLabel} • Python ${profile.pythonVersion} • setup ${profile.lastSetupAt}`,
+      });
+      items.push({
+        label: bootstrapInstalled ? '$(check) Bootstrap Installed' : '$(warning) Bootstrap Missing',
+        description: profile.sitePackages,
+        detail: `Bootstrap version ${profile.bootstrapVersion}`,
+      });
+    } else {
+      items.push({
+        label: '$(circle-slash) No Runtime Configured',
+        description: 'Run setup to install the bootstrap into a Python runtime',
+      });
+    }
+
+    items.push({
+      label: '$(debug-alt) Bundled debugpy',
+      description: `${debugpyInfo.source}${debugpyInfo.version ? ` ${debugpyInfo.version}` : ''}`,
+      detail: debugpyInfo.path,
+    });
+
+    items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
+    items.push({ label: 'Run Setup', action: 'setup' });
+    items.push({ label: 'Reinstall Bundled debugpy', action: 'reinstall' });
+    items.push({ label: 'Open Logs', action: 'logs' });
+
+    const selected = await vscode.window.showQuickPick(items, {
+      placeHolder: 'Django Process Debugger setup status',
+      matchOnDescription: true,
+      matchOnDetail: true,
+    });
+
+    if (!selected?.action) {
+      return;
+    }
+
+    if (selected.action === 'setup') {
+      await vscode.commands.executeCommand('djangoProcessDebugger.setup');
+    } else if (selected.action === 'reinstall') {
+      await vscode.commands.executeCommand('djangoProcessDebugger.reinstallDebugpy');
+    } else if (selected.action === 'logs') {
+      getLogger().show();
+    }
   }
 
   // Command: Setup
@@ -316,28 +373,23 @@ export function activate(context: vscode.ExtensionContext) {
     'djangoProcessDebugger.setup',
     async () => {
       log('Command: setup');
-      const pythonPath = await detectPythonPath();
-      if (!pythonPath) { return; }
-
-      try {
-        await vscode.window.withProgress(
-          { location: vscode.ProgressLocation.Notification, title: 'Preparing debugpy...' },
-          () => ensureDebugpy(pythonPath),
-        );
-
-        const sitePackages = await injector.resolveSitePackages(pythonPath);
-        // Always overwrite — bootstrap code may have been updated
-        await injector.installBootstrap(sitePackages);
-        vscode.window.showInformationMessage(
-          'Debug bootstrap installed. Restart your Django server, then use "Attach to Django Process".'
-        );
-      } catch (err) {
-        logError('[Setup] Failed', err);
-        const msg = err instanceof Error ? err.message : String(err);
-        vscode.window.showErrorMessage(`Setup failed: ${msg}`, 'Show Logs').then((c) => {
-          if (c === 'Show Logs') { getLogger().show(); }
-        });
+      const profile = await installSetupForRuntime('manual-setup');
+      if (!profile) {
+        return;
       }
+
+      vscode.window.showInformationMessage(
+        `Debug bootstrap installed into ${profile.pythonPath}. Restart your Django/Celery process, then use "Attach to Django Process".`
+      );
+    }
+  );
+
+  // Command: Show setup status
+  const statusCmd = vscode.commands.registerCommand(
+    'djangoProcessDebugger.showSetupStatus',
+    async () => {
+      log('Command: showSetupStatus');
+      await showSetupStatus();
     }
   );
 
@@ -354,21 +406,6 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage(
           'No running Django processes found. Start a Django server first.'
         );
-        return;
-      }
-
-      try {
-        await ensureDebugpy(processes[0].pythonPath);
-      } catch (err) {
-        logError('Failed to prepare bundled debugpy', err);
-        vscode.window.showErrorMessage(
-          'Failed to prepare debugpy. Run "Django Debugger: Setup" first.',
-          'Run Setup', 'Show Logs',
-        ).then((c) => {
-          if (c === 'Run Setup') {
-            vscode.commands.executeCommand('djangoProcessDebugger.setup');
-          } else if (c === 'Show Logs') { getLogger().show(); }
-        });
         return;
       }
 
@@ -426,8 +463,23 @@ export function activate(context: vscode.ExtensionContext) {
       // (walks down from uv wrapper → autoreloader → actual server)
       const resolved = await processFinder.resolveDebuggablePid(selected.process.pid);
       const pid = resolved.pid;
+      const resolvedPythonPath = await injector.resolvePythonForPid(pid);
+      const targetProcess: DjangoProcess = {
+        ...selected.process,
+        pid,
+        pythonPath: resolvedPythonPath,
+      };
+      const targetRuntime = makeRuntimeCandidate(
+        resolvedPythonPath,
+        'running-process',
+        `Attach target runtime (PID ${pid})`,
+        `$(play) ${path.basename(resolvedPythonPath)}`,
+        `Attach target runtime (PID ${pid})`,
+        `${resolvedPythonPath}\n${selected.process.command}`,
+        targetProcess,
+      );
       const port = await findFreePort();
-      log(`Selected PID=${selected.process.pid} → resolved to PID=${pid} (${resolved.pythonPath})`);
+      log(`Selected PID=${selected.process.pid} → resolved to PID=${pid} (${resolvedPythonPath})`);
 
       // Check if another VS Code window already has an active debug session
       const existingLock = readLock();
@@ -455,6 +507,52 @@ export function activate(context: vscode.ExtensionContext) {
         }
       }
 
+      try {
+        const sitePackages = await injector.resolveSitePackages(resolvedPythonPath);
+        const bootstrapInstalled = await injector.isBootstrapInstalled(sitePackages);
+        if (!bootstrapInstalled) {
+          const choice = await vscode.window.showWarningMessage(
+            `This runtime is not set up yet: ${resolvedPythonPath}`,
+            'Install for Next Restart',
+            'Show Status',
+            'Cancel',
+          );
+          if (choice === 'Install for Next Restart') {
+            const profile = await installSetupForRuntime('attach-self-heal', targetRuntime);
+            if (profile) {
+              vscode.window.showInformationMessage(
+                `Bootstrap installed into ${profile.pythonPath}. Restart the target process, then attach again.`
+              );
+            }
+          } else if (choice === 'Show Status') {
+            await showSetupStatus();
+          }
+          return;
+        }
+      } catch (err) {
+        logError(`[Attach] Failed to inspect runtime ${resolvedPythonPath}`, err);
+      }
+
+      try {
+        await ensureDebugpy(resolvedPythonPath);
+      } catch (err) {
+        logError('Failed to prepare bundled debugpy', err);
+        const choice = await vscode.window.showErrorMessage(
+          'Failed to prepare bundled debugpy.',
+          'Run Setup',
+          'Show Status',
+          'Show Logs',
+        );
+        if (choice === 'Run Setup') {
+          await vscode.commands.executeCommand('djangoProcessDebugger.setup');
+        } else if (choice === 'Show Status') {
+          await showSetupStatus();
+        } else if (choice === 'Show Logs') {
+          getLogger().show();
+        }
+        return;
+      }
+
       let debugPort: number;
       try {
         debugPort = await injector.activate(pid, port);
@@ -467,24 +565,46 @@ export function activate(context: vscode.ExtensionContext) {
 
         if (err instanceof BootstrapNotInstalledError) {
           const choice = await vscode.window.showErrorMessage(
-            `Debug bootstrap is not installed in the target venv. ` +
-            `Run "Setup" first, then restart your Django server.`,
-            'Run Setup', 'Show Logs',
-          );
-          if (choice === 'Run Setup') {
-            await vscode.commands.executeCommand('djangoProcessDebugger.setup');
-          } else if (choice === 'Show Logs') { getLogger().show(); }
-        } else if (err instanceof BootstrapNotLoadedError) {
-          vscode.window.showErrorMessage(
-            `Bootstrap is installed but the process hasn't loaded it. ` +
-            `Restart your Django server and try again.`,
+            `Debug bootstrap is not installed in the target runtime: ${resolvedPythonPath}`,
+            'Install for Next Restart',
+            'Show Status',
             'Show Logs',
-          ).then((c) => { if (c === 'Show Logs') { getLogger().show(); } });
+          );
+          if (choice === 'Install for Next Restart') {
+            const profile = await installSetupForRuntime('attach-missing-bootstrap', targetRuntime);
+            if (profile) {
+              vscode.window.showInformationMessage(
+                `Bootstrap installed into ${profile.pythonPath}. Restart the target process, then attach again.`
+              );
+            }
+          } else if (choice === 'Show Status') {
+            await showSetupStatus();
+          } else if (choice === 'Show Logs') {
+            getLogger().show();
+          }
+        } else if (err instanceof BootstrapNotLoadedError) {
+          const choice = await vscode.window.showErrorMessage(
+            `Bootstrap is installed in ${resolvedPythonPath}, but PID ${pid} started before it was loaded. Restart the target process and try again.`,
+            'Show Status',
+            'Show Logs',
+          );
+          if (choice === 'Show Status') {
+            await showSetupStatus();
+          } else if (choice === 'Show Logs') {
+            getLogger().show();
+          }
         } else {
           const msg = err instanceof Error ? err.message : String(err);
-          vscode.window.showErrorMessage(
-            `Debugger attach failed: ${msg}`, 'Show Logs',
-          ).then((c) => { if (c === 'Show Logs') { getLogger().show(); } });
+          const choice = await vscode.window.showErrorMessage(
+            `Debugger attach failed: ${msg}`,
+            'Show Status',
+            'Show Logs',
+          );
+          if (choice === 'Show Status') {
+            await showSetupStatus();
+          } else if (choice === 'Show Logs') {
+            getLogger().show();
+          }
         }
         return;
       }
@@ -589,19 +709,37 @@ export function activate(context: vscode.ExtensionContext) {
     async () => {
       log('Command: reinstallDebugpy');
 
-      const pythonPath = await detectPythonPath();
-      if (!pythonPath) { return; }
-
       try {
+        let debugpyInfo: DebugpyProvisioningInfo | undefined;
         await vscode.window.withProgress(
           { location: vscode.ProgressLocation.Notification, title: 'Reinstalling debugpy...' },
           async () => {
-            const dir = await debugpyManager.reinstall(pythonPath);
-            injector.setBundledDebugpyPath(dir);
+            try {
+              debugpyInfo = await debugpyManager.reinstall();
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              if (!msg.includes('No vendored debugpy bundle found')) {
+                throw err;
+              }
+
+              const selected = await selectSetupRuntime();
+              if (!selected) {
+                return;
+              }
+              debugpyInfo = await debugpyManager.reinstall(selected.preflight.resolvedPythonPath);
+            }
+
+            if (!debugpyInfo) {
+              return;
+            }
+            injector.setBundledDebugpyPath(debugpyInfo.path);
           },
         );
+        if (!debugpyInfo) {
+          return;
+        }
         vscode.window.showInformationMessage(
-          `debugpy reinstalled successfully using ${pythonPath}. Restart your Django server to apply.`
+          `Bundled debugpy reinstalled from ${debugpyInfo.source}${debugpyInfo.version ? ` ${debugpyInfo.version}` : ''}.`
         );
       } catch (err) {
         logError('[Reinstall] Failed', err);
@@ -785,6 +923,8 @@ export function activate(context: vscode.ExtensionContext) {
 
       // ── 6. Remove debug session lock ──
       removeLock();
+      await clearSetupProfile(context);
+      actions.push('Cleared workspace setup profile');
 
       // ── 7. Restore Python binaries (macOS code signature + quarantine) ──
       // Repeated crashes can trigger macOS AppleSystemPolicy to block binaries.
@@ -987,7 +1127,7 @@ export function activate(context: vscode.ExtensionContext) {
     }),
   );
 
-  context.subscriptions.push(factory, tracker, attachCmd, setupCmd, killCmd, reinstallCmd, cleanLsCmd, getLogger());
+  context.subscriptions.push(factory, tracker, attachCmd, setupCmd, statusCmd, killCmd, reinstallCmd, cleanLsCmd, getLogger());
   log('Extension activated');
 }
 

@@ -8,6 +8,7 @@ const execFileAsync = promisify(execFile);
 
 const PTH_FILENAME = 'django_process_debugger.pth';
 const BOOTSTRAP_MODULE = '_django_debug_bootstrap';
+export const BOOTSTRAP_VERSION = '2026.04.10';
 
 /**
  * Bootstrap script installed into the target venv's site-packages.
@@ -35,6 +36,7 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
   // a failure here NEVER kills the host Python process (pip, jedi, tests, etc.).
   // The .pth file runs this on every Python startup in the venv.
   const lines = [
+    `# django-process-debugger bootstrap ${BOOTSTRAP_VERSION}`,
     'try:',
     '    import sys as _sys',
     '    import os as _os',
@@ -230,7 +232,18 @@ export class DebugpyInjector {
     try {
       const { stdout } = await execFileAsync(pythonPath, [
         '-c',
-        'import site; print(site.getsitepackages()[0])',
+        [
+          'import site',
+          'import sysconfig',
+          'paths = []',
+          'purelib = sysconfig.get_path("purelib")',
+          'if purelib:',
+          '    paths.append(purelib)',
+          'for candidate in getattr(site, "getsitepackages", lambda: [])():',
+          '    if candidate not in paths:',
+          '        paths.append(candidate)',
+          'print(paths[0])',
+        ].join('\n'),
       ]);
       const dir = stdout.trim();
       log(`[Injector] Resolved site-packages: ${dir}`);

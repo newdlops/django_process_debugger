@@ -90,6 +90,10 @@
         "title": "Django Debugger: Setup"
       },
       {
+        "command": "djangoProcessDebugger.showSetupStatus",
+        "title": "Django Debugger: Show Setup Status"
+      },
+      {
         "command": "djangoProcessDebugger.attachToProcess",
         "title": "Django Debugger: Attach to Django Process"
       },
