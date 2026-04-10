@@ -2,7 +2,7 @@
   "name": "django-process-debugger",
   "displayName": "Django Process Debugger",
   "description": "Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "icon.png",
