@@ -440,12 +440,17 @@ export async function inspectRuntimePreflight(
   const errors: string[] = [];
   const debugpyInfo = await debugpyManager.getProvisioningInfo();
 
+  // Use the original pythonPath (not resolved symlink) for inspection and
+  // site-packages resolution, so that venv paths are preserved correctly.
+  // When resolvedPythonPath follows symlinks (e.g. .venv/bin/python3 →
+  // ~/.asdf/.../python3.11), running the resolved path would return the
+  // global site-packages instead of the venv's site-packages.
   let inspection: PythonInspectionPayload | undefined;
   try {
-    inspection = await inspectPythonInterpreter(resolvedPythonPath);
+    inspection = await inspectPythonInterpreter(pythonPath);
   } catch (err) {
-    logError(`[RuntimeSetup] Failed to inspect Python runtime ${resolvedPythonPath}`, err);
-    errors.push(`Could not execute ${resolvedPythonPath} to inspect the runtime.`);
+    logError(`[RuntimeSetup] Failed to inspect Python runtime ${pythonPath}`, err);
+    errors.push(`Could not execute ${pythonPath} to inspect the runtime.`);
   }
 
   let sitePackages = '';
@@ -453,9 +458,9 @@ export async function inspectRuntimePreflight(
     sitePackages = inspection.sitePackages[0];
   } else {
     try {
-      sitePackages = await injector.resolveSitePackages(resolvedPythonPath);
+      sitePackages = await injector.resolveSitePackages(pythonPath);
     } catch (err) {
-      logError(`[RuntimeSetup] Failed to resolve site-packages for ${resolvedPythonPath}`, err);
+      logError(`[RuntimeSetup] Failed to resolve site-packages for ${pythonPath}`, err);
       errors.push('Could not resolve site-packages for this interpreter.');
     }
   }
