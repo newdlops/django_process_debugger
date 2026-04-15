@@ -5,7 +5,7 @@ import * as fsPromises from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { DjangoProcess, DjangoProcessFinder } from './processFinder';
-import { DebugpyInjector, BootstrapNotLoadedError, BootstrapNotInstalledError } from './debugpyInjector';
+import { DebugpyInjector, BootstrapNotLoadedError, BootstrapNotInstalledError, BOOTSTRAP_VERSION } from './debugpyInjector';
 import { DebugpyManager, DebugpyProvisioningInfo } from './debugpyManager';
 import { log, logError, getLogger } from './logger';
 import {
@@ -529,6 +529,22 @@ export function activate(context: vscode.ExtensionContext) {
           }
           return;
         }
+
+        // Auto-update bootstrap if version is outdated
+        const bootstrapUpToDate = await injector.isBootstrapUpToDate(sitePackages);
+        if (!bootstrapUpToDate) {
+          log(`[Attach] Bootstrap outdated in ${sitePackages}, auto-updating...`);
+          try {
+            await ensureDebugpy(resolvedPythonPath);
+            await injector.installBootstrap(sitePackages);
+            log(`[Attach] Bootstrap auto-updated. Note: takes effect on next Django restart.`);
+            vscode.window.showInformationMessage(
+              `Bootstrap updated to v${BOOTSTRAP_VERSION}. Hot reload improvements will take effect after restarting the Django server.`
+            );
+          } catch (updateErr) {
+            logError('[Attach] Bootstrap auto-update failed', updateErr);
+          }
+        }
       } catch (err) {
         logError(`[Attach] Failed to inspect runtime ${resolvedPythonPath}`, err);
       }
@@ -615,6 +631,7 @@ export function activate(context: vscode.ExtensionContext) {
       const justMyCode = vscode.workspace.getConfiguration('djangoProcessDebugger').get<boolean>('justMyCode', true);
       const processType = selected.process.type;
       const sessionLabel = processType === 'celery' ? 'Celery Worker' : 'Django';
+      const redirectOutput = vscode.workspace.getConfiguration('djangoProcessDebugger').get<boolean>('redirectOutput', true);
       const debugConfig: vscode.DebugConfiguration = {
         type: 'django-process',
         request: 'attach',
@@ -622,6 +639,7 @@ export function activate(context: vscode.ExtensionContext) {
         host: '127.0.0.1',
         port: debugPort,
         justMyCode,
+        redirectOutput,
       };
 
       log(`Debug config: ${JSON.stringify(debugConfig)}`);
@@ -639,6 +657,7 @@ export function activate(context: vscode.ExtensionContext) {
       log(`Debug session started: ${started}`);
 
       if (started) {
+        startHotReloadWatcher(pid);
         vscode.window.showInformationMessage(
           `$(debug-alt) ${sessionLabel} (PID: ${pid}) attached on port ${debugPort}`
         );
@@ -1113,6 +1132,121 @@ export function activate(context: vscode.ExtensionContext) {
     }
   );
 
+  // ── Hot Reload: file watcher management ──
+  let hotReloadWatcher: vscode.FileSystemWatcher | undefined;
+  let hotReloadPid: number | undefined;
+  let hotReloadDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+  let hotReloadPendingFiles: Set<string> = new Set();
+  const hotReloadStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
+
+  function startHotReloadWatcher(pid: number): void {
+    const hotReloadEnabled = vscode.workspace.getConfiguration('djangoProcessDebugger').get<boolean>('hotReload', true);
+    if (!hotReloadEnabled) {
+      log('[HotReload] Disabled by setting');
+      return;
+    }
+
+    stopHotReloadWatcher();
+    hotReloadPid = pid;
+
+    hotReloadWatcher = vscode.workspace.createFileSystemWatcher('**/*.py');
+    hotReloadWatcher.onDidChange((uri) => onPyFileChanged(uri));
+    hotReloadWatcher.onDidCreate((uri) => onPyFileChanged(uri));
+
+    hotReloadStatusItem.text = '$(flame) Hot Reload';
+    hotReloadStatusItem.tooltip = `Hot reload active for PID ${pid}. Changed .py files are reloaded without restarting.`;
+    hotReloadStatusItem.show();
+
+    log(`[HotReload] File watcher started for PID=${pid}`);
+  }
+
+  function stopHotReloadWatcher(): void {
+    if (hotReloadDebounceTimer) {
+      clearTimeout(hotReloadDebounceTimer);
+      hotReloadDebounceTimer = undefined;
+    }
+    hotReloadPendingFiles.clear();
+    if (hotReloadWatcher) {
+      hotReloadWatcher.dispose();
+      hotReloadWatcher = undefined;
+    }
+    hotReloadPid = undefined;
+    hotReloadStatusItem.hide();
+    log('[HotReload] File watcher stopped');
+  }
+
+  function onPyFileChanged(uri: vscode.Uri): void {
+    if (!hotReloadPid) { return; }
+    const filePath = uri.fsPath;
+
+    // Ignore files outside workspace, inside venvs, __pycache__, migrations, etc.
+    if (filePath.includes('site-packages') ||
+        filePath.includes('__pycache__') ||
+        filePath.includes('.venv') ||
+        filePath.includes('/venv/') ||
+        filePath.includes('node_modules') ||
+        filePath.includes('/migrations/')) {
+      return;
+    }
+
+    hotReloadPendingFiles.add(filePath);
+
+    // Debounce: batch changes within 500ms window
+    if (hotReloadDebounceTimer) {
+      clearTimeout(hotReloadDebounceTimer);
+    }
+    hotReloadDebounceTimer = setTimeout(() => {
+      flushHotReload();
+    }, 500);
+  }
+
+  async function flushHotReload(): Promise<void> {
+    if (!hotReloadPid || hotReloadPendingFiles.size === 0) { return; }
+
+    const pid = hotReloadPid;
+    const files = [...hotReloadPendingFiles];
+    hotReloadPendingFiles.clear();
+
+    log(`[HotReload] Requesting reload for ${files.length} file(s): ${files.join(', ')}`);
+    hotReloadStatusItem.text = '$(sync~spin) Reloading...';
+
+    try {
+      await injector.requestHotReload(pid, files);
+
+      // Wait briefly for the Python watcher to process and write results
+      await new Promise((r) => setTimeout(r, 1000));
+
+      const results = await injector.readReloadResult(pid);
+      if (results) {
+        const ok = results.filter((r) => r.startsWith('OK:'));
+        const err = results.filter((r) => r.startsWith('ERR:'));
+        const skip = results.filter((r) => r.startsWith('SKIP:'));
+
+        if (ok.length > 0) {
+          const moduleNames = ok.map((r) => r.replace('OK:', ''));
+          vscode.window.showInformationMessage(
+            `$(flame) Hot reloaded: ${moduleNames.join(', ')}`
+          );
+        }
+        if (err.length > 0) {
+          const details = err.map((r) => r.replace('ERR:', ''));
+          vscode.window.showWarningMessage(
+            `$(warning) Reload failed: ${details.join('; ')}`
+          );
+        }
+        if (skip.length > 0 && ok.length === 0 && err.length === 0) {
+          log(`[HotReload] All files skipped (not loaded as modules): ${skip.join(', ')}`);
+        }
+
+        log(`[HotReload] Results: ${ok.length} OK, ${err.length} ERR, ${skip.length} SKIP`);
+      }
+    } catch (err) {
+      logError('[HotReload] Failed to request reload', err);
+    }
+
+    hotReloadStatusItem.text = '$(flame) Hot Reload';
+  }
+
   // Debug session lifecycle logging
   context.subscriptions.push(
     vscode.debug.onDidStartDebugSession((session) => {
@@ -1122,12 +1256,13 @@ export function activate(context: vscode.ExtensionContext) {
       log(`[DebugSession] Terminated: ${session.name}`);
       if (session.type === 'django-process') {
         removeLock();
-        log('[DebugSession] Lock file removed');
+        stopHotReloadWatcher();
+        log('[DebugSession] Lock file removed, hot reload stopped');
       }
     }),
   );
 
-  context.subscriptions.push(factory, tracker, attachCmd, setupCmd, statusCmd, killCmd, reinstallCmd, cleanLsCmd, getLogger());
+  context.subscriptions.push(factory, tracker, attachCmd, setupCmd, statusCmd, killCmd, reinstallCmd, cleanLsCmd, hotReloadStatusItem, getLogger());
   log('Extension activated');
 }
 

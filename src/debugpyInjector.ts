@@ -8,7 +8,7 @@ const execFileAsync = promisify(execFile);
 
 const PTH_FILENAME = 'django_process_debugger.pth';
 const BOOTSTRAP_MODULE = '_django_debug_bootstrap';
-export const BOOTSTRAP_VERSION = '2026.04.10';
+export const BOOTSTRAP_VERSION = '2026.04.15';
 
 /**
  * Bootstrap script installed into the target venv's site-packages.
@@ -26,6 +26,14 @@ export const BOOTSTRAP_VERSION = '2026.04.10';
 const PORT_FILE_DIR = '/tmp/django-process-debugger';
 function portFilePath(pid: number): string {
   return `${PORT_FILE_DIR}/${pid}.port`;
+}
+
+function reloadFilePath(pid: number): string {
+  return `${PORT_FILE_DIR}/${pid}.reload`;
+}
+
+function reloadResultFilePath(pid: number): string {
+  return `${PORT_FILE_DIR}/${pid}.reload.result`;
 }
 
 function makeBootstrapScript(bundledDebugpyPath: string): string {
@@ -85,7 +93,180 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '',
     '        _dbg_log("Bootstrap module loaded, installing signal handlers")',
     '',
+    '        _hot_reload_watcher_started = False',
+    '',
+    '        # Persistent storage: keeps references to the ORIGINAL functions',
+    '        # (before any reload) so we always patch the ones Django actually calls.',
+    '        _original_mod_funcs = {}',
+    '        _original_mod_class_methods = {}',
+    '',
+    '        def _start_hot_reload_watcher():',
+    '            """Start a daemon thread that watches for module reload requests."""',
+    '            import threading',
+    '            import importlib',
+    '            import time',
+    '',
+    '            _pid = _os.getpid()',
+    '            _reload_file = f"{_PORT_FILE_DIR}/{_pid}.reload"',
+    '            _reload_result_file = f"{_PORT_FILE_DIR}/{_pid}.reload.result"',
+    '',
+    '            # ── Suppress Django autoreloader restarts (multi-layer) ──',
+    '            #',
+    '            # Django restart flow: StatReloader.tick() detects mtime change',
+    '            #   → notify_file_changed(path)',
+    '            #   → file_changed signal dispatch',
+    '            #   → trigger_reload(path)  (if no handler returns True)',
+    '            #   → sys.exit(3)',
+    '            #   → parent process restarts child',
+    '            #',
+    '            # We suppress at TWO layers for robustness:',
+    '            #   1. file_changed signal handler returning True (Django built-in extension point)',
+    '            #   2. Patch trigger_reload() as belt-and-suspenders',
+    '',
+    '            # Layer 1: file_changed signal — returning True prevents trigger_reload()',
+    '            try:',
+    '                from django.utils.autoreload import file_changed as _file_changed_signal',
+    '                def _suppress_autoreload(sender, file_path, **kwargs):',
+    '                    _dbg_log(f"Autoreload suppressed (signal): {file_path}")',
+    '                    return True',
+    '                _file_changed_signal.connect(_suppress_autoreload)',
+    '                _dbg_log("Django file_changed signal handler registered")',
+    '            except Exception as _e:',
+    '                _dbg_log(f"Could not register file_changed handler: {_e}")',
+    '',
+    '            # Layer 2: patch trigger_reload() to prevent sys.exit(3)',
+    '            try:',
+    '                import django.utils.autoreload as _autoreload_mod',
+    '                def _suppressed_trigger_reload(filename):',
+    '                    _dbg_log(f"Autoreload suppressed (trigger_reload): {filename}")',
+    '                _autoreload_mod.trigger_reload = _suppressed_trigger_reload',
+    '                _dbg_log("Django trigger_reload patched")',
+    '            except Exception as _e:',
+    '                _dbg_log(f"Could not patch trigger_reload: {_e}")',
+    '',
+    '            def _deep_reload_module(_mod):',
+    '                """Reload module AND patch __code__ on the ORIGINAL function objects',
+    '                (from before any reload) so Django URL patterns always execute latest code.',
+    '',
+    '                Key insight: on reload N, mod.__dict__ has classes from reload N-1.',
+    '                But Django holds references to the ORIGINAL (pre-reload) functions.',
+    '                We must always patch those originals, not the intermediate versions."""',
+    '                import types',
+    '',
+    '                _mod_name = _mod.__name__',
+    '',
+    '                # First reload: save ORIGINAL function refs (the ones Django holds)',
+    '                if _mod_name not in _original_mod_funcs:',
+    '                    _original_mod_funcs[_mod_name] = {}',
+    '                    _original_mod_class_methods[_mod_name] = {}',
+    '                    for _attr_name, _obj in _mod.__dict__.items():',
+    '                        if isinstance(_obj, types.FunctionType):',
+    '                            _original_mod_funcs[_mod_name][_attr_name] = _obj',
+    '                        elif isinstance(_obj, type):',
+    '                            _original_mod_class_methods[_mod_name][_attr_name] = {}',
+    '                            for _mname, _mobj in _obj.__dict__.items():',
+    '                                if isinstance(_mobj, types.FunctionType):',
+    '                                    _original_mod_class_methods[_mod_name][_attr_name][_mname] = _mobj',
+    '                                elif isinstance(_mobj, (classmethod, staticmethod)):',
+    '                                    _inner = getattr(_mobj, "__func__", None)',
+    '                                    if _inner:',
+    '                                        _original_mod_class_methods[_mod_name][_attr_name][_mname] = _inner',
+    '                    _dbg_log(f"Saved original refs for {_mod_name}")',
+    '',
+    '                # Reload the module (creates new classes/functions in __dict__)',
+    '                importlib.reload(_mod)',
+    '',
+    '                # Patch ORIGINAL functions with LATEST code (every time)',
+    '                _patched = []',
+    '                for _attr_name, _orig_fn in _original_mod_funcs[_mod_name].items():',
+    '                    _new_fn = _mod.__dict__.get(_attr_name)',
+    '                    if isinstance(_new_fn, types.FunctionType):',
+    '                        _orig_fn.__code__ = _new_fn.__code__',
+    '                        _orig_fn.__defaults__ = _new_fn.__defaults__',
+    '                        _orig_fn.__kwdefaults__ = getattr(_new_fn, "__kwdefaults__", None)',
+    '                        _orig_fn.__dict__.update(_new_fn.__dict__)',
+    '                        _patched.append(_attr_name)',
+    '',
+    '                # Patch ORIGINAL class methods with LATEST code',
+    '                for _cls_name, _methods in _original_mod_class_methods[_mod_name].items():',
+    '                    _new_cls = _mod.__dict__.get(_cls_name)',
+    '                    if not isinstance(_new_cls, type):',
+    '                        continue',
+    '                    for _mname, _orig_mfn in _methods.items():',
+    '                        _new_raw = _new_cls.__dict__.get(_mname)',
+    '                        _new_mfn = None',
+    '                        if isinstance(_new_raw, types.FunctionType):',
+    '                            _new_mfn = _new_raw',
+    '                        elif isinstance(_new_raw, (classmethod, staticmethod)):',
+    '                            _new_mfn = getattr(_new_raw, "__func__", None)',
+    '                        if _new_mfn and isinstance(_orig_mfn, types.FunctionType):',
+    '                            _orig_mfn.__code__ = _new_mfn.__code__',
+    '                            _orig_mfn.__defaults__ = _new_mfn.__defaults__',
+    '                            _orig_mfn.__kwdefaults__ = getattr(_new_mfn, "__kwdefaults__", None)',
+    '                            _orig_mfn.__dict__.update(_new_mfn.__dict__)',
+    '                            _patched.append(f"{_cls_name}.{_mname}")',
+    '',
+    '                return _patched',
+    '',
+    '            def _reload_watcher():',
+    '                while True:',
+    '                    try:',
+    '                        time.sleep(0.3)',
+    '                        if not _os.path.exists(_reload_file):',
+    '                            continue',
+    '                        with open(_reload_file) as _f:',
+    '                            _paths = [_p.strip() for _p in _f.read().strip().split("\\n") if _p.strip()]',
+    '                        _os.unlink(_reload_file)',
+    '                        if not _paths:',
+    '                            continue',
+    '',
+    '                        importlib.invalidate_caches()',
+    '                        _results = []',
+    '',
+    '                        for _fpath in _paths:',
+    '                            _found = False',
+    '                            _abs_fpath = _os.path.abspath(_fpath)',
+    '                            for _name, _mod in list(_sys.modules.items()):',
+    '                                _mod_file = getattr(_mod, "__file__", None)',
+    '                                if not _mod_file:',
+    '                                    continue',
+    '                                _abs_mod = _os.path.abspath(_mod_file)',
+    '                                if _abs_mod.endswith(".pyc"):',
+    '                                    _abs_mod = _abs_mod[:-1]',
+    '                                if _abs_mod == _abs_fpath:',
+    '                                    try:',
+    '                                        _patched = _deep_reload_module(_mod)',
+    '                                        _patch_list = ", ".join(_patched) if _patched else ""',
+    '                                        _patch_info = f" (patched: {_patch_list})" if _patched else ""',
+    '                                        _msg = f"OK:{_name}{_patch_info}"',
+    '                                        _dbg_log(f"Hot reloaded: {_name}{_patch_info}")',
+    '                                        _results.append(_msg)',
+    '                                    except Exception as _e:',
+    '                                        _msg = f"ERR:{_name}:{_e}"',
+    '                                        _dbg_log(f"Reload failed: {_name}: {_e}")',
+    '                                        _results.append(_msg)',
+    '                                    _found = True',
+    '                                    break',
+    '                            if not _found:',
+    '                                _msg = f"SKIP:{_fpath}"',
+    '                                _dbg_log(f"No loaded module for: {_fpath}")',
+    '                                _results.append(_msg)',
+    '',
+    '                        try:',
+    '                            with open(_reload_result_file, "w") as _f:',
+    '                                _f.write("\\n".join(_results))',
+    '                        except Exception:',
+    '                            pass',
+    '',
+    '                    except Exception as _e:',
+    '                        _dbg_log(f"Reload watcher error: {_e}")',
+    '',
+    '            _t = threading.Thread(target=_reload_watcher, daemon=True, name="django-debug-hot-reload")',
+    '            _t.start()',
+    '            _dbg_log("Hot reload watcher started")',
+    '',
     '        def _django_debugger_signal_handler(signum, frame):',
+    '            global _hot_reload_watcher_started',
     '            _dbg_log(f"Signal {signum} received")',
     '            _active_file = f"{_PORT_FILE_DIR}/{_os.getpid()}.active"',
     '            try:',
@@ -117,6 +298,10 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                with open(_active_file, "w") as _f:',
     '                    _f.write(str(_port))',
     '                _dbg_log(f"debugpy listening on 127.0.0.1:{_port}")',
+    '                # Start hot reload watcher after debugpy is active',
+    '                if not _hot_reload_watcher_started:',
+    '                    _start_hot_reload_watcher()',
+    '                    _hot_reload_watcher_started = True',
     '            except RuntimeError as e:',
     '                if "already" in str(e).lower():',
     '                    _dbg_log(f"debugpy already listening: {e}")',
@@ -212,6 +397,33 @@ export class DebugpyInjector {
   }
 
   /**
+   * Request hot reload of changed Python files in a running process.
+   * Writes file paths to the reload request file; the bootstrap's
+   * reload watcher thread picks them up and does importlib.reload().
+   */
+  async requestHotReload(pid: number, filePaths: string[]): Promise<void> {
+    if (filePaths.length === 0) { return; }
+    await fs.mkdir(PORT_FILE_DIR, { recursive: true });
+    await fs.writeFile(reloadFilePath(pid), filePaths.join('\n'), 'utf-8');
+    log(`[Injector] Hot reload requested for PID=${pid}: ${filePaths.join(', ')}`);
+  }
+
+  /**
+   * Read the result of the last hot reload request.
+   * Returns an array of result lines (OK:module, ERR:module:reason, SKIP:path).
+   */
+  async readReloadResult(pid: number): Promise<string[] | null> {
+    const resultFile = reloadResultFilePath(pid);
+    try {
+      const content = await fs.readFile(resultFile, 'utf-8');
+      await fs.unlink(resultFile).catch(() => {});
+      return content.trim().split('\n').filter(Boolean);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Check if the bootstrap is installed in a venv.
    */
   async isBootstrapInstalled(venvSitePackages: string): Promise<boolean> {
@@ -219,6 +431,20 @@ export class DebugpyInjector {
       await fs.access(path.join(venvSitePackages, PTH_FILENAME));
       await fs.access(path.join(venvSitePackages, `${BOOTSTRAP_MODULE}.py`));
       return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if the installed bootstrap version matches the current version.
+   * Returns true if up-to-date, false if outdated or missing.
+   */
+  async isBootstrapUpToDate(venvSitePackages: string): Promise<boolean> {
+    try {
+      const modulePath = path.join(venvSitePackages, `${BOOTSTRAP_MODULE}.py`);
+      const content = await fs.readFile(modulePath, 'utf-8');
+      return content.includes(`bootstrap ${BOOTSTRAP_VERSION}`);
     } catch {
       return false;
     }

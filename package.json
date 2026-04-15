@@ -2,7 +2,7 @@
   "name": "django-process-debugger",
   "displayName": "Django Process Debugger",
   "description": "Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "icon.png",
@@ -81,6 +81,16 @@
           "type": "boolean",
           "default": true,
           "description": "When true, the debugger only steps through your code. When false, it also steps into library/framework code (e.g., Django, Celery internals)."
+        },
+        "djangoProcessDebugger.redirectOutput": {
+          "type": "boolean",
+          "default": true,
+          "description": "Redirect stdout/stderr to the VS Code Debug Console. When true, print() output appears in the Debug Console instead of only in the terminal."
+        },
+        "djangoProcessDebugger.hotReload": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true, changed Python files are hot-reloaded via importlib.reload() without restarting the Django process, keeping the debug session alive. Django's autoreloader is suppressed while active."
         }
       }
     },

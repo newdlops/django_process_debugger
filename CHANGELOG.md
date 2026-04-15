@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.2.4] - 2026-04-15
+
+### Added
+- **Hot Reload**: Edit Python files while debugging — changes are applied instantly without restarting Django or losing your debug session
+  - Background watcher thread in the Django process monitors for reload requests
+  - `importlib.reload()` + `__code__` patching ensures all existing references (URL patterns, decorators, CBV `as_view()` closures) execute the updated code
+  - Persistent original-reference tracking: always patches the functions Django actually holds, even after multiple edits
+  - Status bar indicator shows hot reload state
+  - File change debouncing (500ms) to batch rapid saves
+  - Skips non-project files (site-packages, __pycache__, venv, migrations)
+- **Django autoreloader suppression** (two-layer):
+  - `file_changed` signal handler returning `True` (Django's built-in extension point)
+  - `trigger_reload()` patched to prevent `sys.exit(3)`
+  - Works with both `StatReloader` and `WatchmanReloader` (Django 4.x/5.x)
+- **`redirectOutput` setting** (default: `true`): `print()` and stdout/stderr now appear in the VS Code Debug Console instead of only in the terminal
+- **`hotReload` setting** (default: `true`): toggle hot reload on/off
+- **Bootstrap auto-update on attach**: detects outdated bootstrap versions and auto-updates site-packages (Django restart still required to load the new bootstrap)
+- **Bootstrap version check**: `isBootstrapUpToDate()` method compares installed vs current version
+
+### Changed
+- Debug configuration now includes `redirectOutput` flag in DAP attach request
+- Bootstrap version bumped to `2026.04.15`
+
 ## [0.2.0] - 2026-04-07
 
 ### Added
