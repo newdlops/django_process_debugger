@@ -273,18 +273,18 @@ describe('Feature: decorator-wrapped method reload via __wrapped__ chain (log.tx
     const okLine = results.find((r) => r.startsWith('OK:sampleapp.decorated'));
     assert.ok(okLine, `no OK line: ${JSON.stringify(results)}`);
 
-    // The fix makes _deep_reload_module follow __wrapped__ and patch the
-    // innermost function. The patched list should reflect the unwrap step.
+    // The fix walks closures + __wrapped__ and patches the innermost user
+    // function by co_qualname. Patched list should name it.
     assert.ok(
-      okLine.includes('top_level') && okLine.includes('unwrapped'),
-      `expected "(+N unwrapped)" suffix for top_level, got: ${okLine}`,
+      okLine.includes('top_level'),
+      `expected top_level in patched list, got: ${okLine}`,
     );
 
     // The saved wrapper — held externally — now delegates to the patched
     // inner function and returns new code.
     const afterWrapper = await harness.call('saved_wrapper()');
     assert.strictEqual(afterWrapper, "'top v2-via-closure'",
-      'BEFORE the fix this returned "top v1" because the wrapper closure captured the old inner function. With __wrapped__ unwrap, the inner is patched in place.');
+      'BEFORE the fix this returned "top v1" because the wrapper closure captured the old inner function. With closure walk, the inner is patched in place.');
   });
 
   it('decorated class method: reload propagates to externally held instance', async function () {
@@ -307,8 +307,8 @@ describe('Feature: decorator-wrapped method reload via __wrapped__ chain (log.tx
     const okLine = results?.find((r) => r.startsWith('OK:sampleapp.decorated'));
     assert.ok(okLine, `no OK line: ${JSON.stringify(results)}`);
     assert.ok(
-      okLine.includes('DecoratedView.render') && okLine.includes('unwrapped'),
-      `expected DecoratedView.render unwrap in patched list, got: ${okLine}`,
+      okLine.includes('DecoratedView.render'),
+      `expected DecoratedView.render in patched list, got: ${okLine}`,
     );
 
     const after = await harness.call('saved_view.render()');
@@ -358,7 +358,7 @@ describe('Feature: deep-reload skips imported symbols (log.txt bug #3)', functio
 
     // Parse the patched list out of "OK:name (patched: a, b, c)".
     const match = okLine.match(/\(patched: (.+?)\)$/);
-    const patched = match ? match[1].split(/,\s*/).map((s) => s.replace(/\s*\(\+\d+ unwrapped\)$/, '')) : [];
+    const patched = match ? match[1].split(/,\s*/) : [];
 
     // Must include locally-defined things.
     assert.ok(patched.includes('my_function'),

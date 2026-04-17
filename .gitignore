@@ -1,5 +1,18 @@
+# Build + deps
 out/
 node_modules/
 .vscode-test/
 *.vsix
 test-results/
+
+# Runtime logs / debug output
+log.txt
+*.log
+
+# Python bytecode from vendored debugpy (generated when running tests locally)
+**/__pycache__/
+*.py[co]
+
+# OS / IDE scratch
+.DS_Store
+.claude/

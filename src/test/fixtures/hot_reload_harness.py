@@ -17,13 +17,16 @@ Protocol:
        SKIP:/absolute/path
 
 Deep-reload semantics (must match bootstrap):
-  - Snapshot each class's __dict__ BEFORE reload.
-  - importlib.reload(mod) rebinds mod.ClassName to NEW class (old one is still
-    alive via outside references).
-  - For each (old_name, old_class_dict): find the NEW class, iterate OLD method
-    functions, and overwrite __code__ / __defaults__ / __kwdefaults__ / __dict__
-    in place so that outside code still holding the OLD class reference sees
-    new behavior on next call.
+  - BEFORE importlib.reload, walk mod.__dict__ and follow __wrapped__ AND
+    __closure__ cells to collect every function whose __code__.co_filename ==
+    mod.__file__. Index by co_qualname so OLD/NEW pair by identity across
+    reload even if the decorator chain reshapes the object graph.
+  - importlib.reload(mod) rebinds mod attributes to fresh objects.
+  - Walk NEW mod.__dict__ the same way → {qualname: new_fn}.
+  - For each qualname, overwrite OLD.__code__ / __defaults__ / __kwdefaults__
+    / __dict__ in place. Outside holders (Django URL conf / GraphQL schema /
+    Celery registry) keep the SAME object and dispatch through the fresh
+    bytecode on next call.
 
 Usage:
     python hot_reload_harness.py APP_DIR [MODULE_TO_PREIMPORT ...]
@@ -32,6 +35,7 @@ Special stdin commands (for testing externally held references):
     CALL <python-expression>   -> print repr(eval(expr))
 """
 import importlib
+import linecache
 import os
 import signal
 import sys
@@ -48,82 +52,114 @@ RELOAD_POLL_SEC = 0.05  # tighter than real bootstrap (0.3s) so tests are fast
 _watcher_paused = threading.Event()
 
 
-def _unwrap_chain(fn):
-    """Return [fn, fn.__wrapped__, fn.__wrapped__.__wrapped__, ...].
+# Persistent storage of original function refs per module. Mirrors the
+# bootstrap: we snapshot once and keep patching those same objects in place on
+# every subsequent reload so externally held references stay live.
+_original_mod_funcs: dict = {}
 
-    Mirrors bootstrap behavior: follow functools.wraps chains so decorator-
-    wrapped methods get their innermost user function patched.
-    """
-    chain = []
+
+def _code_key(code):
+    qn = getattr(code, 'co_qualname', None)
+    return qn if qn else code.co_name
+
+
+def _walk_reachable(start_values):
+    """Yield every FunctionType reachable from start_values via __wrapped__,
+    __closure__ cells, and class __dict__ members. id()-tracked."""
     seen = set()
-    while isinstance(fn, types.FunctionType) and id(fn) not in seen:
-        seen.add(id(fn))
-        chain.append(fn)
-        fn = getattr(fn, '__wrapped__', None)
-    return chain
-
-
-def _patch_fn_pair(old_fn, new_fn, label, patched_list):
-    old_chain = _unwrap_chain(old_fn)
-    new_chain = _unwrap_chain(new_fn)
-    levels = 0
-    for o, n in zip(old_chain, new_chain):
-        o.__code__ = n.__code__
-        o.__defaults__ = n.__defaults__
-        o.__kwdefaults__ = getattr(n, '__kwdefaults__', None)
-        o.__dict__.update(n.__dict__)
-        levels += 1
-    if levels:
-        suffix = '' if levels == 1 else f' (+{levels - 1} unwrapped)'
-        patched_list.append(f"{label}{suffix}")
+    stack = list(start_values)
+    while stack:
+        obj = stack.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if isinstance(obj, types.FunctionType):
+            yield obj
+            w = getattr(obj, '__wrapped__', None)
+            if w is not None:
+                stack.append(w)
+            cl = getattr(obj, '__closure__', None)
+            if cl:
+                for cell in cl:
+                    try:
+                        stack.append(cell.cell_contents)
+                    except ValueError:
+                        pass
+        elif isinstance(obj, type):
+            for mobj in list(obj.__dict__.values()):
+                if isinstance(mobj, types.FunctionType):
+                    stack.append(mobj)
+                elif isinstance(mobj, (classmethod, staticmethod)):
+                    inner = getattr(mobj, '__func__', None)
+                    if inner is not None:
+                        stack.append(inner)
+                elif isinstance(mobj, property):
+                    for acc in (mobj.fget, mobj.fset, mobj.fdel):
+                        if acc is not None:
+                            stack.append(acc)
 
 
 def _deep_reload_module(mod):
-    """Mirror of the bootstrap's deep-reload — import filter + unwrap chain.
+    """Mirror of the bootstrap's deep-reload.
 
-    Returns "ClassName.methodName" / "functionName" entries that were patched.
+    Walks closures (not just __wrapped__) and pairs OLD/NEW by co_qualname so
+    decorator chains without @functools.wraps still get their inner user
+    function patched in place. Returns the patched qualnames.
     """
     mod_name = mod.__name__
-    patched = []
+    mod_file = getattr(mod, '__file__', None)
+    mod_real = os.path.realpath(mod_file) if mod_file else None
 
-    old_funcs = {}
-    old_class_methods = {}
-    for attr_name, obj in mod.__dict__.items():
-        obj_mod = getattr(obj, '__module__', None)
-        if obj_mod is not None and obj_mod != mod_name:
-            continue  # skip imported symbols
-        if isinstance(obj, types.FunctionType):
-            old_funcs[attr_name] = obj
-        elif isinstance(obj, type):
-            old_class_methods[attr_name] = (obj, {})
-            for mname, mobj in obj.__dict__.items():
-                if isinstance(mobj, types.FunctionType):
-                    old_class_methods[attr_name][1][mname] = mobj
-                elif isinstance(mobj, (classmethod, staticmethod)):
-                    inner = getattr(mobj, '__func__', None)
-                    if inner:
-                        old_class_methods[attr_name][1][mname] = inner
+    def _in_this_file(code):
+        if mod_real is None:
+            return False
+        f = getattr(code, 'co_filename', None)
+        if not f:
+            return False
+        try:
+            return os.path.realpath(f) == mod_real
+        except Exception:  # noqa: BLE001
+            return f == mod_file
+
+    def _index(target_mod):
+        idx = {}
+        for fn in _walk_reachable(list(target_mod.__dict__.values())):
+            c = fn.__code__
+            if not _in_this_file(c):
+                continue
+            idx.setdefault(_code_key(c), fn)
+        return idx
+
+    if mod_name not in _original_mod_funcs:
+        _original_mod_funcs[mod_name] = _index(mod)
 
     importlib.reload(mod)
 
-    for attr_name, old_fn in old_funcs.items():
-        new_fn = mod.__dict__.get(attr_name)
-        if isinstance(new_fn, types.FunctionType):
-            _patch_fn_pair(old_fn, new_fn, attr_name, patched)
+    try:
+        linecache.checkcache()
+        if mod_file:
+            linecache.checkcache(mod_file)
+    except Exception:  # noqa: BLE001
+        pass
 
-    for cls_name, (_old_cls, methods) in old_class_methods.items():
-        new_cls = mod.__dict__.get(cls_name)
-        if not isinstance(new_cls, type):
+    new_fns = _index(mod)
+    patched = []
+    orig_map = _original_mod_funcs[mod_name]
+    for qn, old_fn in list(orig_map.items()):
+        new_fn = new_fns.get(qn)
+        if new_fn is None or new_fn is old_fn:
             continue
-        for mname, old_mfn in methods.items():
-            new_raw = new_cls.__dict__.get(mname)
-            new_mfn = None
-            if isinstance(new_raw, types.FunctionType):
-                new_mfn = new_raw
-            elif isinstance(new_raw, (classmethod, staticmethod)):
-                new_mfn = getattr(new_raw, '__func__', None)
-            if new_mfn and isinstance(old_mfn, types.FunctionType):
-                _patch_fn_pair(old_mfn, new_mfn, f"{cls_name}.{mname}", patched)
+        try:
+            old_fn.__code__ = new_fn.__code__
+            old_fn.__defaults__ = new_fn.__defaults__
+            old_fn.__kwdefaults__ = getattr(new_fn, '__kwdefaults__', None)
+            old_fn.__dict__.update(new_fn.__dict__)
+            patched.append(qn)
+        except Exception:  # noqa: BLE001
+            pass
+
+    for qn, new_fn in new_fns.items():
+        orig_map.setdefault(qn, new_fn)
 
     return patched
 
