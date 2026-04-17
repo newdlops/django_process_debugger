@@ -12,3 +12,6 @@ tsconfig.json
 *.vsix
 CLAUDE.md
 .tool-versions
+out/test/**
+test-results/**
+optimization.md

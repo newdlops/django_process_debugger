@@ -8,6 +8,7 @@ import { DjangoProcess, DjangoProcessFinder } from './processFinder';
 import { DebugpyInjector, BootstrapNotLoadedError, BootstrapNotInstalledError, BOOTSTRAP_VERSION } from './debugpyInjector';
 import { DebugpyManager, DebugpyProvisioningInfo } from './debugpyManager';
 import { log, logError, getLogger } from './logger';
+import { shouldIgnoreForHotReload } from './hotReloadFilter';
 import {
   RuntimeCandidate,
   SetupProfile,
@@ -84,6 +85,12 @@ export function activate(context: vscode.ExtensionContext) {
     }
   );
 
+  // Sessions currently paused at a breakpoint (all threads stopped).
+  // The Python-side hot-reload watcher thread is frozen during this period,
+  // so reload requests are queued until the user resumes execution.
+  const pausedSessions = new Set<string>();
+  interface DapEvent { type?: string; event?: string; body?: { allThreadsStopped?: boolean } }
+
   // DAP message tracker for debugging the debug protocol itself
   const tracker = vscode.debug.registerDebugAdapterTrackerFactory(
     'django-process',
@@ -97,12 +104,25 @@ export function activate(context: vscode.ExtensionContext) {
             log(`[DAP] -> send: ${JSON.stringify(message)}`);
           },
           onDidSendMessage(message: unknown) {
+            const msg = message as DapEvent;
+            if (msg?.type === 'event') {
+              if (msg.event === 'stopped' && msg.body?.allThreadsStopped) {
+                pausedSessions.add(session.id);
+                log(`[HotReload] Session ${session.id} paused (allThreadsStopped)`);
+              } else if (msg.event === 'continued') {
+                pausedSessions.delete(session.id);
+                log(`[HotReload] Session ${session.id} resumed`);
+              } else if (msg.event === 'terminated' || msg.event === 'exited') {
+                pausedSessions.delete(session.id);
+              }
+            }
             log(`[DAP] <- recv: ${JSON.stringify(message)}`);
           },
           onError(error: Error) {
             logError(`[DAP] Error`, error);
           },
           onExit(code: number | undefined, signal: string | undefined) {
+            pausedSessions.delete(session.id);
             log(`[DAP] Exit: code=${code} signal=${signal}`);
           },
         };
@@ -1179,13 +1199,7 @@ export function activate(context: vscode.ExtensionContext) {
     if (!hotReloadPid) { return; }
     const filePath = uri.fsPath;
 
-    // Ignore files outside workspace, inside venvs, __pycache__, migrations, etc.
-    if (filePath.includes('site-packages') ||
-        filePath.includes('__pycache__') ||
-        filePath.includes('.venv') ||
-        filePath.includes('/venv/') ||
-        filePath.includes('node_modules') ||
-        filePath.includes('/migrations/')) {
+    if (shouldIgnoreForHotReload(filePath)) {
       return;
     }
 
@@ -1213,10 +1227,29 @@ export function activate(context: vscode.ExtensionContext) {
     try {
       await injector.requestHotReload(pid, files);
 
-      // Wait briefly for the Python watcher to process and write results
-      await new Promise((r) => setTimeout(r, 1000));
+      // First, poll briefly (3s) assuming the watcher is running. This covers
+      // the common "not at a breakpoint" case without stalling the UI.
+      let results = await injector.pollReloadResult(pid, 3_000);
 
-      const results = await injector.readReloadResult(pid);
+      // If no result yet AND the request file is still on disk, the Python
+      // watcher hasn't processed it. Most common cause: debugpy paused all
+      // threads at a breakpoint (including django-debug-hot-reload). Switch
+      // status to "queued" and keep polling until the session resumes — or
+      // give up after 60s to avoid zombie UI state.
+      if (!results && await injector.isReloadPending(pid)) {
+        const atBreakpoint = pausedSessions.size > 0;
+        hotReloadStatusItem.text = atBreakpoint
+          ? '$(clock) Reload queued — continue to apply'
+          : '$(clock) Reload queued...';
+        hotReloadStatusItem.tooltip = atBreakpoint
+          ? `Hot reload is waiting because the process is paused at a breakpoint. ` +
+            `The Python watcher thread cannot run until you continue.`
+          : undefined;
+        log(`[HotReload] Result not ready after 3s — pending=${await injector.isReloadPending(pid)}, ` +
+          `paused=${atBreakpoint}. Extending timeout.`);
+        results = await injector.pollReloadResult(pid, 60_000);
+      }
+
       if (results) {
         const ok = results.filter((r) => r.startsWith('OK:'));
         const err = results.filter((r) => r.startsWith('ERR:'));
@@ -1239,9 +1272,14 @@ export function activate(context: vscode.ExtensionContext) {
         }
 
         log(`[HotReload] Results: ${ok.length} OK, ${err.length} ERR, ${skip.length} SKIP`);
+      } else {
+        log(`[HotReload] No result after extended wait — reload may have been lost`);
       }
     } catch (err) {
       logError('[HotReload] Failed to request reload', err);
+    } finally {
+      hotReloadStatusItem.tooltip = `Hot reload active for PID ${pid}. ` +
+        `Changed .py files are reloaded without restarting.`;
     }
 
     hotReloadStatusItem.text = '$(flame) Hot Reload';

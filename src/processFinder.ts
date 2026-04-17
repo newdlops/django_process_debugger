@@ -130,8 +130,8 @@ export class DjangoProcessFinder {
       return parseInt(uvicornPortMatch[1], 10);
     }
 
-    // gunicorn -b / --bind [addr:]port
-    const gunicornMatch = command.match(/(?:-b|--bind)\s+(?:\S+:)?(\d+)/);
+    // gunicorn -b / --bind [addr:]port  (addr can be empty, e.g. `-b :8000`)
+    const gunicornMatch = command.match(/(?:-b|--bind)\s+(?:[^\s]*:)?(\d+)/);
     if (gunicornMatch) {
       return parseInt(gunicornMatch[1], 10);
     }

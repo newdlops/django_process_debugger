@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.2.5] - 2026-04-17
+
+### Fixed
+- **Hot reload silently failing at breakpoints** — when debugpy stopped all threads at a breakpoint, the Python-side reload watcher thread was also frozen, so reload requests timed out against the extension's fixed 1s wait and disappeared from the UI. The extension now polls for the result (3s short poll, then 60s long poll if the request is still queued) and tracks paused sessions via DAP `stopped`/`continued` events. Queued reloads now surface as a `$(clock) Reload queued — continue to apply` status bar indicator and are delivered the moment execution resumes.
+- **Decorator-wrapped methods not seeing new code after reload** — functions decorated with `@functools.wraps` capture the inner function in a closure; patching only the wrapper's `__code__` left the closure pointing at the pre-reload body, so GraphQL resolvers / Django views wrapped with `@login_required`, `@company_owner_required`, etc. reported reload success but served stale code. The bootstrap's `_deep_reload_module` now follows the `__wrapped__` chain and patches every level of the unwrap graph. Patched entries for multi-level wrappers are reported as `name (+N unwrapped)`.
+- **Misleading "patched" list for imported symbols** — `from typing import TypedDict, cast` and similar imports were appearing in the reload result's patched list, obscuring what actually changed. `_deep_reload_module` now skips any symbol whose `__module__` doesn't match the reloaded module.
+
+### Changed
+- Bootstrap version bumped to `2026.04.17`. Existing venvs auto-upgrade on next attach.
+- `DebugpyInjector` gained `pollReloadResult(pid, timeoutMs, intervalMs)` and `isReloadPending(pid)` for non-blocking result retrieval.
+- `FileSystemWatcher` exclusion rule extracted to `src/hotReloadFilter.ts` (`shouldIgnoreForHotReload`) for unit testing.
+
+### Added — developer tooling
+- End-to-end test infrastructure (`src/test/suite/*.test.ts`, `@vscode/test-electron`) covering:
+  - Process discovery (single + multi-process)
+  - Bootstrap install/update/uninstall lifecycle + non-target process gating
+  - Hot reload full cycle via a Python harness that mirrors the bootstrap's reload watcher and deep-reload logic
+  - Hot reload reference semantics (URL-conf dict capture, class-method in-place patching, module indirection, constant by-value capture, async coroutine capture)
+  - Multi-worker isolation (one worker reloaded, others untouched)
+  - Breakpoint-deadlock recovery, decorator unwrap, import filter
+- `PerfReporter` generates `test-results/perf-report.md` + `.json` on every `npm test` run, recording per-measurement wall times.
+- `optimization.md` — prioritized improvement backlog with before/after baselines, scenario matrix, and production-bug diagnosis rooted in real `log.txt` evidence.
+
 ## [0.2.4] - 2026-04-15
 
 ### Added

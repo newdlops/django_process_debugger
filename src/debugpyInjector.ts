@@ -8,7 +8,7 @@ const execFileAsync = promisify(execFile);
 
 const PTH_FILENAME = 'django_process_debugger.pth';
 const BOOTSTRAP_MODULE = '_django_debug_bootstrap';
-export const BOOTSTRAP_VERSION = '2026.04.15';
+export const BOOTSTRAP_VERSION = '2026.04.17';
 
 /**
  * Bootstrap script installed into the target venv's site-packages.
@@ -145,21 +145,58 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                _dbg_log(f"Could not patch trigger_reload: {_e}")',
     '',
     '            def _deep_reload_module(_mod):',
-    '                """Reload module AND patch __code__ on the ORIGINAL function objects',
-    '                (from before any reload) so Django URL patterns always execute latest code.',
+    '                """Reload the module AND patch __code__ on the ORIGINAL function',
+    '                objects (captured before any reload). Two extra behaviors layered on',
+    '                top of the plain importlib.reload:',
     '',
-    '                Key insight: on reload N, mod.__dict__ has classes from reload N-1.',
-    '                But Django holds references to the ORIGINAL (pre-reload) functions.',
-    '                We must always patch those originals, not the intermediate versions."""',
+    '                1. Skip imported symbols. Anything with __module__ != this module',
+    '                   was brought in via `from X import Y`; reloading this module does',
+    '                   nothing to those objects and listing them as "patched" is noise.',
+    '',
+    '                2. Follow the __wrapped__ chain. When a user decorates a method',
+    '                   with functools.wraps, the wrapper captures the inner function in',
+    '                   its closure. Patching only the wrapper __code__ leaves the',
+    '                   closure pointing at the pre-reload body — so code changes look',
+    '                   like they reloaded but actually do not run. We recursively',
+    '                   patch every level of __wrapped__ on BOTH old and new to keep',
+    '                   the original (Django-held) wrapper delegating to the latest',
+    '                   user code."""',
     '                import types',
     '',
     '                _mod_name = _mod.__name__',
     '',
-    '                # First reload: save ORIGINAL function refs (the ones Django holds)',
+    '                def _unwrap_chain(_fn):',
+    '                    _chain = []',
+    '                    _seen = set()',
+    '                    while isinstance(_fn, types.FunctionType) and id(_fn) not in _seen:',
+    '                        _seen.add(id(_fn))',
+    '                        _chain.append(_fn)',
+    '                        _fn = getattr(_fn, "__wrapped__", None)',
+    '                    return _chain',
+    '',
+    '                def _patch_fn_pair(_old_fn, _new_fn, _label, _patched_list):',
+    '                    _old_chain = _unwrap_chain(_old_fn)',
+    '                    _new_chain = _unwrap_chain(_new_fn)',
+    '                    _levels = 0',
+    '                    for _o, _n in zip(_old_chain, _new_chain):',
+    '                        _o.__code__ = _n.__code__',
+    '                        _o.__defaults__ = _n.__defaults__',
+    '                        _o.__kwdefaults__ = getattr(_n, "__kwdefaults__", None)',
+    '                        _o.__dict__.update(_n.__dict__)',
+    '                        _levels += 1',
+    '                    if _levels:',
+    '                        _suffix = "" if _levels == 1 else f" (+{_levels - 1} unwrapped)"',
+    '                        _patched_list.append(f"{_label}{_suffix}")',
+    '',
+    '                # First reload: save ORIGINAL function refs (the ones Django holds).',
+    '                # Import filter: skip any symbol whose __module__ points somewhere else.',
     '                if _mod_name not in _original_mod_funcs:',
     '                    _original_mod_funcs[_mod_name] = {}',
     '                    _original_mod_class_methods[_mod_name] = {}',
     '                    for _attr_name, _obj in _mod.__dict__.items():',
+    '                        _obj_mod = getattr(_obj, "__module__", None)',
+    '                        if _obj_mod is not None and _obj_mod != _mod_name:',
+    '                            continue',
     '                        if isinstance(_obj, types.FunctionType):',
     '                            _original_mod_funcs[_mod_name][_attr_name] = _obj',
     '                        elif isinstance(_obj, type):',
@@ -176,18 +213,14 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                # Reload the module (creates new classes/functions in __dict__)',
     '                importlib.reload(_mod)',
     '',
-    '                # Patch ORIGINAL functions with LATEST code (every time)',
+    '                # Patch ORIGINAL functions, drilling into __wrapped__ chains.',
     '                _patched = []',
     '                for _attr_name, _orig_fn in _original_mod_funcs[_mod_name].items():',
     '                    _new_fn = _mod.__dict__.get(_attr_name)',
     '                    if isinstance(_new_fn, types.FunctionType):',
-    '                        _orig_fn.__code__ = _new_fn.__code__',
-    '                        _orig_fn.__defaults__ = _new_fn.__defaults__',
-    '                        _orig_fn.__kwdefaults__ = getattr(_new_fn, "__kwdefaults__", None)',
-    '                        _orig_fn.__dict__.update(_new_fn.__dict__)',
-    '                        _patched.append(_attr_name)',
+    '                        _patch_fn_pair(_orig_fn, _new_fn, _attr_name, _patched)',
     '',
-    '                # Patch ORIGINAL class methods with LATEST code',
+    '                # Patch ORIGINAL class methods, drilling into __wrapped__ chains.',
     '                for _cls_name, _methods in _original_mod_class_methods[_mod_name].items():',
     '                    _new_cls = _mod.__dict__.get(_cls_name)',
     '                    if not isinstance(_new_cls, type):',
@@ -200,11 +233,7 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                        elif isinstance(_new_raw, (classmethod, staticmethod)):',
     '                            _new_mfn = getattr(_new_raw, "__func__", None)',
     '                        if _new_mfn and isinstance(_orig_mfn, types.FunctionType):',
-    '                            _orig_mfn.__code__ = _new_mfn.__code__',
-    '                            _orig_mfn.__defaults__ = _new_mfn.__defaults__',
-    '                            _orig_mfn.__kwdefaults__ = getattr(_new_mfn, "__kwdefaults__", None)',
-    '                            _orig_mfn.__dict__.update(_new_mfn.__dict__)',
-    '                            _patched.append(f"{_cls_name}.{_mname}")',
+    '                            _patch_fn_pair(_orig_mfn, _new_mfn, f"{_cls_name}.{_mname}", _patched)',
     '',
     '                return _patched',
     '',
@@ -420,6 +449,47 @@ export class DebugpyInjector {
       return content.trim().split('\n').filter(Boolean);
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Poll until the reload result is available or the timeout expires.
+   * The Python-side watcher thread is suspended by debugpy while the process
+   * is paused at a breakpoint (allThreadsStopped), so a result that doesn't
+   * arrive promptly usually means execution needs to resume first. Callers
+   * should use a long timeout when the session is known-paused.
+   */
+  async pollReloadResult(
+    pid: number,
+    timeoutMs: number,
+    intervalMs: number = 20,
+  ): Promise<string[] | null> {
+    const resultFile = reloadResultFilePath(pid);
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const content = await fs.readFile(resultFile, 'utf-8');
+        await fs.unlink(resultFile).catch(() => {});
+        return content.trim().split('\n').filter(Boolean);
+      } catch {
+        // not yet
+      }
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    return null;
+  }
+
+  /**
+   * Check whether a queued reload request file still sits on disk —
+   * i.e. the Python watcher hasn't consumed it yet. Used to distinguish
+   * "Python-side didn't process" from "Python-side reported nothing".
+   */
+  async isReloadPending(pid: number): Promise<boolean> {
+    try {
+      await fs.access(reloadFilePath(pid));
+      return true;
+    } catch {
+      return false;
     }
   }
 
