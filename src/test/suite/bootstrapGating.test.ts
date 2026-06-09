@@ -120,6 +120,37 @@ describe('Feature: bootstrap gating on non-target processes', function () {
       `expected signal handlers to be installed, got:\n${delta || '(empty)'}`,
     );
   });
+
+  it('celery worker via `python -m celery` triggers bootstrap log entry', async function () {
+    if (!venv) { this.skip(); return; }
+    this.timeout(15_000);
+
+    const snapshot = await readLogSafe(bootstrapLog);
+
+    // `python -m celery worker` rewrites sys.argv to ['-m', 'worker', ...] at
+    // site-init time — the module name "celery" is stripped and argv[0] is the
+    // literal '-m', so detection must consult sys.orig_argv. celery isn't
+    // installed in the temp venv, so the process exits with an ImportError, but
+    // the .pth bootstrap runs during site initialization (BEFORE runpy resolves
+    // the module), so the gate has already decided and logged by then.
+    await execFileAsync(
+      venv!.python,
+      ['-m', 'celery', 'worker', '-n', 'dpd-gating@localhost'],
+      { timeout: 10_000 },
+    ).catch(() => { /* ImportError exit is expected; we only assert on the log */ });
+    await new Promise((r) => setTimeout(r, 300));
+
+    const after = await readLogSafe(bootstrapLog);
+    const delta = stripBefore(after, snapshot);
+    assert.ok(
+      delta.includes('Bootstrap module loaded'),
+      `expected bootstrap log entry for "python -m celery worker", got:\n${delta || '(empty)'}`,
+    );
+    assert.ok(
+      delta.includes('SIGUSR1+SIGUSR2 handlers installed'),
+      `expected signal handlers to be installed for celery worker, got:\n${delta || '(empty)'}`,
+    );
+  });
 });
 
 async function timeSamples(python: string, n: number): Promise<{ median: number; all: number[] }> {

@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.7] - 2026-06-09
+
+### Fixed
+- **Celery workers (and any `python -m …` server) could not be attached** — the bootstrap's process gate inspected `sys.argv`, but at `.pth`/`site` initialization time `python -m celery worker …` has already had its `sys.argv` rewritten to `['-m', '<args…>']`: the module name (`celery`) is stripped and `argv[0]` is the literal `'-m'`. So the `"celery worker"` / `"-m celery worker"` patterns never matched, the SIGUSR1/SIGUSR2 handler was never installed, and attaching failed with `BootstrapNotLoadedError` even after a clean restart. (Django `runserver` was unaffected because it launches as a script, so its `argv` stays intact.) The gate now reads `sys.orig_argv` (Python 3.10+), which preserves the real command line, matches celery by the `celery` + `worker` tokens (tolerating `-A app` in between), and falls back to a `-m … worker` heuristic on Python < 3.10. ASGI/WSGI servers launched via `-m uvicorn|gunicorn|daphne` are now detected as well.
+- Removed the overly-broad `"site-packages"` entry from the tool blocklist: under `python -m <tool>` it could match `argv[0]` (e.g. `…/site-packages/celery/__main__.py`) and falsely exclude real servers. Tool exclusion now relies on the `-m pip` / `-m pytest` / … patterns, which `sys.orig_argv` makes reliable.
+
+### Changed
+- Bootstrap version bumped to `2026.06.09.1`. Existing venvs auto-upgrade on next attach; **restart the Django/Celery process afterward** so the new bootstrap loads at startup.
+
+### Added — tests
+- Regression test: a `python -m celery worker` invocation now installs the signal handler. The gating suite previously only covered the script-form `manage.py runserver`, which is why this regression went unnoticed.
+
 ## [0.2.5] - 2026-04-17
 
 ### Fixed
