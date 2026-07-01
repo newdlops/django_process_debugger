@@ -12,7 +12,7 @@ Attach a debugger to a running Django or Celery process without modifying your c
 - `print()` output redirected to VS Code Debug Console by default
 - Guided runtime setup with preflight checks, recommendation ranking, and workspace profile reuse
 - Auto-discover Python interpreters from running servers, VS Code selection, asdf, pyenv, mise, conda, Poetry, pipenv, Homebrew, and more
-- Port-grouped QuickPick — parent/child processes on the same port shown as one entry
+- Host/port-grouped attach picker — attachable Django servers are grouped by listener host and port
 - Kill processes and fully clean up debug artifacts with one command
 - macOS code signature auto-repair (quarantine removal + ad-hoc re-signing)
 - Workspace-level debug session lock to prevent conflicts across VS Code windows
@@ -38,7 +38,7 @@ Restart your Django server through your normal workflow (`manage.py runserver`, 
 
 Run **Django Debugger: Attach to Django Process** from the Command Palette.
 
-Select the process you want to debug — processes are grouped by port, showing PID and type. The extension automatically resolves the correct child process in the Django process tree, activates debugpy, and connects VS Code's debugger.
+Select the server you want to debug — attachable Django processes are grouped by listener host and port, with the related PIDs shown in the item description. The extension automatically resolves the correct child process in the Django process tree, activates debugpy, and connects VS Code's debugger.
 
 ### 4. Edit & Debug (Hot Reload)
 

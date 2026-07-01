@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- Attach process picker now shows attachable Django server targets grouped by listener host and port, so parent/child/wrapper processes collapse only when they resolve to the same `host:port`.
+
 ## [0.2.7] - 2026-06-09
 
 ### Fixed

@@ -81,6 +81,24 @@ describe('Feature: process discovery', function () {
     }
   });
 
+  describe('endpoint extraction', function () {
+    const cases: Array<[string, { host: string; port: number } | undefined]> = [
+      ['python manage.py runserver 8080', { host: '127.0.0.1', port: 8080 }],
+      ['python manage.py runserver 0.0.0.0:8000', { host: '127.0.0.1', port: 8000 }],
+      ['python manage.py runserver 127.83.116.219:9090', { host: '127.83.116.219', port: 9090 }],
+      ['uvicorn app.asgi:application --host 127.83.116.219 --port 8001', { host: '127.83.116.219', port: 8001 }],
+      ['gunicorn app.wsgi:application -b :8002', { host: '127.0.0.1', port: 8002 }],
+      ['gunicorn app.wsgi:application --bind 127.83.116.219:8003', { host: '127.83.116.219', port: 8003 }],
+      ['daphne -b 127.83.116.219 -p 8004 app.asgi:application', { host: '127.83.116.219', port: 8004 }],
+      ['python -m celery worker', undefined],
+    ];
+    for (const [cmd, expected] of cases) {
+      it(`extracts endpoint ${expected ? `${expected.host}:${expected.port}` : 'undefined'} from: ${cmd}`, function () {
+        assert.deepStrictEqual(finder.extractEndpointFromCommand(cmd), expected);
+      });
+    }
+  });
+
   describe('lsof listen parsing', function () {
     it('parses macOS loopback aliases with LISTEN state', function () {
       const endpoint = parseLsofTcpListenLine(
@@ -136,6 +154,7 @@ describe('Feature: process discovery', function () {
       const mine = results.find((p) => p.pid === fake!.pid);
       assert.ok(mine, `spawned pid ${fake!.pid} not found in results (found: ${results.map((r) => r.pid).join(',')})`);
       assert.strictEqual(mine.type, 'django');
+      assert.ok(mine.host, 'host should be detected or inferred');
       assert.strictEqual(mine.port, port);
     });
 

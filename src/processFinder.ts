@@ -1,7 +1,11 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { log, logError } from './logger';
-import { parseLsofTcpListenLine } from './listeningEndpoint';
+import {
+  TcpListeningEndpoint,
+  normalizeListeningHost,
+  parseLsofTcpListenLine,
+} from './listeningEndpoint';
 
 const execFileAsync = promisify(execFile);
 
@@ -13,6 +17,7 @@ export interface DjangoProcess {
   pythonPath: string;
   arch: string;
   type: ProcessType;
+  host?: string;
   port?: number;
 }
 
@@ -41,9 +46,13 @@ export class DjangoProcessFinder {
         }
       }
 
-      // Resolve listening ports for each process
+      // Resolve listening endpoints for each process.
       await Promise.all(processes.map(async (p) => {
-        p.port = this.extractPortFromCommand(p.command) ?? await this.findListeningPort(p.pid);
+        const commandEndpoint = this.extractEndpointFromCommand(p.command);
+        const endpoint = await this.findListeningEndpoint(p.pid, commandEndpoint?.port) ??
+          commandEndpoint;
+        p.host = endpoint?.host;
+        p.port = endpoint?.port;
       }));
 
       log(`[ProcessFinder] Found ${processes.length} Django process(es)`);
@@ -119,37 +128,90 @@ export class DjangoProcessFinder {
    *          uvicorn --port 8080, gunicorn -b :8000, gunicorn --bind 0.0.0.0:8000
    */
   extractPortFromCommand(command: string): number | undefined {
+    return this.extractEndpointFromCommand(command)?.port;
+  }
+
+  extractEndpointFromCommand(command: string): TcpListeningEndpoint | undefined {
     // manage.py runserver [addr:]port
-    const runserverMatch = command.match(/runserver\s+(?:\S+:)?(\d+)/);
+    const runserverMatch = command.match(/runserver\s+(\S+)/);
     if (runserverMatch) {
-      return parseInt(runserverMatch[1], 10);
+      const endpoint = this.parseAddressEndpoint(runserverMatch[1]);
+      if (endpoint) {
+        return endpoint;
+      }
     }
 
     // uvicorn --port PORT or --host X --port PORT
     const uvicornPortMatch = command.match(/--port\s+(\d+)/);
     if (uvicornPortMatch) {
-      return parseInt(uvicornPortMatch[1], 10);
+      const hostMatch = command.match(/--host\s+(\S+)/);
+      return this.endpoint(hostMatch?.[1], parseInt(uvicornPortMatch[1], 10));
     }
 
     // gunicorn -b / --bind [addr:]port  (addr can be empty, e.g. `-b :8000`)
-    const gunicornMatch = command.match(/(?:-b|--bind)\s+(?:[^\s]*:)?(\d+)/);
+    const gunicornMatch = command.match(/(?:-b|--bind)\s+(\S+)/);
     if (gunicornMatch) {
-      return parseInt(gunicornMatch[1], 10);
+      const endpoint = this.parseAddressEndpoint(gunicornMatch[1]);
+      if (endpoint) {
+        return endpoint;
+      }
     }
 
     // daphne -p PORT or --port PORT
     const daphneMatch = command.match(/(?:-p|--port)\s+(\d+)/);
     if (daphneMatch) {
-      return parseInt(daphneMatch[1], 10);
+      const hostMatch = command.match(/(?:-b|--bind)\s+(\S+)/);
+      return this.endpoint(hostMatch?.[1], parseInt(daphneMatch[1], 10));
+    }
+
+    return undefined;
+  }
+
+  private endpoint(host: string | undefined, port: number): TcpListeningEndpoint | undefined {
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+      return undefined;
+    }
+    return {
+      host: normalizeListeningHost(host && host.length > 0 ? host : '127.0.0.1'),
+      port,
+    };
+  }
+
+  private parseAddressEndpoint(address: string): TcpListeningEndpoint | undefined {
+    if (!address || address.startsWith('unix:')) {
+      return undefined;
+    }
+
+    const portOnly = address.match(/^(\d+)$/);
+    if (portOnly) {
+      return this.endpoint(undefined, parseInt(portOnly[1], 10));
+    }
+
+    const bracketed = address.match(/^\[([^\]]+)\]:(\d+)$/);
+    if (bracketed) {
+      return this.endpoint(bracketed[1], parseInt(bracketed[2], 10));
+    }
+
+    const emptyHost = address.match(/^:(\d+)$/);
+    if (emptyHost) {
+      return this.endpoint(undefined, parseInt(emptyHost[1], 10));
+    }
+
+    const hostPort = address.match(/^(.+):(\d+)$/);
+    if (hostPort) {
+      return this.endpoint(hostPort[1], parseInt(hostPort[2], 10));
     }
 
     return undefined;
   }
 
   /**
-   * Find the TCP listening port for a given PID using lsof.
+   * Find the TCP listening endpoint for a given PID using lsof.
    */
-  private async findListeningPort(pid: number): Promise<number | undefined> {
+  private async findListeningEndpoint(
+    pid: number,
+    expectedPort?: number,
+  ): Promise<TcpListeningEndpoint | undefined> {
     try {
       const { stdout } = await execFileAsync('lsof', [
         '-iTCP', '-sTCP:LISTEN', '-nP', '-p', String(pid),
@@ -158,8 +220,8 @@ export class DjangoProcessFinder {
       // NAME looks like *:8000, 127.0.0.1:8000, or 127.x.x.x:8000 (LISTEN)
       for (const line of stdout.split('\n')) {
         const endpoint = parseLsofTcpListenLine(line);
-        if (endpoint) {
-          return endpoint.port;
+        if (endpoint && (!expectedPort || endpoint.port === expectedPort)) {
+          return endpoint;
         }
       }
     } catch {

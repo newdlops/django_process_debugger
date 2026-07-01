@@ -141,6 +141,13 @@ export function activate(context: vscode.ExtensionContext) {
     action?: 'setup' | 'logs' | 'reinstall';
   }
 
+  interface AttachQuickPickItem extends vscode.QuickPickItem {
+    process: DjangoProcess;
+    resolvedPid: number;
+    endpoint?: TcpListeningEndpoint;
+    groupedPids: number[];
+  }
+
   function makeRuntimeCandidate(
     pythonPath: string,
     sourceKind: RuntimeCandidate['sourceKind'],
@@ -431,46 +438,85 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      // Group by port to deduplicate parent/child processes on the same server
-      // Show one entry per port (or per unique celery worker)
-      const portGroups = new Map<string, typeof processes>();
-      for (const p of processes) {
-        const key = p.type === 'celery'
-          ? `celery-${p.pid}`  // each celery worker is unique
-          : `${p.port ?? 'no-port'}-${p.type}`;
-        const group = portGroups.get(key) ?? [];
-        group.push(p);
-        portGroups.set(key, group);
+      const endpointForProcess = (processInfo: DjangoProcess): TcpListeningEndpoint | undefined =>
+        processInfo.host && processInfo.port
+          ? { host: processInfo.host, port: processInfo.port }
+          : undefined;
+
+      const attachCandidates = await Promise.all(processes.map(async (processInfo) => {
+        try {
+          const resolved = await processFinder.resolveDebuggablePid(processInfo.pid);
+          const resolvedProcess = processes.find((p) => p.pid === resolved.pid);
+          return {
+            process: processInfo,
+            resolvedPid: resolved.pid,
+            endpoint: endpointForProcess(resolvedProcess ?? processInfo) ?? endpointForProcess(processInfo),
+          };
+        } catch (err) {
+          logError(`[Attach] Failed to resolve debuggable PID for ${processInfo.pid}`, err);
+          return {
+            process: processInfo,
+            resolvedPid: processInfo.pid,
+            endpoint: endpointForProcess(processInfo),
+          };
+        }
+      }));
+
+      const attachGroups = new Map<string, typeof attachCandidates>();
+      for (const candidate of attachCandidates) {
+        if (candidate.process.type === 'django' && !candidate.endpoint) {
+          log(`[Attach] Skipping PID=${candidate.process.pid}: no Django host:port endpoint detected`);
+          continue;
+        }
+        const key = candidate.process.type === 'django'
+          ? `django-${candidate.endpoint!.port}-${candidate.endpoint!.host}`
+          : `celery-${candidate.resolvedPid}`;
+        const group = attachGroups.get(key) ?? [];
+        group.push(candidate);
+        attachGroups.set(key, group);
       }
 
-      const items = await Promise.all([...portGroups.values()].map(async (group) => {
-        // Pick the representative: prefer the one with the highest CPU (active child)
-        const representative = group[0];
-        const allPids = group.map((p) => p.pid);
-        const icon = representative.type === 'celery' ? '$(server-process)' : '$(globe)';
-        const typeLabel = representative.type === 'celery' ? 'Celery Worker' : 'Django Server';
-
-        // Check debugpy status for any pid in the group
+      const items: AttachQuickPickItem[] = await Promise.all([...attachGroups.values()].map(async (group) => {
+        const representative = group.find((candidate) => candidate.process.pid === candidate.resolvedPid) ?? group[0];
+        const icon = representative.process.type === 'celery' ? '$(server-process)' : '$(globe)';
+        const typeLabel = representative.process.type === 'celery' ? 'Celery Worker' : 'Django Server';
+        const groupedPids = [...new Set(group.flatMap((candidate) => [
+          candidate.process.pid,
+          candidate.resolvedPid,
+        ]))].sort((a, b) => a - b);
+        const activeCheckPids = [...new Set([representative.resolvedPid, ...groupedPids])];
         let activeEndpoint: TcpListeningEndpoint | null = null;
-        for (const p of group) {
-          activeEndpoint = await injector.getActiveEndpoint(p.pid);
+        for (const activeCheckPid of activeCheckPids) {
+          activeEndpoint = await injector.getActiveEndpoint(activeCheckPid);
           if (activeEndpoint) { break; }
         }
         const portStatus = activeEndpoint
           ? `$(debug-alt) debugpy active on ${formatEndpoint(activeEndpoint)}`
           : '$(circle-slash) debugpy not attached';
-        const portLabel = representative.port ? ` | Port: ${representative.port}` : '';
-        const pidLabel = allPids.length > 1
-          ? `PIDs: ${allPids.join(', ')}`
-          : `PID: ${allPids[0]}`;
+        const endpointLabel = representative.endpoint
+          ? `Port: ${representative.endpoint.port} | Host: ${representative.endpoint.host}`
+          : `PID: ${representative.resolvedPid}`;
+        const pidLabel = groupedPids.length > 1
+          ? `PIDs: ${groupedPids.join(', ')}`
+          : `PID: ${groupedPids[0]}`;
 
         return {
-          label: `${icon} [${typeLabel}] ${pidLabel}${portLabel}`,
-          description: representative.command,
-          detail: `${portStatus}  |  Python: ${representative.pythonPath}`,
-          process: representative,
+          label: `${icon} [${typeLabel}] ${endpointLabel}`,
+          description: pidLabel,
+          detail: `${portStatus}  |  Python: ${representative.process.pythonPath}`,
+          process: representative.process,
+          resolvedPid: representative.resolvedPid,
+          endpoint: representative.endpoint,
+          groupedPids,
         };
       }));
+
+      if (items.length === 0) {
+        vscode.window.showWarningMessage(
+          'No attachable Django processes found with a host:port listener.'
+        );
+        return;
+      }
 
       const selected = await vscode.window.showQuickPick(items, {
         placeHolder: 'Select a Django process to attach debugger',
@@ -481,15 +527,14 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      // Resolve to the actual debuggable Python process
-      // (walks down from uv wrapper → autoreloader → actual server)
-      const resolved = await processFinder.resolveDebuggablePid(selected.process.pid);
-      const pid = resolved.pid;
+      const pid = selected.resolvedPid;
       const resolvedPythonPath = await injector.resolvePythonForPid(pid);
       const targetProcess: DjangoProcess = {
         ...selected.process,
         pid,
         pythonPath: resolvedPythonPath,
+        host: selected.endpoint?.host ?? selected.process.host,
+        port: selected.endpoint?.port ?? selected.process.port,
       };
       const targetRuntime = makeRuntimeCandidate(
         resolvedPythonPath,
@@ -501,7 +546,7 @@ export function activate(context: vscode.ExtensionContext) {
         targetProcess,
       );
       const port = await findFreePort();
-      log(`Selected PID=${selected.process.pid} → resolved to PID=${pid} (${resolvedPythonPath})`);
+      log(`Selected PID=${selected.process.pid} → attach target PID=${pid} (${resolvedPythonPath})`);
 
       // Check if another VS Code window already has an active debug session
       const existingLock = readLock();
