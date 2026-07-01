@@ -9,6 +9,7 @@ import { DebugpyInjector, BootstrapNotLoadedError, BootstrapNotInstalledError, B
 import { DebugpyManager, DebugpyProvisioningInfo } from './debugpyManager';
 import { log, logError, getLogger } from './logger';
 import { shouldIgnoreForHotReload } from './hotReloadFilter';
+import { TcpListeningEndpoint, formatEndpoint } from './listeningEndpoint';
 import {
   RuntimeCandidate,
   SetupProfile,
@@ -28,6 +29,7 @@ const LOCK_FILE = path.join(LOCK_DIR, 'debug-session.lock');
 
 interface LockInfo {
   pid: number;
+  host?: string;
   port: number;
   workspaceId: string;
   workspaceName: string;
@@ -449,13 +451,13 @@ export function activate(context: vscode.ExtensionContext) {
         const typeLabel = representative.type === 'celery' ? 'Celery Worker' : 'Django Server';
 
         // Check debugpy status for any pid in the group
-        let activePort: number | null = null;
+        let activeEndpoint: TcpListeningEndpoint | null = null;
         for (const p of group) {
-          activePort = await injector.getActivePort(p.pid);
-          if (activePort) { break; }
+          activeEndpoint = await injector.getActiveEndpoint(p.pid);
+          if (activeEndpoint) { break; }
         }
-        const portStatus = activePort
-          ? `$(debug-alt) debugpy active on ${activePort}`
+        const portStatus = activeEndpoint
+          ? `$(debug-alt) debugpy active on ${formatEndpoint(activeEndpoint)}`
           : '$(circle-slash) debugpy not attached';
         const portLabel = representative.port ? ` | Port: ${representative.port}` : '';
         const pidLabel = allPids.length > 1
@@ -508,7 +510,7 @@ export function activate(context: vscode.ExtensionContext) {
         let lockValid = false;
         try {
           process.kill(existingLock.pid, 0); // process alive?
-          lockValid = await injector.isPortListeningPublic(existingLock.port);
+          lockValid = await injector.isPortListeningPublic(existingLock.port, existingLock.host);
         } catch {
           lockValid = false;
         }
@@ -517,7 +519,7 @@ export function activate(context: vscode.ExtensionContext) {
           log(`Active debug session detected from workspace "${existingLock.workspaceName}" (PID ${existingLock.pid})`);
           vscode.window.showErrorMessage(
             `Cannot attach: a debug session is already active in workspace "${existingLock.workspaceName}" ` +
-            `(PID ${existingLock.pid}, port ${existingLock.port}). ` +
+            `(PID ${existingLock.pid}, ${existingLock.host ? `${existingLock.host}:` : 'port '}${existingLock.port}). ` +
             `Stop the existing session first.`
           );
           return;
@@ -589,13 +591,13 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      let debugPort: number;
+      let debugEndpoint: TcpListeningEndpoint;
       try {
-        debugPort = await injector.activate(pid, port);
-        if (debugPort !== port) {
-          log(`debugpy was already active on port ${debugPort}, reusing`);
+        debugEndpoint = await injector.activateEndpoint(pid, port);
+        if (debugEndpoint.port !== port) {
+          log(`debugpy was already active on ${formatEndpoint(debugEndpoint)}, reusing`);
         }
-        log(`debugpy activated for PID=${pid} on port ${debugPort}`);
+        log(`debugpy activated for PID=${pid} on ${formatEndpoint(debugEndpoint)}`);
       } catch (err) {
         logError(`Attach failed for PID=${pid}`, err);
 
@@ -656,8 +658,8 @@ export function activate(context: vscode.ExtensionContext) {
         type: 'django-process',
         request: 'attach',
         name: `${sessionLabel} (PID: ${pid})`,
-        host: '127.0.0.1',
-        port: debugPort,
+        host: debugEndpoint.host,
+        port: debugEndpoint.port,
         justMyCode,
         redirectOutput,
       };
@@ -667,7 +669,8 @@ export function activate(context: vscode.ExtensionContext) {
       // Write lock before starting session
       writeLock({
         pid,
-        port: debugPort,
+        host: debugEndpoint.host,
+        port: debugEndpoint.port,
         workspaceId: getWorkspaceId(),
         workspaceName: getWorkspaceName(),
         timestamp: new Date().toISOString(),
@@ -679,7 +682,7 @@ export function activate(context: vscode.ExtensionContext) {
       if (started) {
         startHotReloadWatcher(pid);
         vscode.window.showInformationMessage(
-          `$(debug-alt) ${sessionLabel} (PID: ${pid}) attached on port ${debugPort}`
+          `$(debug-alt) ${sessionLabel} (PID: ${pid}) attached on ${formatEndpoint(debugEndpoint)}`
         );
       } else {
         removeLock();

@@ -1,6 +1,7 @@
 import * as assert from 'assert';
 import { describe, it, before, after } from 'mocha';
 import { DjangoProcessFinder } from '../../processFinder';
+import { parseLsofTcpListenLine } from '../../listeningEndpoint';
 import { getPerf } from './perfReporter';
 import { findSystemPython, spawnFakeRunserver, SpawnedProcess } from './testHelpers';
 
@@ -78,6 +79,29 @@ describe('Feature: process discovery', function () {
         assert.strictEqual(finder.extractPortFromCommand(cmd), expected);
       });
     }
+  });
+
+  describe('lsof listen parsing', function () {
+    it('parses macOS loopback aliases with LISTEN state', function () {
+      const endpoint = parseLsofTcpListenLine(
+        'python3.1 26422 lky 3u IPv4 0x704380322b7c396d 0t0 TCP 127.83.116.219:53343 (LISTEN)',
+      );
+      assert.deepStrictEqual(endpoint, { host: '127.83.116.219', port: 53343 });
+    });
+
+    it('normalizes wildcard listeners to a connectable localhost address', function () {
+      const endpoint = parseLsofTcpListenLine(
+        'Python 123 lky 3u IPv4 0x0 0t0 TCP *:8000 (LISTEN)',
+      );
+      assert.deepStrictEqual(endpoint, { host: '127.0.0.1', port: 8000 });
+    });
+
+    it('parses bracketed IPv6 listeners', function () {
+      const endpoint = parseLsofTcpListenLine(
+        'Python 123 lky 3u IPv6 0x0 0t0 TCP [::1]:5678 (LISTEN)',
+      );
+      assert.deepStrictEqual(endpoint, { host: '::1', port: 5678 });
+    });
   });
 
   describe('live ps integration', function () {

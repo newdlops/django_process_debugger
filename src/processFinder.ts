@@ -1,6 +1,7 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { log, logError } from './logger';
+import { parseLsofTcpListenLine } from './listeningEndpoint';
 
 const execFileAsync = promisify(execFile);
 
@@ -154,11 +155,11 @@ export class DjangoProcessFinder {
         '-iTCP', '-sTCP:LISTEN', '-nP', '-p', String(pid),
       ]);
       // Parse lsof output: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
-      // NAME looks like *:8000 or 127.0.0.1:8000
+      // NAME looks like *:8000, 127.0.0.1:8000, or 127.x.x.x:8000 (LISTEN)
       for (const line of stdout.split('\n')) {
-        const match = line.match(/:(\d+)\s*$/);
-        if (match) {
-          return parseInt(match[1], 10);
+        const endpoint = parseLsofTcpListenLine(line);
+        if (endpoint) {
+          return endpoint.port;
         }
       }
     } catch {

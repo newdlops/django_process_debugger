@@ -3,12 +3,19 @@ import { promisify } from 'util';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { log, logError } from './logger';
+import {
+  TcpListeningEndpoint,
+  formatEndpoint,
+  normalizeListeningHost,
+  parseLsofTcpListenLine,
+} from './listeningEndpoint';
 
 const execFileAsync = promisify(execFile);
 
 const PTH_FILENAME = 'django_process_debugger.pth';
 const BOOTSTRAP_MODULE = '_django_debug_bootstrap';
-export const BOOTSTRAP_VERSION = '2026.06.09.1';
+export const BOOTSTRAP_VERSION = '2026.07.01.1';
+export type DebugpyEndpoint = TcpListeningEndpoint;
 
 /**
  * Bootstrap script installed into the target venv's site-packages.
@@ -407,10 +414,16 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                    _dbg_log(f"Port file not found, using default {_port}")',
     '                except ValueError as ve:',
     '                    _dbg_log(f"Bad port file content: {ve}")',
-    '                debugpy.listen(("127.0.0.1", _port))',
+    '                _listen_result = debugpy.listen(("127.0.0.1", _port))',
+    '                _host = "127.0.0.1"',
+    '                _actual_port = _port',
+    '                if isinstance(_listen_result, (tuple, list)) and len(_listen_result) >= 2:',
+    '                    _host = str(_listen_result[0])',
+    '                    _actual_port = int(_listen_result[1])',
+    '                import json as _json',
     '                with open(_active_file, "w") as _f:',
-    '                    _f.write(str(_port))',
-    '                _dbg_log(f"debugpy listening on 127.0.0.1:{_port}")',
+    '                    _f.write(_json.dumps({"host": _host, "port": _actual_port}))',
+    '                _dbg_log(f"debugpy listening on {_host}:{_actual_port}")',
     '                # Start hot reload watcher after debugpy is active',
     '                if not _hot_reload_watcher_started:',
     '                    _start_hot_reload_watcher()',
@@ -748,15 +761,21 @@ export class DebugpyInjector {
 
   /**
    * Check if debugpy is already active for a given PID.
-   * Returns the port if active, null otherwise.
+   * Returns the endpoint if active, null otherwise.
    */
-  async getActivePort(pid: number): Promise<number | null> {
+  async getActiveEndpoint(pid: number): Promise<DebugpyEndpoint | null> {
     const activeFile = path.join(PORT_FILE_DIR, `${pid}.active`);
     try {
       const content = await fs.readFile(activeFile, 'utf-8');
-      const port = parseInt(content.trim(), 10);
-      if (!isNaN(port) && await this.isPortListening(port)) {
-        return port;
+      const recorded = this.parseActiveFile(content);
+      if (recorded) {
+        let endpoint = await this.findListeningEndpoint(recorded.port, undefined, recorded.host);
+        if (!endpoint && recorded.host) {
+          endpoint = await this.findListeningEndpoint(recorded.port);
+        }
+        if (endpoint) {
+          return endpoint;
+        }
       }
       // Stale active file — debugpy no longer listening
       await fs.unlink(activeFile).catch(() => {});
@@ -767,24 +786,51 @@ export class DebugpyInjector {
   }
 
   /**
+   * Check if debugpy is already active for a given PID.
+   * Returns the port if active, null otherwise.
+   */
+  async getActivePort(pid: number): Promise<number | null> {
+    const endpoint = await this.getActiveEndpoint(pid);
+    return endpoint?.port ?? null;
+  }
+
+  private parseActiveFile(content: string): { host?: string; port: number } | null {
+    const trimmed = content.trim();
+    try {
+      const parsed = JSON.parse(trimmed) as { host?: unknown; port?: unknown };
+      if (typeof parsed.port === 'number' && Number.isInteger(parsed.port)) {
+        return {
+          host: typeof parsed.host === 'string' ? parsed.host : undefined,
+          port: parsed.port,
+        };
+      }
+    } catch {
+      // Legacy active files contain only the port.
+    }
+
+    const port = parseInt(trimmed, 10);
+    return Number.isInteger(port) ? { port } : null;
+  }
+
+  /**
    * Activate debugpy in a running Django process by sending SIGUSR1.
-   * Returns the port debugpy is listening on.
+   * Returns the endpoint debugpy is listening on.
    *
-   * If debugpy is already active, returns the existing port.
+   * If debugpy is already active, returns the existing endpoint.
    * SAFETY: Will NOT send SIGUSR1 unless the bootstrap module is confirmed
    * importable, because Python's default SIGUSR1 handler terminates the process.
    */
-  async activate(pid: number, port: number): Promise<number> {
+  async activateEndpoint(pid: number, port: number): Promise<DebugpyEndpoint> {
     log(`[Injector] Activating debugpy for PID=${pid} port=${port}`);
 
     this.verifyProcessAlive(pid);
     log(`[Injector] Process ${pid} is alive`);
 
     // Check if debugpy is already active for this PID
-    const existingPort = await this.getActivePort(pid);
-    if (existingPort !== null) {
-      log(`[Injector] debugpy already active for PID=${pid} on port ${existingPort}`);
-      return existingPort;
+    const existingEndpoint = await this.getActiveEndpoint(pid);
+    if (existingEndpoint !== null) {
+      log(`[Injector] debugpy already active for PID=${pid} on ${formatEndpoint(existingEndpoint)}`);
+      return existingEndpoint;
     }
 
     // SAFETY: Verify bootstrap is installed before sending SIGUSR1
@@ -817,13 +863,22 @@ export class DebugpyInjector {
 
     // Wait for debugpy to start listening (via lsof, non-invasive)
     log(`[Injector] Waiting for debugpy to listen on port ${port}...`);
-    const listening = await this.waitForPortListening(port, 5000);
-    if (!listening) {
+    const detectedEndpoint = await this.waitForPortListening(port, 5000);
+    if (!detectedEndpoint) {
       log(`[Injector] Port ${port} not open after SIGUSR1`);
       throw new BootstrapNotLoadedError(pid, port);
     }
-    log(`[Injector] debugpy is listening on port ${port}`);
-    return port;
+    const endpoint = await this.getActiveEndpoint(pid) ?? detectedEndpoint;
+    log(`[Injector] debugpy is listening on ${formatEndpoint(endpoint)}`);
+    return endpoint;
+  }
+
+  /**
+   * Backward-compatible helper for callers that only need the port.
+   */
+  async activate(pid: number, port: number): Promise<number> {
+    const endpoint = await this.activateEndpoint(pid, port);
+    return endpoint.port;
   }
 
   private async getProcessCommand(pid: number): Promise<string> {
@@ -847,33 +902,73 @@ export class DebugpyInjector {
    * Check if a port is being listened on WITHOUT connecting to it.
    * Uses lsof to avoid consuming debugpy's single-client slot.
    */
-  async isPortListeningPublic(port: number): Promise<boolean> {
-    return this.isPortListening(port);
+  async isPortListeningPublic(port: number, host?: string): Promise<boolean> {
+    return (await this.findListeningEndpoint(port, undefined, host)) !== null;
   }
 
-  private async isPortListening(port: number): Promise<boolean> {
+  /**
+   * Resolve the actual listening endpoint for a port.
+   */
+  async findListeningEndpointPublic(
+    port: number,
+    pid?: number,
+    host?: string,
+  ): Promise<DebugpyEndpoint | null> {
+    return this.findListeningEndpoint(port, pid, host);
+  }
+
+  private async findListeningEndpoint(
+    port: number,
+    pid?: number,
+    host?: string,
+  ): Promise<DebugpyEndpoint | null> {
     try {
+      const args = [
+        '-nP',
+        '-i', `TCP:${port}`,
+        '-sTCP:LISTEN',
+      ];
+      if (pid !== undefined) {
+        args.push('-p', String(pid));
+      }
+
       const { stdout } = await execFileAsync('lsof', [
-        '-i', `TCP:${port}`, '-sTCP:LISTEN', '-P', '-n',
+        ...args,
       ]);
-      return stdout.trim().length > 0;
+      const expectedHost = host ? normalizeListeningHost(host) : undefined;
+      for (const line of stdout.split('\n')) {
+        const endpoint = parseLsofTcpListenLine(line);
+        if (!endpoint || endpoint.port !== port) {
+          continue;
+        }
+        if (expectedHost && endpoint.host !== expectedHost) {
+          continue;
+        }
+        return endpoint;
+      }
+      return null;
     } catch {
-      return false;
+      return null;
     }
   }
 
   /**
    * Wait for a port to start listening, checked via lsof (non-invasive).
    */
-  private async waitForPortListening(port: number, timeoutMs: number): Promise<boolean> {
+  private async waitForPortListening(
+    port: number,
+    timeoutMs: number,
+    pid?: number,
+  ): Promise<DebugpyEndpoint | null> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if (await this.isPortListening(port)) {
-        return true;
+      const endpoint = await this.findListeningEndpoint(port, pid);
+      if (endpoint) {
+        return endpoint;
       }
       await new Promise((r) => setTimeout(r, 200));
     }
-    return false;
+    return null;
   }
 }
 

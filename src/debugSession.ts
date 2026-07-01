@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { DebugpyInjector } from './debugpyInjector';
 import { log, logError, getLogger } from './logger';
+import { formatEndpoint } from './listeningEndpoint';
 
 /**
  * Bridges between our "django-process" debug type and the underlying
@@ -20,15 +21,17 @@ export class DjangoDebugSessionFactory
   ): Promise<vscode.DebugAdapterDescriptor | null> {
     const config = session.configuration;
     const pid: number | undefined = config.pid;
-    const host: string = config.host ?? '127.0.0.1';
-    const port: number = config.port ?? 5678;
+    let host: string = config.host ?? '127.0.0.1';
+    let port: number = config.port ?? 5678;
 
     log(`[DebugSession] createDebugAdapterDescriptor: pid=${pid} host=${host} port=${port}`);
 
     if (pid) {
       try {
-        await this.injector.activate(pid, port);
-        log(`[DebugSession] Activation succeeded, connecting to ${host}:${port}`);
+        const endpoint = await this.injector.activateEndpoint(pid, port);
+        host = endpoint.host;
+        port = endpoint.port;
+        log(`[DebugSession] Activation succeeded, connecting to ${formatEndpoint(endpoint)}`);
       } catch (err) {
         logError(`[DebugSession] Activation failed`, err);
         const msg = err instanceof Error ? err.message : String(err);

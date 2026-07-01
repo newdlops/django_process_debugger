@@ -104,8 +104,12 @@ describe('Feature: end-to-end attach flow', function () {
 
     assert.strictEqual(actualPort, debugPort, 'activate should return the requested port');
 
-    const listening = await isPortListening(debugPort);
-    assert.strictEqual(listening, true, `debugpy should be listening on ${debugPort}`);
+    const endpoint = await injector.getActiveEndpoint(server.pid);
+    assert.ok(endpoint, 'debugpy active endpoint should be discoverable');
+    assert.strictEqual(endpoint.port, debugPort);
+
+    const listening = await isPortListening(endpoint.port, endpoint.host);
+    assert.strictEqual(listening, true, `debugpy should be listening on ${endpoint.host}:${debugPort}`);
   });
 
   it('activate() is idempotent — second call reuses the same port', async function () {
@@ -124,6 +128,14 @@ describe('Feature: end-to-end attach flow', function () {
     if (!server) { this.skip(); return; }
     const port = await injector.getActivePort(server.pid);
     assert.strictEqual(port, debugPort);
+  });
+
+  it('getActiveEndpoint reflects the active host and port', async function () {
+    if (!server) { this.skip(); return; }
+    const endpoint = await injector.getActiveEndpoint(server.pid);
+    assert.ok(endpoint);
+    assert.ok(endpoint.host.length > 0);
+    assert.strictEqual(endpoint.port, debugPort);
   });
 
   it('resolveDebuggablePid resolves to the server pid', async function () {
@@ -147,7 +159,7 @@ async function canImportBootstrap(pythonPath: string): Promise<boolean> {
   }
 }
 
-async function isPortListening(port: number): Promise<boolean> {
+async function isPortListening(port: number, host: string): Promise<boolean> {
   return new Promise((resolve) => {
     const sock = new net.Socket();
     const done = (result: boolean) => {
@@ -158,6 +170,6 @@ async function isPortListening(port: number): Promise<boolean> {
     sock.once('connect', () => done(true));
     sock.once('timeout', () => done(false));
     sock.once('error', () => done(false));
-    sock.connect(port, '127.0.0.1');
+    sock.connect(port, host);
   });
 }
