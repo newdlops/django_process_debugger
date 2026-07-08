@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import { describe, it, before, after } from 'mocha';
-import { DjangoProcessFinder } from '../../processFinder';
+import { DjangoProcess, DjangoProcessFinder, mergeLoopbackAliasEndpoints } from '../../processFinder';
 import { parseLsofTcpListenLine } from '../../listeningEndpoint';
 import { getPerf } from './perfReporter';
 import { findSystemPython, spawnFakeRunserver, SpawnedProcess } from './testHelpers';
@@ -119,6 +119,73 @@ describe('Feature: process discovery', function () {
         'Python 123 lky 3u IPv6 0x0 0t0 TCP [::1]:5678 (LISTEN)',
       );
       assert.deepStrictEqual(endpoint, { host: '::1', port: 5678 });
+    });
+  });
+
+  describe('loopback alias merging', function () {
+    it('adds non-Django 127.x listeners on the same port as selectable endpoints', function () {
+      const processes: DjangoProcess[] = [{
+        pid: 101,
+        command: 'python manage.py runserver 8004',
+        pythonPath: 'python',
+        arch: process.arch,
+        type: 'django',
+        host: '127.1.0.1',
+        port: 8004,
+        endpoints: [{ host: '127.1.0.1', port: 8004 }],
+      }];
+
+      mergeLoopbackAliasEndpoints(processes, new Map([
+        [8004, [
+          { pid: 202, endpoint: { host: '127.135.15.126', port: 8004 } },
+        ]],
+      ]));
+
+      assert.deepStrictEqual(processes[0].endpoints, [
+        { host: '127.1.0.1', port: 8004 },
+        { host: '127.135.15.126', port: 8004 },
+      ]);
+    });
+
+    it('does not mix endpoints owned by another discovered Django process', function () {
+      const processes: DjangoProcess[] = [
+        {
+          pid: 101,
+          command: 'python manage.py runserver 127.1.0.1:8004',
+          pythonPath: 'python',
+          arch: process.arch,
+          type: 'django',
+          host: '127.1.0.1',
+          port: 8004,
+          endpoints: [{ host: '127.1.0.1', port: 8004 }],
+        },
+        {
+          pid: 202,
+          command: 'python manage.py runserver 127.97.194.31:8004',
+          pythonPath: 'python',
+          arch: process.arch,
+          type: 'django',
+          host: '127.97.194.31',
+          port: 8004,
+          endpoints: [{ host: '127.97.194.31', port: 8004 }],
+        },
+      ];
+
+      mergeLoopbackAliasEndpoints(processes, new Map([
+        [8004, [
+          { pid: 202, endpoint: { host: '127.97.194.31', port: 8004 } },
+          { pid: 303, endpoint: { host: '127.135.15.126', port: 8004 } },
+        ]],
+      ]));
+
+      assert.deepStrictEqual(processes[0].endpoints, [
+        { host: '127.1.0.1', port: 8004 },
+        { host: '127.135.15.126', port: 8004 },
+      ]);
+      assert.deepStrictEqual(processes[1].endpoints, [
+        { host: '127.97.194.31', port: 8004 },
+        { host: '127.135.15.126', port: 8004 },
+      ]);
     });
   });
 

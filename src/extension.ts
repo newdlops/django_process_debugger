@@ -148,6 +148,12 @@ export function activate(context: vscode.ExtensionContext) {
     groupedPids: number[];
   }
 
+  interface AttachCandidate {
+    process: DjangoProcess;
+    resolvedPid: number;
+    endpoint?: TcpListeningEndpoint;
+  }
+
   function makeRuntimeCandidate(
     pythonPath: string,
     sourceKind: RuntimeCandidate['sourceKind'],
@@ -438,31 +444,46 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
 
-      const endpointForProcess = (processInfo: DjangoProcess): TcpListeningEndpoint | undefined =>
-        processInfo.host && processInfo.port
-          ? { host: processInfo.host, port: processInfo.port }
-          : undefined;
+      const endpointsForProcess = (processInfo: DjangoProcess): TcpListeningEndpoint[] => {
+        if (processInfo.endpoints?.length) {
+          return processInfo.endpoints;
+        }
+        return processInfo.host && processInfo.port
+          ? [{ host: processInfo.host, port: processInfo.port }]
+          : [];
+      };
 
-      const attachCandidates = await Promise.all(processes.map(async (processInfo) => {
+      const attachCandidateGroups: Array<{
+        process: DjangoProcess;
+        resolvedPid: number;
+        endpoints: TcpListeningEndpoint[];
+      }> = await Promise.all(processes.map(async (processInfo) => {
         try {
           const resolved = await processFinder.resolveDebuggablePid(processInfo.pid);
           const resolvedProcess = processes.find((p) => p.pid === resolved.pid);
+          const endpoints = endpointsForProcess(resolvedProcess ?? processInfo);
+          const fallbackEndpoints = endpointsForProcess(processInfo);
           return {
             process: processInfo,
             resolvedPid: resolved.pid,
-            endpoint: endpointForProcess(resolvedProcess ?? processInfo) ?? endpointForProcess(processInfo),
+            endpoints: endpoints.length > 0 ? endpoints : fallbackEndpoints,
           };
         } catch (err) {
           logError(`[Attach] Failed to resolve debuggable PID for ${processInfo.pid}`, err);
           return {
             process: processInfo,
             resolvedPid: processInfo.pid,
-            endpoint: endpointForProcess(processInfo),
+            endpoints: endpointsForProcess(processInfo),
           };
         }
       }));
+      const attachCandidates: AttachCandidate[] = attachCandidateGroups.flatMap((candidate): AttachCandidate[] =>
+        candidate.endpoints.length > 0
+          ? candidate.endpoints.map((endpoint) => ({ ...candidate, endpoint }))
+          : [{ ...candidate, endpoint: undefined }],
+      );
 
-      const attachGroups = new Map<string, typeof attachCandidates>();
+      const attachGroups = new Map<string, AttachCandidate[]>();
       for (const candidate of attachCandidates) {
         if (candidate.process.type === 'django' && !candidate.endpoint) {
           log(`[Attach] Skipping PID=${candidate.process.pid}: no Django host:port endpoint detected`);

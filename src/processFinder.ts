@@ -3,6 +3,7 @@ import { promisify } from 'util';
 import { log, logError } from './logger';
 import {
   TcpListeningEndpoint,
+  formatEndpoint,
   normalizeListeningHost,
   parseLsofTcpListenLine,
 } from './listeningEndpoint';
@@ -19,6 +20,68 @@ export interface DjangoProcess {
   type: ProcessType;
   host?: string;
   port?: number;
+  endpoints?: TcpListeningEndpoint[];
+}
+
+export interface OwnedTcpListeningEndpoint {
+  pid?: number;
+  endpoint: TcpListeningEndpoint;
+}
+
+function endpointKey(endpoint: TcpListeningEndpoint): string {
+  return `${endpoint.host}:${endpoint.port}`;
+}
+
+function mergeEndpoints(
+  ...endpointLists: Array<ReadonlyArray<TcpListeningEndpoint | undefined> | undefined>
+): TcpListeningEndpoint[] {
+  const byKey = new Map<string, TcpListeningEndpoint>();
+  for (const endpointList of endpointLists) {
+    for (const endpoint of endpointList ?? []) {
+      if (!endpoint) { continue; }
+      byKey.set(endpointKey(endpoint), endpoint);
+    }
+  }
+  return [...byKey.values()];
+}
+
+function isLoopbackAlias(endpoint: TcpListeningEndpoint): boolean {
+  const host = normalizeListeningHost(endpoint.host).toLowerCase();
+  return host.startsWith('127.') && host !== '127.0.0.1';
+}
+
+function parseLsofPid(line: string): number | undefined {
+  const parts = line.trim().split(/\s+/);
+  if (parts.length < 2 || parts[0] === 'COMMAND') {
+    return undefined;
+  }
+
+  const pid = parseInt(parts[1], 10);
+  return Number.isInteger(pid) ? pid : undefined;
+}
+
+export function mergeLoopbackAliasEndpoints(
+  processes: DjangoProcess[],
+  aliasesByPort: ReadonlyMap<number, ReadonlyArray<OwnedTcpListeningEndpoint>>,
+): void {
+  const discoveredDjangoPids = new Set(processes.map((p) => p.pid));
+
+  for (const processInfo of processes) {
+    if (processInfo.type !== 'django' || !processInfo.endpoints?.length) {
+      continue;
+    }
+
+    const aliases = processInfo.endpoints.flatMap((endpoint) =>
+      (aliasesByPort.get(endpoint.port) ?? [])
+        .filter((alias) =>
+          alias.pid === processInfo.pid ||
+          alias.pid === undefined ||
+          !discoveredDjangoPids.has(alias.pid),
+        )
+        .map((alias) => alias.endpoint),
+    );
+    processInfo.endpoints = mergeEndpoints(processInfo.endpoints, aliases);
+  }
 }
 
 export class DjangoProcessFinder {
@@ -49,11 +112,22 @@ export class DjangoProcessFinder {
       // Resolve listening endpoints for each process.
       await Promise.all(processes.map(async (p) => {
         const commandEndpoint = this.extractEndpointFromCommand(p.command);
-        const endpoint = await this.findListeningEndpoint(p.pid, commandEndpoint?.port) ??
-          commandEndpoint;
+        const lsofEndpoints = await this.findListeningEndpoints(p.pid, commandEndpoint?.port);
+        p.endpoints = lsofEndpoints.length > 0
+          ? mergeEndpoints(lsofEndpoints)
+          : mergeEndpoints(commandEndpoint ? [commandEndpoint] : undefined);
+      }));
+
+      await this.addLoopbackAliasEndpoints(processes);
+
+      for (const p of processes) {
+        const endpoint = p.endpoints?.[0];
         p.host = endpoint?.host;
         p.port = endpoint?.port;
-      }));
+        if (p.endpoints && p.endpoints.length > 1) {
+          log(`[ProcessFinder] PID=${p.pid} endpoints: ${p.endpoints.map(formatEndpoint).join(', ')}`);
+        }
+      }
 
       log(`[ProcessFinder] Found ${processes.length} Django process(es)`);
       return processes;
@@ -206,28 +280,73 @@ export class DjangoProcessFinder {
   }
 
   /**
-   * Find the TCP listening endpoint for a given PID using lsof.
+   * Find TCP listening endpoints for a given PID using lsof.
    */
-  private async findListeningEndpoint(
+  private async findListeningEndpoints(
     pid: number,
     expectedPort?: number,
-  ): Promise<TcpListeningEndpoint | undefined> {
+  ): Promise<TcpListeningEndpoint[]> {
+    const endpoints: TcpListeningEndpoint[] = [];
     try {
       const { stdout } = await execFileAsync('lsof', [
-        '-iTCP', '-sTCP:LISTEN', '-nP', '-p', String(pid),
+        '-a', '-iTCP', '-sTCP:LISTEN', '-nP', '-p', String(pid),
       ]);
       // Parse lsof output: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
       // NAME looks like *:8000, 127.0.0.1:8000, or 127.x.x.x:8000 (LISTEN)
       for (const line of stdout.split('\n')) {
         const endpoint = parseLsofTcpListenLine(line);
         if (endpoint && (!expectedPort || endpoint.port === expectedPort)) {
-          return endpoint;
+          endpoints.push(endpoint);
         }
       }
     } catch {
       // lsof may fail for permission reasons — that's fine
     }
-    return undefined;
+    return mergeEndpoints(endpoints);
+  }
+
+  private async addLoopbackAliasEndpoints(processes: DjangoProcess[]): Promise<void> {
+    const ports = new Set<number>();
+
+    for (const processInfo of processes) {
+      if (processInfo.type !== 'django') { continue; }
+      for (const endpoint of processInfo.endpoints ?? []) {
+        ports.add(endpoint.port);
+      }
+    }
+
+    if (ports.size === 0) {
+      return;
+    }
+
+    const aliasesByPort = await this.findLoopbackAliasEndpointsByPort(ports);
+    mergeLoopbackAliasEndpoints(processes, aliasesByPort);
+  }
+
+  private async findLoopbackAliasEndpointsByPort(
+    ports: ReadonlySet<number>,
+  ): Promise<Map<number, OwnedTcpListeningEndpoint[]>> {
+    const byPort = new Map<number, OwnedTcpListeningEndpoint[]>();
+
+    try {
+      const { stdout } = await execFileAsync('lsof', [
+        '-iTCP', '-sTCP:LISTEN', '-nP',
+      ]);
+      for (const line of stdout.split('\n')) {
+        const endpoint = parseLsofTcpListenLine(line);
+        if (!endpoint || !ports.has(endpoint.port) || !isLoopbackAlias(endpoint)) {
+          continue;
+        }
+
+        const endpoints = byPort.get(endpoint.port) ?? [];
+        endpoints.push({ pid: parseLsofPid(line), endpoint });
+        byPort.set(endpoint.port, endpoints);
+      }
+    } catch {
+      // lsof may fail for permission reasons — direct process endpoints still work.
+    }
+
+    return byPort;
   }
 
   /**
