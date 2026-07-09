@@ -1,4 +1,7 @@
 import { execFile } from 'child_process';
+import * as net from 'net';
+import * as os from 'os';
+import * as path from 'path';
 import { promisify } from 'util';
 import { log, logError } from './logger';
 import {
@@ -9,6 +12,7 @@ import {
 } from './listeningEndpoint';
 
 const execFileAsync = promisify(execFile);
+const PORT_MANAGER_AGENT_REQUEST_TIMEOUT_MS = 1_000;
 
 export type ProcessType = 'django' | 'celery';
 
@@ -28,6 +32,51 @@ export interface OwnedTcpListeningEndpoint {
   endpoint: TcpListeningEndpoint;
 }
 
+export interface PortManagerProcessRow {
+  id?: string;
+  pid?: number;
+  name?: string;
+  command?: string;
+  cwd?: string;
+  requestedPort?: number;
+  actualPort?: number;
+  status?: string;
+  url?: string;
+  source?: string;
+}
+
+export interface PortManagerRouteRow {
+  logicalPort?: number;
+  actualPort?: number;
+  routeDirection?: string;
+  host?: string;
+  processId?: string;
+  processName?: string;
+  status?: string;
+  source?: string;
+}
+
+export interface PortManagerListenerRow {
+  localAddress?: string;
+  port?: number;
+  pid?: number;
+  processName?: string;
+  command?: string;
+}
+
+export interface PortManagerSnapshot {
+  processes?: PortManagerProcessRow[];
+  routes?: PortManagerRouteRow[];
+  listeners?: PortManagerListenerRow[];
+}
+
+interface PortManagerResponseMessage {
+  id?: string;
+  ok?: boolean;
+  payload?: unknown;
+  error?: string;
+}
+
 function endpointKey(endpoint: TcpListeningEndpoint): string {
   return `${endpoint.host}:${endpoint.port}`;
 }
@@ -45,9 +94,13 @@ function mergeEndpoints(
   return [...byKey.values()];
 }
 
-function isLoopbackAlias(endpoint: TcpListeningEndpoint): boolean {
+/**
+ * Port managers can own 127.0.0.1:PORT while the real server listens on a
+ * 127.x loopback alias. Treat both sides as mergeable picker endpoints.
+ */
+export function isIpv4LoopbackEndpoint(endpoint: TcpListeningEndpoint): boolean {
   const host = normalizeListeningHost(endpoint.host).toLowerCase();
-  return host.startsWith('127.') && host !== '127.0.0.1';
+  return /^127(?:\.\d{1,3}){3}$/.test(host);
 }
 
 function parseLsofPid(line: string): number | undefined {
@@ -58,6 +111,204 @@ function parseLsofPid(line: string): number | undefined {
 
   const pid = parseInt(parts[1], 10);
   return Number.isInteger(pid) ? pid : undefined;
+}
+
+function isValidPort(port: unknown): port is number {
+  return Number.isInteger(port) && (port as number) > 0 && (port as number) <= 65535;
+}
+
+function isPositivePid(pid: unknown): pid is number {
+  return Number.isInteger(pid) && (pid as number) > 0;
+}
+
+function isPythonLikeText(text: string | undefined): boolean {
+  if (!text) {
+    return false;
+  }
+  const firstToken = text.trim().split(/\s+/, 1)[0] ?? '';
+  const executableName = path.basename(firstToken).toLowerCase();
+  return /^python(?:\d+(?:\.\d+)*)?$/.test(executableName);
+}
+
+function isPortManagerPythonProcess(
+  processRow: PortManagerProcessRow,
+  routeRow?: PortManagerRouteRow,
+): boolean {
+  return (
+    isPythonLikeText(processRow.command) ||
+    isPythonLikeText(processRow.name) ||
+    isPythonLikeText(routeRow?.processName)
+  );
+}
+
+function endpointFromUrl(url: string | undefined): TcpListeningEndpoint | undefined {
+  if (!url) {
+    return undefined;
+  }
+  try {
+    const parsed = new URL(url);
+    const port = parseInt(parsed.port, 10);
+    if (!isValidPort(port)) {
+      return undefined;
+    }
+    return {
+      host: normalizeListeningHost(parsed.hostname),
+      port,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function endpointFromRoute(route: PortManagerRouteRow): TcpListeningEndpoint | undefined {
+  const port = isValidPort(route.actualPort)
+    ? route.actualPort
+    : isValidPort(route.logicalPort)
+      ? route.logicalPort
+      : undefined;
+  if (!port) {
+    return undefined;
+  }
+  return {
+    host: normalizeListeningHost(route.host && route.host.length > 0 ? route.host : '127.0.0.1'),
+    port,
+  };
+}
+
+function endpointFromListener(listener: PortManagerListenerRow): TcpListeningEndpoint | undefined {
+  if (!isValidPort(listener.port)) {
+    return undefined;
+  }
+  return {
+    host: normalizeListeningHost(listener.localAddress && listener.localAddress.length > 0
+      ? listener.localAddress
+      : '127.0.0.1'),
+    port: listener.port,
+  };
+}
+
+function portManagerCommand(processRow: PortManagerProcessRow, route: PortManagerRouteRow): string {
+  const command = processRow.command && processRow.command.length > 0
+    ? processRow.command
+    : processRow.name && processRow.name.length > 0
+      ? processRow.name
+      : route.processName && route.processName.length > 0
+        ? route.processName
+        : 'python3';
+  const cwd = processRow.cwd && processRow.cwd.length > 0 ? processRow.cwd : undefined;
+  const endpoint = endpointFromRoute(route);
+  const details = [
+    'Port Manager',
+    cwd,
+    endpoint ? `:${endpoint.port}` : undefined,
+  ].filter((item): item is string => !!item);
+  return `${command} (${details.join(', ')})`;
+}
+
+function portManagerPythonPath(
+  processRow: PortManagerProcessRow,
+  routeRow: PortManagerRouteRow,
+  listenerRows: PortManagerListenerRow[],
+): string {
+  for (const text of [
+    processRow.command,
+    processRow.name,
+    routeRow.processName,
+    ...listenerRows.map((listener) => listener.command),
+    ...listenerRows.map((listener) => listener.processName),
+  ]) {
+    if (isPythonLikeText(text)) {
+      return text!.trim().split(/\s+/, 1)[0]!;
+    }
+  }
+  return 'python3';
+}
+
+function isPortManagerListenRoute(route: PortManagerRouteRow): boolean {
+  return (
+    route.status === 'running' &&
+    (route.routeDirection === undefined || route.routeDirection === 'listen') &&
+    isValidPort(route.actualPort ?? route.logicalPort) &&
+    typeof route.processId === 'string' &&
+    route.processId.length > 0
+  );
+}
+
+export function buildPortManagerDjangoProcesses(snapshot: PortManagerSnapshot): DjangoProcess[] {
+  const processRows = snapshot.processes ?? [];
+  const routeRows = snapshot.routes ?? [];
+  const listenerRows = snapshot.listeners ?? [];
+  const processesById = new Map<string, PortManagerProcessRow>();
+  const listenersByPid = new Map<number, PortManagerListenerRow[]>();
+  const candidatesByPid = new Map<number, DjangoProcess>();
+
+  for (const processRow of processRows) {
+    if (typeof processRow.id === 'string' && processRow.id.length > 0) {
+      processesById.set(processRow.id, processRow);
+    }
+  }
+
+  for (const listener of listenerRows) {
+    if (!isPositivePid(listener.pid)) {
+      continue;
+    }
+    const existing = listenersByPid.get(listener.pid) ?? [];
+    existing.push(listener);
+    listenersByPid.set(listener.pid, existing);
+  }
+
+  for (const route of routeRows) {
+    if (!isPortManagerListenRoute(route)) {
+      continue;
+    }
+
+    const processRow = processesById.get(route.processId!);
+    if (
+      !processRow ||
+      processRow.status !== 'running' ||
+      processRow.source === 'detected' ||
+      !isPositivePid(processRow.pid) ||
+      !isPortManagerPythonProcess(processRow, route)
+    ) {
+      continue;
+    }
+
+    const processListeners = listenersByPid.get(processRow.pid) ?? [];
+    const routeEndpoint = endpointFromRoute(route);
+    const routePort = routeEndpoint?.port;
+    const matchingListenerEndpoints = processListeners
+      .filter((listener) => routePort === undefined || listener.port === routePort)
+      .map(endpointFromListener)
+      .filter((endpoint): endpoint is TcpListeningEndpoint => !!endpoint);
+    const endpoints = mergeEndpoints(
+      routeEndpoint ? [routeEndpoint] : undefined,
+      endpointFromUrl(processRow.url) ? [endpointFromUrl(processRow.url)] : undefined,
+      matchingListenerEndpoints,
+    );
+
+    if (endpoints.length === 0) {
+      continue;
+    }
+
+    const existing = candidatesByPid.get(processRow.pid);
+    if (existing) {
+      existing.endpoints = mergeEndpoints(existing.endpoints, endpoints);
+      continue;
+    }
+
+    candidatesByPid.set(processRow.pid, {
+      pid: processRow.pid,
+      command: portManagerCommand(processRow, route),
+      pythonPath: portManagerPythonPath(processRow, route, processListeners),
+      arch: process.arch,
+      type: 'django',
+      host: endpoints[0].host,
+      port: endpoints[0].port,
+      endpoints,
+    });
+  }
+
+  return [...candidatesByPid.values()];
 }
 
 export function mergeLoopbackAliasEndpoints(
@@ -118,6 +369,9 @@ export class DjangoProcessFinder {
           : mergeEndpoints(commandEndpoint ? [commandEndpoint] : undefined);
       }));
 
+      const portManagerProcesses = await this.findPortManagerDjangoProcesses();
+      this.mergeDiscoveredProcesses(processes, portManagerProcesses);
+
       await this.addLoopbackAliasEndpoints(processes);
 
       for (const p of processes) {
@@ -135,6 +389,128 @@ export class DjangoProcessFinder {
       logError('[ProcessFinder] Failed to run ps', err);
       return [];
     }
+  }
+
+  private mergeDiscoveredProcesses(
+    processes: DjangoProcess[],
+    discoveredProcesses: DjangoProcess[],
+  ): void {
+    const byPid = new Map(processes.map((processInfo) => [processInfo.pid, processInfo]));
+
+    for (const discovered of discoveredProcesses) {
+      const existing = byPid.get(discovered.pid);
+      if (!existing) {
+        processes.push(discovered);
+        byPid.set(discovered.pid, discovered);
+        continue;
+      }
+
+      existing.endpoints = mergeEndpoints(existing.endpoints, discovered.endpoints);
+      existing.host = existing.endpoints[0]?.host ?? existing.host;
+      existing.port = existing.endpoints[0]?.port ?? existing.port;
+      if (!existing.pythonPath || existing.pythonPath === 'python') {
+        existing.pythonPath = discovered.pythonPath;
+      }
+    }
+  }
+
+  private async findPortManagerDjangoProcesses(): Promise<DjangoProcess[]> {
+    const snapshot = await this.queryPortManagerSnapshot();
+    if (!snapshot) {
+      return [];
+    }
+
+    const processes = buildPortManagerDjangoProcesses(snapshot);
+    if (processes.length > 0) {
+      log(`[ProcessFinder] Port Manager snapshot contributed ${processes.length} Django process candidate(s)`);
+    }
+    return processes;
+  }
+
+  private async queryPortManagerSnapshot(): Promise<PortManagerSnapshot | undefined> {
+    const socketPath = this.getPortManagerAgentSocketPath();
+    const requestId = `django-process-debugger-${process.pid}-${Date.now()}`;
+
+    return new Promise((resolve) => {
+      const socket = net.createConnection(socketPath);
+      let buffer = '';
+      let settled = false;
+
+      const settle = (snapshot?: PortManagerSnapshot) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        socket.destroy();
+        resolve(snapshot);
+      };
+
+      const timer = setTimeout(() => {
+        log(`[ProcessFinder] Port Manager agent snapshot timed out at ${socketPath}`);
+        settle();
+      }, PORT_MANAGER_AGENT_REQUEST_TIMEOUT_MS);
+
+      socket.once('connect', () => {
+        socket.write(`${JSON.stringify({ id: requestId, method: 'listSnapshot' })}\n`);
+      });
+
+      socket.on('data', (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          if (line.trim().length === 0) {
+            continue;
+          }
+          let message: PortManagerResponseMessage;
+          try {
+            message = JSON.parse(line) as PortManagerResponseMessage;
+          } catch {
+            continue;
+          }
+          if (message.id !== requestId) {
+            continue;
+          }
+          if (message.ok === true && this.isPortManagerSnapshot(message.payload)) {
+            settle(message.payload);
+          } else {
+            log(`[ProcessFinder] Port Manager agent snapshot failed: ${message.error ?? 'unknown response'}`);
+            settle();
+          }
+        }
+      });
+
+      socket.once('error', (err) => {
+        log(`[ProcessFinder] Port Manager agent unavailable at ${socketPath}: ${err.message}`);
+        settle();
+      });
+    });
+  }
+
+  private getPortManagerAgentSocketPath(): string {
+    if (process.env.PORT_MANAGER_AGENT_SOCKET) {
+      return process.env.PORT_MANAGER_AGENT_SOCKET;
+    }
+    if (process.platform === 'win32') {
+      return '\\\\.\\pipe\\newdlops-portmanager-agent';
+    }
+    const userId = typeof process.getuid === 'function'
+      ? process.getuid()
+      : os.userInfo().username;
+    return path.join(os.tmpdir(), `newdlops-portmanager-agent-${userId}.sock`);
+  }
+
+  private isPortManagerSnapshot(value: unknown): value is PortManagerSnapshot {
+    if (typeof value !== 'object' || value === null) {
+      return false;
+    }
+    const snapshot = value as PortManagerSnapshot;
+    return (
+      (snapshot.processes === undefined || Array.isArray(snapshot.processes)) &&
+      (snapshot.routes === undefined || Array.isArray(snapshot.routes)) &&
+      (snapshot.listeners === undefined || Array.isArray(snapshot.listeners))
+    );
   }
 
   private isDjangoProcess(line: string): boolean {
@@ -334,7 +710,7 @@ export class DjangoProcessFinder {
       ]);
       for (const line of stdout.split('\n')) {
         const endpoint = parseLsofTcpListenLine(line);
-        if (!endpoint || !ports.has(endpoint.port) || !isLoopbackAlias(endpoint)) {
+        if (!endpoint || !ports.has(endpoint.port) || !isIpv4LoopbackEndpoint(endpoint)) {
           continue;
         }
 

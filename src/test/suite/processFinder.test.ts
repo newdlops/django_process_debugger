@@ -1,6 +1,12 @@
 import * as assert from 'assert';
 import { describe, it, before, after } from 'mocha';
-import { DjangoProcess, DjangoProcessFinder, mergeLoopbackAliasEndpoints } from '../../processFinder';
+import {
+  buildPortManagerDjangoProcesses,
+  DjangoProcess,
+  DjangoProcessFinder,
+  isIpv4LoopbackEndpoint,
+  mergeLoopbackAliasEndpoints,
+} from '../../processFinder';
 import { parseLsofTcpListenLine } from '../../listeningEndpoint';
 import { getPerf } from './perfReporter';
 import { findSystemPython, spawnFakeRunserver, SpawnedProcess } from './testHelpers';
@@ -122,7 +128,39 @@ describe('Feature: process discovery', function () {
     });
   });
 
+  describe('loopback endpoint detection', function () {
+    it('includes portmanager public listeners on 127.0.0.1', function () {
+      assert.strictEqual(isIpv4LoopbackEndpoint({ host: '127.0.0.1', port: 8004 }), true);
+      assert.strictEqual(isIpv4LoopbackEndpoint({ host: '127.125.100.191', port: 8004 }), true);
+      assert.strictEqual(isIpv4LoopbackEndpoint({ host: '::1', port: 8004 }), false);
+    });
+  });
+
   describe('loopback alias merging', function () {
+    it('adds portmanager 127.0.0.1 listeners on the same port as selectable endpoints', function () {
+      const processes: DjangoProcess[] = [{
+        pid: 101,
+        command: 'python manage.py runserver 8004',
+        pythonPath: 'python',
+        arch: process.arch,
+        type: 'django',
+        host: '127.103.218.122',
+        port: 8004,
+        endpoints: [{ host: '127.103.218.122', port: 8004 }],
+      }];
+
+      mergeLoopbackAliasEndpoints(processes, new Map([
+        [8004, [
+          { pid: 5950, endpoint: { host: '127.0.0.1', port: 8004 } },
+        ]],
+      ]));
+
+      assert.deepStrictEqual(processes[0].endpoints, [
+        { host: '127.103.218.122', port: 8004 },
+        { host: '127.0.0.1', port: 8004 },
+      ]);
+    });
+
     it('adds non-Django 127.x listeners on the same port as selectable endpoints', function () {
       const processes: DjangoProcess[] = [{
         pid: 101,
@@ -185,6 +223,142 @@ describe('Feature: process discovery', function () {
       assert.deepStrictEqual(processes[1].endpoints, [
         { host: '127.97.194.31', port: 8004 },
         { host: '127.135.15.126', port: 8004 },
+      ]);
+    });
+  });
+
+  describe('portmanager snapshot discovery', function () {
+    it('creates Django candidates from hooked python routes with shortened commands', function () {
+      const processes = buildPortManagerDjangoProcesses({
+        processes: [{
+          id: 'managed-process-58',
+          pid: 8288,
+          name: 'python3',
+          command: 'python3',
+          cwd: '/Users/lky/project/app',
+          requestedPort: 8004,
+          actualPort: 8004,
+          status: 'running',
+          url: 'http://127.103.218.122:8004',
+          source: 'hooked',
+        }],
+        routes: [{
+          logicalPort: 8004,
+          actualPort: 8004,
+          routeDirection: 'listen',
+          host: '127.103.218.122',
+          processId: 'managed-process-58',
+          processName: 'python3',
+          status: 'running',
+          source: 'hooked',
+        }],
+        listeners: [{
+          localAddress: '127.103.218.122',
+          port: 8004,
+          pid: 8288,
+          processName: 'python3.11',
+          command: 'python3.11',
+        }],
+      });
+
+      assert.strictEqual(processes.length, 1);
+      assert.strictEqual(processes[0].pid, 8288);
+      assert.strictEqual(processes[0].type, 'django');
+      assert.strictEqual(processes[0].pythonPath, 'python3');
+      assert.strictEqual(processes[0].command, 'python3 (Port Manager, /Users/lky/project/app, :8004)');
+      assert.deepStrictEqual(processes[0].endpoints, [
+        { host: '127.103.218.122', port: 8004 },
+      ]);
+    });
+
+    it('ignores detected router rows and non-python routes', function () {
+      const processes = buildPortManagerDjangoProcesses({
+        processes: [
+          {
+            id: 'detected-router',
+            pid: 86587,
+            name: 'portmanager_tcp_router',
+            command: 'portmanager_tcp_router',
+            requestedPort: 8004,
+            actualPort: 8004,
+            status: 'running',
+            source: 'detected',
+          },
+          {
+            id: 'managed-node',
+            pid: 41484,
+            name: 'node',
+            command: 'node',
+            requestedPort: 3004,
+            actualPort: 3004,
+            status: 'running',
+            source: 'hooked',
+          },
+        ],
+        routes: [
+          {
+            logicalPort: 8004,
+            actualPort: 8004,
+            routeDirection: 'listen',
+            host: '127.0.0.1',
+            processId: 'detected-router',
+            processName: 'portmanager_tcp_router',
+            status: 'running',
+          },
+          {
+            logicalPort: 3004,
+            actualPort: 3004,
+            routeDirection: 'listen',
+            host: '127.0.0.1',
+            processId: 'managed-node',
+            processName: 'node',
+            status: 'running',
+          },
+        ],
+      });
+
+      assert.deepStrictEqual(processes, []);
+    });
+
+    it('merges multiple running routes owned by the same python pid', function () {
+      const processes = buildPortManagerDjangoProcesses({
+        processes: [{
+          id: 'managed-python',
+          pid: 9001,
+          name: 'python3.11',
+          command: 'python3.11',
+          cwd: '/app',
+          requestedPort: 8004,
+          actualPort: 8004,
+          status: 'running',
+          source: 'hooked',
+        }],
+        routes: [
+          {
+            logicalPort: 8004,
+            actualPort: 8004,
+            routeDirection: 'listen',
+            host: '127.10.0.1',
+            processId: 'managed-python',
+            processName: 'python3.11',
+            status: 'running',
+          },
+          {
+            logicalPort: 8005,
+            actualPort: 8005,
+            routeDirection: 'listen',
+            host: '127.10.0.1',
+            processId: 'managed-python',
+            processName: 'python3.11',
+            status: 'running',
+          },
+        ],
+      });
+
+      assert.strictEqual(processes.length, 1);
+      assert.deepStrictEqual(processes[0].endpoints, [
+        { host: '127.10.0.1', port: 8004 },
+        { host: '127.10.0.1', port: 8005 },
       ]);
     });
   });
