@@ -13,18 +13,37 @@ import { getPerf } from './perfReporter';
 describe('Feature: debug session lock-file contract', function () {
   const perf = getPerf();
   let lockDir: string;
-  let lockFile: string;
+  let legacyLockFile: string;
+
+  function lockFileForPid(pid: number): string {
+    return path.join(lockDir, `debug-session.${pid}.lock`);
+  }
+
+  async function readLockForPid(pid: number): Promise<Record<string, unknown> | null> {
+    try {
+      const data = await fs.readFile(lockFileForPid(pid), 'utf-8');
+      return JSON.parse(data);
+    } catch {
+      // Backward compatibility: the legacy global lock only applies to its own PID.
+      try {
+        const legacy = JSON.parse(await fs.readFile(legacyLockFile, 'utf-8'));
+        return legacy.pid === pid ? legacy : null;
+      } catch {
+        return null;
+      }
+    }
+  }
 
   before(async function () {
     lockDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dpd-lock-'));
-    lockFile = path.join(lockDir, 'debug-session.lock');
+    legacyLockFile = path.join(lockDir, 'debug-session.lock');
   });
 
   after(async function () {
     await fs.rm(lockDir, { recursive: true, force: true }).catch(() => {});
   });
 
-  it('write and read round-trip preserves payload', async function () {
+  it('PID-scoped write and read round-trip preserves payload', async function () {
     const payload = {
       pid: 12345,
       port: 5678,
@@ -34,18 +53,32 @@ describe('Feature: debug session lock-file contract', function () {
     };
 
     await perf.measure('lock write', async () => {
-      await fs.writeFile(lockFile, JSON.stringify(payload), 'utf-8');
+      await fs.writeFile(lockFileForPid(payload.pid), JSON.stringify(payload), 'utf-8');
     }, { group: 'lock' });
 
-    const round = JSON.parse(
-      await perf.measure('lock read', async () =>
-        fs.readFile(lockFile, 'utf-8'),
-      { group: 'lock' }),
-    );
+    const round = await perf.measure('lock read', async () =>
+      readLockForPid(payload.pid),
+    { group: 'lock' });
     assert.deepStrictEqual(round, payload);
   });
 
+  it('legacy global lock is ignored for a different target PID', async function () {
+    const payload = {
+      pid: 11111,
+      port: 5678,
+      workspaceId: 'abc',
+      workspaceName: 'test-workspace',
+      timestamp: new Date().toISOString(),
+    };
+
+    await fs.writeFile(legacyLockFile, JSON.stringify(payload), 'utf-8');
+
+    assert.deepStrictEqual(await readLockForPid(payload.pid), payload);
+    assert.strictEqual(await readLockForPid(22222), null);
+  });
+
   it('remove is idempotent', async function () {
+    const lockFile = lockFileForPid(12345);
     await fs.unlink(lockFile).catch(() => {});
     await fs.unlink(lockFile).catch(() => {});
     await assert.rejects(fs.access(lockFile));

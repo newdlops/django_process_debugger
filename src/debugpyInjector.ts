@@ -14,8 +14,21 @@ const execFileAsync = promisify(execFile);
 
 const PTH_FILENAME = 'django_process_debugger.pth';
 const BOOTSTRAP_MODULE = '_django_debug_bootstrap';
-export const BOOTSTRAP_VERSION = '2026.07.01.1';
+export const BOOTSTRAP_VERSION = '2026.07.10.2';
 export type DebugpyEndpoint = TcpListeningEndpoint;
+type BootstrapRuntimeState = {
+  pid: number;
+  version: string;
+};
+
+function pythonProbeEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  env.PORT_MANAGER_HOOK = '0';
+  env.PORT_MANAGER_HOOK_DISABLED = '1';
+  delete env.DYLD_INSERT_LIBRARIES;
+  delete env.LD_PRELOAD;
+  return env;
+}
 
 /**
  * Bootstrap script installed into the target venv's site-packages.
@@ -41,6 +54,19 @@ function reloadFilePath(pid: number): string {
 
 function reloadResultFilePath(pid: number): string {
   return `${PORT_FILE_DIR}/${pid}.reload.result`;
+}
+
+function bootstrapStateFilePath(pid: number): string {
+  return `${PORT_FILE_DIR}/${pid}.bootstrap.json`;
+}
+
+function isCeleryWorkerCommand(command: string): boolean {
+  return [
+    /(?:^|\s)(?:\S*\/)?celery(?:\s|$).*?\bworker\b/i,
+    /(?:^|\s)-m\s+celery(?:\s|$).*?\bworker\b/i,
+    /(?:^|\s)(?:\S*\/)?celery(?:\s|$).*?\bmulti\s+start\b/i,
+    /(?:^|\s)(?:\S*\/)?celeryd(?:\s|$)/i,
+  ].some((pattern) => pattern.test(command));
 }
 
 function makeBootstrapScript(bundledDebugpyPath: string): string {
@@ -87,6 +113,8 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '        # both tokens rather than a fixed "celery worker" substring.',
     '        if "worker" in _parts and ("celery" in _parts or _os.path.basename(_argv0) == "celery"):',
     '            return True',
+    '        if _os.path.basename(_argv0) == "celeryd" or " celeryd" in _cmd:',
+    '            return True',
     '        # Fallback for Python < 3.10 (no orig_argv): a `-m <pkg> worker`',
     '        # invocation arrives as argv == ["-m", "worker", ...].',
     '        if _argv0 == "-m" and "worker" in _parts:',
@@ -120,9 +148,20 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '            except Exception:',
     '                pass',
     '',
+    '        def _write_bootstrap_state():',
+    '            try:',
+    '                _os.makedirs(_PORT_FILE_DIR, exist_ok=True)',
+    '                import json as _json',
+    '                with open(f"{_PORT_FILE_DIR}/{_os.getpid()}.bootstrap.json", "w") as _f:',
+    '                    _f.write(_json.dumps({"version": ' + JSON.stringify(BOOTSTRAP_VERSION) + ', "pid": _os.getpid()}))',
+    '            except Exception as _e:',
+    '                _dbg_log(f"Failed to write bootstrap state: {_e}")',
+    '',
     '        _dbg_log("Bootstrap module loaded, installing signal handlers")',
+    '        _write_bootstrap_state()',
     '',
     '        _hot_reload_watcher_started = False',
+    '        _debugpy_endpoint = None',
     '',
     '        # Persistent storage: keeps references to the ORIGINAL functions',
     '        # (before any reload) so we always patch the ones Django actually calls.',
@@ -386,16 +425,70 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '            _dbg_log("Hot reload watcher started")',
     '',
     '        def _django_debugger_signal_handler(signum, frame):',
-    '            global _hot_reload_watcher_started',
+    '            global _hot_reload_watcher_started, _debugpy_endpoint',
     '            _dbg_log(f"Signal {signum} received")',
+    '            _write_bootstrap_state()',
     '            _active_file = f"{_PORT_FILE_DIR}/{_os.getpid()}.active"',
-    '            try:',
-    '                with open(_active_file) as _f:',
-    '                    _existing_port = _f.read().strip()',
-    '                _dbg_log(f"debugpy already active on port {_existing_port}, skipping")',
-    '                return',
-    '            except FileNotFoundError:',
-    '                pass',
+    '            _port_file = f"{_PORT_FILE_DIR}/{_os.getpid()}.port"',
+    '            def _clear_pending_port_file():',
+    '                try:',
+    '                    _os.unlink(_port_file)',
+    '                except FileNotFoundError:',
+    '                    pass',
+    '                except Exception as _e:',
+    '                    _dbg_log(f"Failed to remove stale port file: {_e}")',
+    '            def _endpoint_is_alive(_host, _port):',
+    '                try:',
+    '                    import socket as _socket',
+    '                    _sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)',
+    '                    _sock.settimeout(0.2)',
+    '                    try:',
+    '                        return _sock.connect_ex((_host or "127.0.0.1", int(_port))) == 0',
+    '                    finally:',
+    '                        _sock.close()',
+    '                except Exception as _e:',
+    '                    _dbg_log(f"Endpoint check failed for {_host}:{_port}: {_e}")',
+    '                    return False',
+    '            def _read_active_endpoint():',
+    '                try:',
+    '                    with open(_active_file) as _f:',
+    '                        _content = _f.read().strip()',
+    '                    try:',
+    '                        import json as _json',
+    '                        _parsed = _json.loads(_content)',
+    '                        return (str(_parsed.get("host") or "127.0.0.1"), int(_parsed.get("port")))',
+    '                    except Exception:',
+    '                        return ("127.0.0.1", int(_content))',
+    '                except FileNotFoundError:',
+    '                    return None',
+    '                except Exception as _e:',
+    '                    _dbg_log(f"Failed to read active endpoint: {_e}")',
+    '                    return None',
+    '            _existing_endpoint = _read_active_endpoint()',
+    '            if _existing_endpoint is not None:',
+    '                if _endpoint_is_alive(_existing_endpoint[0], _existing_endpoint[1]):',
+    '                    _clear_pending_port_file()',
+    '                    _dbg_log(f"debugpy already active on {_existing_endpoint[0]}:{_existing_endpoint[1]}, skipping")',
+    '                    return',
+    '                try:',
+    '                    _os.unlink(_active_file)',
+    '                except FileNotFoundError:',
+    '                    pass',
+    '                _dbg_log(f"Removed stale active endpoint {_existing_endpoint[0]}:{_existing_endpoint[1]}")',
+    '            if _debugpy_endpoint is not None:',
+    '                if not _endpoint_is_alive(_debugpy_endpoint[0], _debugpy_endpoint[1]):',
+    '                    _dbg_log(f"Stored debugpy endpoint is stale: {_debugpy_endpoint[0]}:{_debugpy_endpoint[1]}")',
+    '                    _debugpy_endpoint = None',
+    '                else:',
+    '                    try:',
+    '                        import json as _json',
+    '                        with open(_active_file, "w") as _f:',
+    '                            _f.write(_json.dumps({"host": _debugpy_endpoint[0], "port": _debugpy_endpoint[1]}))',
+    '                        _clear_pending_port_file()',
+    '                        _dbg_log(f"debugpy endpoint restored in active file: {_debugpy_endpoint[0]}:{_debugpy_endpoint[1]}")',
+    '                    except Exception as _e:',
+    '                        _dbg_log(f"Failed to restore active file: {_e}")',
+    '                    return',
     '            _bundled = ' + JSON.stringify(bundledDebugpyPath),
     '            if _bundled and _bundled not in _sys.path:',
     '                _sys.path.insert(0, _bundled)',
@@ -403,7 +496,6 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '            try:',
     '                import debugpy',
     '                _dbg_log(f"debugpy imported from {debugpy.__file__}")',
-    '                _port_file = f"{_PORT_FILE_DIR}/{_os.getpid()}.port"',
     '                _port = 5678',
     '                try:',
     '                    with open(_port_file) as _f:',
@@ -423,6 +515,7 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                import json as _json',
     '                with open(_active_file, "w") as _f:',
     '                    _f.write(_json.dumps({"host": _host, "port": _actual_port}))',
+    '                _debugpy_endpoint = (_host, _actual_port)',
     '                _dbg_log(f"debugpy listening on {_host}:{_actual_port}")',
     '                # Start hot reload watcher after debugpy is active',
     '                if not _hot_reload_watcher_started:',
@@ -637,7 +730,7 @@ export class DebugpyInjector {
           '        paths.append(candidate)',
           'print(paths[0])',
         ].join('\n'),
-      ]);
+      ], { env: pythonProbeEnv() });
       const dir = stdout.trim();
       log(`[Injector] Resolved site-packages: ${dir}`);
       return dir;
@@ -766,15 +859,29 @@ export class DebugpyInjector {
   async getActiveEndpoint(pid: number): Promise<DebugpyEndpoint | null> {
     const activeFile = path.join(PORT_FILE_DIR, `${pid}.active`);
     try {
+      this.verifyProcessAlive(pid);
+    } catch {
+      await fs.unlink(activeFile).catch(() => {});
+      return null;
+    }
+
+    try {
       const content = await fs.readFile(activeFile, 'utf-8');
       const recorded = this.parseActiveFile(content);
       if (recorded) {
-        let endpoint = await this.findListeningEndpoint(recorded.port, undefined, recorded.host);
-        if (!endpoint && recorded.host) {
-          endpoint = await this.findListeningEndpoint(recorded.port);
-        }
+        const endpoint = recorded.host
+          ? await this.findListeningEndpoint(recorded.port, undefined, recorded.host)
+          : await this.findListeningEndpoint(recorded.port);
         if (endpoint) {
           return endpoint;
+        }
+        const pidOwnedEndpoint = await this.findListeningEndpoint(recorded.port, pid);
+        if (pidOwnedEndpoint) {
+          log(
+            `[Injector] Active endpoint host ${recorded.host ?? 'unknown'} for PID=${pid} ` +
+            `resolved through PID-owned listener ${formatEndpoint(pidOwnedEndpoint)}`
+          );
+          return pidOwnedEndpoint;
         }
       }
       // Stale active file — debugpy no longer listening
@@ -842,6 +949,24 @@ export class DebugpyInjector {
     }
     log(`[Injector] Bootstrap module verified as importable`);
 
+    const loadedBootstrapState = await this.getLoadedBootstrapState(pid);
+    const loadedBootstrapVersion = loadedBootstrapState?.version ?? null;
+    if (!loadedBootstrapState || loadedBootstrapVersion !== BOOTSTRAP_VERSION) {
+      log(
+        `[Injector] Target PID=${pid} loaded bootstrap version ` +
+        `${loadedBootstrapVersion ?? 'unknown'}, expected ${BOOTSTRAP_VERSION}`
+      );
+      throw new BootstrapRuntimeVersionError(pid, loadedBootstrapVersion, BOOTSTRAP_VERSION);
+    }
+    if (loadedBootstrapState.pid === pid) {
+      log(`[Injector] Target PID=${pid} loaded bootstrap version ${loadedBootstrapVersion}`);
+    } else {
+      log(
+        `[Injector] Target PID=${pid} inherited bootstrap version ${loadedBootstrapVersion} ` +
+        `from ancestor PID=${loadedBootstrapState.pid}`
+      );
+    }
+
     // Write the desired port to a file the bootstrap will read
     await fs.mkdir(PORT_FILE_DIR, { recursive: true });
     await fs.writeFile(portFilePath(pid), String(port), 'utf-8');
@@ -850,7 +975,7 @@ export class DebugpyInjector {
     // Determine which signal to send: celery overrides SIGUSR1 for log reopen,
     // so we use SIGUSR2 for celery workers and SIGUSR1 for everything else.
     const command = await this.getProcessCommand(pid);
-    const isCelery = /celery\s+.*worker|-m\s+celery\s+worker/.test(command);
+    const isCelery = isCeleryWorkerCommand(command);
     const signal = isCelery ? 'SIGUSR2' : 'SIGUSR1';
 
     log(`[Injector] Sending ${signal} to PID=${pid} (${isCelery ? 'celery' : 'django'})`);
@@ -861,14 +986,13 @@ export class DebugpyInjector {
       throw new SignalError(pid, err instanceof Error ? err : new Error(String(err)));
     }
 
-    // Wait for debugpy to start listening (via lsof, non-invasive)
-    log(`[Injector] Waiting for debugpy to listen on port ${port}...`);
-    const detectedEndpoint = await this.waitForPortListening(port, 5000);
-    if (!detectedEndpoint) {
-      log(`[Injector] Port ${port} not open after SIGUSR1`);
-      throw new BootstrapNotLoadedError(pid, port);
+    // Wait for the target process to publish a live active endpoint.
+    log(`[Injector] Waiting for debugpy active endpoint on port ${port}...`);
+    const endpoint = await this.waitForActiveEndpoint(pid, port, 5000);
+    if (!endpoint) {
+      log(`[Injector] Active endpoint for PID=${pid} port=${port} not available after ${signal}`);
+      throw new BootstrapNotLoadedError(pid, port, signal);
     }
-    const endpoint = await this.getActiveEndpoint(pid) ?? detectedEndpoint;
     log(`[Injector] debugpy is listening on ${formatEndpoint(endpoint)}`);
     return endpoint;
   }
@@ -887,6 +1011,64 @@ export class DebugpyInjector {
       return stdout.trim();
     } catch {
       return '';
+    }
+  }
+
+  private async getLoadedBootstrapState(pid: number): Promise<BootstrapRuntimeState | null> {
+    const directState = await this.readBootstrapState(pid);
+    if (directState) {
+      return directState;
+    }
+
+    for (const ancestorPid of await this.getAncestorPids(pid)) {
+      const ancestorState = await this.readBootstrapState(ancestorPid);
+      if (ancestorState) {
+        return ancestorState;
+      }
+    }
+
+    return null;
+  }
+
+  private async readBootstrapState(pid: number): Promise<BootstrapRuntimeState | null> {
+    try {
+      this.verifyProcessAlive(pid);
+      const content = await fs.readFile(bootstrapStateFilePath(pid), 'utf-8');
+      const parsed = JSON.parse(content) as { pid?: unknown; version?: unknown };
+      if (parsed.pid !== pid || typeof parsed.version !== 'string') {
+        return null;
+      }
+      return { pid, version: parsed.version };
+    } catch {
+      return null;
+    }
+  }
+
+  private async getAncestorPids(pid: number): Promise<number[]> {
+    const ancestors: number[] = [];
+    const seen = new Set<number>([pid]);
+    let currentPid = pid;
+
+    for (let depth = 0; depth < 16; depth += 1) {
+      const parentPid = await this.getParentPid(currentPid);
+      if (!parentPid || parentPid <= 1 || seen.has(parentPid)) {
+        break;
+      }
+      ancestors.push(parentPid);
+      seen.add(parentPid);
+      currentPid = parentPid;
+    }
+
+    return ancestors;
+  }
+
+  private async getParentPid(pid: number): Promise<number | null> {
+    try {
+      const { stdout } = await execFileAsync('ps', ['-p', String(pid), '-o', 'ppid=']);
+      const parentPid = Number.parseInt(stdout.trim(), 10);
+      return Number.isInteger(parentPid) && parentPid > 0 ? parentPid : null;
+    } catch {
+      return null;
     }
   }
 
@@ -925,9 +1107,14 @@ export class DebugpyInjector {
     try {
       const args = [
         '-nP',
+      ];
+      if (pid !== undefined) {
+        args.push('-a');
+      }
+      args.push(
         '-i', `TCP:${port}`,
         '-sTCP:LISTEN',
-      ];
+      );
       if (pid !== undefined) {
         args.push('-p', String(pid));
       }
@@ -952,18 +1139,22 @@ export class DebugpyInjector {
     }
   }
 
-  /**
-   * Wait for a port to start listening, checked via lsof (non-invasive).
-   */
-  private async waitForPortListening(
-    port: number,
+  private async waitForActiveEndpoint(
+    pid: number,
+    expectedPort: number,
     timeoutMs: number,
-    pid?: number,
   ): Promise<DebugpyEndpoint | null> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const endpoint = await this.findListeningEndpoint(port, pid);
+      const endpoint = await this.getActiveEndpoint(pid);
       if (endpoint) {
+        if (endpoint.port !== expectedPort) {
+          log(
+            `[Injector] Reusing existing debugpy endpoint ${formatEndpoint(endpoint)} ` +
+            `for PID=${pid}; requested port was ${expectedPort}`
+          );
+          await fs.unlink(portFilePath(pid)).catch(() => {});
+        }
         return endpoint;
       }
       await new Promise((r) => setTimeout(r, 200));
@@ -999,13 +1190,29 @@ export class BootstrapNotInstalledError extends Error {
   }
 }
 
+export class BootstrapRuntimeVersionError extends Error {
+  constructor(
+    public readonly pid: number,
+    public readonly loadedVersion: string | null,
+    public readonly expectedVersion: string,
+  ) {
+    super(
+      loadedVersion
+        ? `Target PID ${pid} loaded bootstrap ${loadedVersion}, but this extension requires ${expectedVersion}. Restart the target process after setup.`
+        : `Target PID ${pid} did not publish bootstrap runtime state. Restart the target process after setup so the debug bootstrap is loaded.`
+    );
+    this.name = 'BootstrapRuntimeVersionError';
+  }
+}
+
 export class BootstrapNotLoadedError extends Error {
   constructor(
     public readonly pid: number,
     public readonly port: number,
+    public readonly signal: NodeJS.Signals = 'SIGUSR1',
   ) {
     super(
-      `Sent SIGUSR1 to PID ${pid} but debugpy did not start listening on port ${port}. ` +
+      `Sent ${signal} to PID ${pid} but debugpy did not start listening on port ${port}. ` +
       `The Django process was likely not started with the debug bootstrap loaded.`
     );
     this.name = 'BootstrapNotLoadedError';

@@ -5,7 +5,13 @@ import * as fsPromises from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { DjangoProcess, DjangoProcessFinder } from './processFinder';
-import { DebugpyInjector, BootstrapNotLoadedError, BootstrapNotInstalledError, BOOTSTRAP_VERSION } from './debugpyInjector';
+import {
+  DebugpyInjector,
+  BootstrapNotLoadedError,
+  BootstrapNotInstalledError,
+  BootstrapRuntimeVersionError,
+  BOOTSTRAP_VERSION,
+} from './debugpyInjector';
 import { DebugpyManager, DebugpyProvisioningInfo } from './debugpyManager';
 import { log, logError, getLogger } from './logger';
 import { shouldIgnoreForHotReload } from './hotReloadFilter';
@@ -25,7 +31,7 @@ import {
 } from './runtimeSetup';
 
 const LOCK_DIR = '/tmp/django-process-debugger';
-const LOCK_FILE = path.join(LOCK_DIR, 'debug-session.lock');
+const LEGACY_LOCK_FILE = path.join(LOCK_DIR, 'debug-session.lock');
 
 interface LockInfo {
   pid: number;
@@ -36,22 +42,59 @@ interface LockInfo {
   timestamp: string;
 }
 
-function readLock(): LockInfo | null {
+function lockFileForPid(pid: number): string {
+  return path.join(LOCK_DIR, `debug-session.${pid}.lock`);
+}
+
+function readLockFile(lockFile: string): LockInfo | null {
   try {
-    const data = fs.readFileSync(LOCK_FILE, 'utf-8');
+    const data = fs.readFileSync(lockFile, 'utf-8');
     return JSON.parse(data);
   } catch {
     return null;
   }
 }
 
-function writeLock(info: LockInfo): void {
-  fs.mkdirSync(LOCK_DIR, { recursive: true });
-  fs.writeFileSync(LOCK_FILE, JSON.stringify(info), 'utf-8');
+function readLockForPid(pid: number): LockInfo | null {
+  const pidLock = readLockFile(lockFileForPid(pid));
+  if (pidLock) {
+    return pidLock;
+  }
+
+  // Backward compatibility for older builds that wrote a single global lock.
+  const legacyLock = readLockFile(LEGACY_LOCK_FILE);
+  return legacyLock?.pid === pid ? legacyLock : null;
 }
 
-function removeLock(): void {
-  try { fs.unlinkSync(LOCK_FILE); } catch { /* ignore */ }
+function writeLock(info: LockInfo): void {
+  fs.mkdirSync(LOCK_DIR, { recursive: true });
+  fs.writeFileSync(lockFileForPid(info.pid), JSON.stringify(info), 'utf-8');
+
+  // Do not leave a stale global lock that can block a different worker PID.
+  const legacyLock = readLockFile(LEGACY_LOCK_FILE);
+  if (legacyLock?.pid === info.pid) {
+    try { fs.unlinkSync(LEGACY_LOCK_FILE); } catch { /* ignore */ }
+  }
+}
+
+function removeLock(pid?: number): void {
+  if (typeof pid === 'number') {
+    try { fs.unlinkSync(lockFileForPid(pid)); } catch { /* ignore */ }
+    const legacyLock = readLockFile(LEGACY_LOCK_FILE);
+    if (legacyLock?.pid === pid) {
+      try { fs.unlinkSync(LEGACY_LOCK_FILE); } catch { /* ignore */ }
+    }
+    return;
+  }
+
+  try { fs.unlinkSync(LEGACY_LOCK_FILE); } catch { /* ignore */ }
+  try {
+    for (const entry of fs.readdirSync(LOCK_DIR)) {
+      if (/^debug-session\.\d+\.lock$/.test(entry)) {
+        try { fs.unlinkSync(path.join(LOCK_DIR, entry)); } catch { /* ignore */ }
+      }
+    }
+  } catch { /* ignore */ }
 }
 
 function getWorkspaceId(): string {
@@ -61,6 +104,15 @@ function getWorkspaceId(): string {
 
 function getWorkspaceName(): string {
   return vscode.workspace.workspaceFolders?.[0]?.name ?? 'Unknown Workspace';
+}
+
+function targetPidFromSession(session: vscode.DebugSession): number | undefined {
+  const match = session.name.match(/\(PID:\s*(\d+)\)/);
+  if (!match) {
+    return undefined;
+  }
+  const pid = parseInt(match[1], 10);
+  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -152,6 +204,7 @@ export function activate(context: vscode.ExtensionContext) {
     process: DjangoProcess;
     resolvedPid: number;
     endpoint?: TcpListeningEndpoint;
+    isWorker?: boolean;
   }
 
   function makeRuntimeCandidate(
@@ -457,26 +510,36 @@ export function activate(context: vscode.ExtensionContext) {
         process: DjangoProcess;
         resolvedPid: number;
         endpoints: TcpListeningEndpoint[];
-      }> = await Promise.all(processes.map(async (processInfo) => {
+        isWorker?: boolean;
+      }> = (await Promise.all(processes.map(async (processInfo) => {
         try {
           const resolved = await processFinder.resolveDebuggablePid(processInfo.pid);
           const resolvedProcess = processes.find((p) => p.pid === resolved.pid);
           const endpoints = endpointsForProcess(resolvedProcess ?? processInfo);
           const fallbackEndpoints = endpointsForProcess(processInfo);
-          return {
+          const workerPids = (processInfo.workerPids ?? []).filter((pid) => pid !== resolved.pid);
+          const targetPids = workerPids.length > 0
+            ? [...new Set(workerPids)]
+            : [resolved.pid];
+          return targetPids.map((targetPid) => ({
             process: processInfo,
-            resolvedPid: resolved.pid,
+            resolvedPid: targetPid,
             endpoints: endpoints.length > 0 ? endpoints : fallbackEndpoints,
-          };
+            isWorker: targetPid !== resolved.pid,
+          }));
         } catch (err) {
           logError(`[Attach] Failed to resolve debuggable PID for ${processInfo.pid}`, err);
-          return {
+          const fallbackPids = processInfo.workerPids?.length
+            ? [...new Set(processInfo.workerPids)]
+            : [processInfo.pid];
+          return fallbackPids.map((fallbackPid) => ({
             process: processInfo,
-            resolvedPid: processInfo.pid,
+            resolvedPid: fallbackPid,
             endpoints: endpointsForProcess(processInfo),
-          };
+            isWorker: fallbackPid !== processInfo.pid,
+          }));
         }
-      }));
+      }))).flat();
       const attachCandidates: AttachCandidate[] = attachCandidateGroups.flatMap((candidate): AttachCandidate[] =>
         candidate.endpoints.length > 0
           ? candidate.endpoints.map((endpoint) => ({ ...candidate, endpoint }))
@@ -490,7 +553,7 @@ export function activate(context: vscode.ExtensionContext) {
           continue;
         }
         const key = candidate.process.type === 'django'
-          ? `django-${candidate.endpoint!.port}-${candidate.endpoint!.host}`
+          ? `django-${candidate.endpoint!.port}-${candidate.endpoint!.host}${candidate.isWorker ? `-worker-${candidate.resolvedPid}` : ''}`
           : `celery-${candidate.resolvedPid}`;
         const group = attachGroups.get(key) ?? [];
         group.push(candidate);
@@ -499,13 +562,21 @@ export function activate(context: vscode.ExtensionContext) {
 
       const items: AttachQuickPickItem[] = await Promise.all([...attachGroups.values()].map(async (group) => {
         const representative = group.find((candidate) => candidate.process.pid === candidate.resolvedPid) ?? group[0];
-        const icon = representative.process.type === 'celery' ? '$(server-process)' : '$(globe)';
-        const typeLabel = representative.process.type === 'celery' ? 'Celery Worker' : 'Django Server';
+        const isWorkerGroup = group.some((candidate) => candidate.isWorker);
+        const icon = representative.process.type === 'celery' || isWorkerGroup ? '$(server-process)' : '$(globe)';
+        const typeLabel = representative.process.type === 'celery'
+          ? isWorkerGroup ? 'Celery Child' : 'Celery Worker'
+          : isWorkerGroup
+            ? 'Django Worker'
+            : 'Django Server';
         const groupedPids = [...new Set(group.flatMap((candidate) => [
           candidate.process.pid,
           candidate.resolvedPid,
         ]))].sort((a, b) => a - b);
-        const activeCheckPids = [...new Set([representative.resolvedPid, ...groupedPids])];
+        const workerPids = representative.process.workerPids ?? [];
+        const activeCheckPids = isWorkerGroup
+          ? [representative.resolvedPid]
+          : [...new Set([representative.resolvedPid, ...groupedPids])];
         let activeEndpoint: TcpListeningEndpoint | null = null;
         for (const activeCheckPid of activeCheckPids) {
           activeEndpoint = await injector.getActiveEndpoint(activeCheckPid);
@@ -517,14 +588,23 @@ export function activate(context: vscode.ExtensionContext) {
         const endpointLabel = representative.endpoint
           ? `Port: ${representative.endpoint.port} | Host: ${representative.endpoint.host}`
           : `PID: ${representative.resolvedPid}`;
-        const pidLabel = groupedPids.length > 1
+        const pidLabel = isWorkerGroup
+          ? `Worker PID: ${representative.resolvedPid} | Owner PID: ${representative.process.pid}`
+          : groupedPids.length > 1
           ? `PIDs: ${groupedPids.join(', ')}`
           : `PID: ${groupedPids[0]}`;
+        const detailParts = [
+          portStatus,
+          `Python: ${representative.process.pythonPath}`,
+          representative.process.cwd ? `CWD: ${representative.process.cwd}` : undefined,
+          representative.process.processGroupId ? `PGID: ${representative.process.processGroupId}` : undefined,
+          workerPids.length > 0 ? `Workers: ${workerPids.join(', ')}` : undefined,
+        ].filter((part): part is string => !!part);
 
         return {
           label: `${icon} [${typeLabel}] ${endpointLabel}`,
           description: pidLabel,
-          detail: `${portStatus}  |  Python: ${representative.process.pythonPath}`,
+          detail: detailParts.join('  |  '),
           process: representative.process,
           resolvedPid: representative.resolvedPid,
           endpoint: representative.endpoint,
@@ -570,7 +650,7 @@ export function activate(context: vscode.ExtensionContext) {
       log(`Selected PID=${selected.process.pid} → attach target PID=${pid} (${resolvedPythonPath})`);
 
       // Check if another VS Code window already has an active debug session
-      const existingLock = readLock();
+      const existingLock = readLockForPid(pid);
       if (existingLock && existingLock.workspaceId !== getWorkspaceId()) {
         // Verify the lock is still valid: process alive AND port still listening
         let lockValid = false;
@@ -590,8 +670,8 @@ export function activate(context: vscode.ExtensionContext) {
           );
           return;
         } else {
-          log('Found stale lock file, removing');
-          removeLock();
+          log(`Found stale lock file for PID=${pid}, removing`);
+          removeLock(pid);
         }
       }
 
@@ -697,6 +777,17 @@ export function activate(context: vscode.ExtensionContext) {
           } else if (choice === 'Show Logs') {
             getLogger().show();
           }
+        } else if (err instanceof BootstrapRuntimeVersionError) {
+          const choice = await vscode.window.showErrorMessage(
+            err.message,
+            'Show Status',
+            'Show Logs',
+          );
+          if (choice === 'Show Status') {
+            await showSetupStatus();
+          } else if (choice === 'Show Logs') {
+            getLogger().show();
+          }
         } else {
           const msg = err instanceof Error ? err.message : String(err);
           const choice = await vscode.window.showErrorMessage(
@@ -751,7 +842,7 @@ export function activate(context: vscode.ExtensionContext) {
           `$(debug-alt) ${sessionLabel} (PID: ${pid}) attached on ${formatEndpoint(debugEndpoint)}`
         );
       } else {
-        removeLock();
+        removeLock(pid);
         vscode.window.showErrorMessage(
           'Failed to start debug session. Check logs for details.',
           'Show Logs',
@@ -776,10 +867,12 @@ export function activate(context: vscode.ExtensionContext) {
         const icon = p.type === 'celery' ? '$(server-process)' : '$(globe)';
         const typeLabel = p.type === 'celery' ? 'Celery Worker' : 'Django Server';
         const portLabel = p.port ? ` | Port: ${p.port}` : '';
+        const cwdLabel = p.cwd ? ` | CWD: ${p.cwd}` : '';
+        const workerLabel = p.workerPids?.length ? ` | Workers: ${p.workerPids.join(', ')}` : '';
         return {
           label: `${icon} [${typeLabel}] PID: ${p.pid}${portLabel}`,
           description: p.command,
-          detail: `Python: ${p.pythonPath}`,
+          detail: `Python: ${p.pythonPath}${cwdLabel}${workerLabel}`,
           process: p,
         };
       });
@@ -1362,9 +1455,10 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.debug.onDidTerminateDebugSession((session) => {
       log(`[DebugSession] Terminated: ${session.name}`);
       if (session.type === 'django-process') {
-        removeLock();
+        const sessionPid = targetPidFromSession(session);
+        removeLock(sessionPid);
         stopHotReloadWatcher();
-        log('[DebugSession] Lock file removed, hot reload stopped');
+        log(`[DebugSession] Lock file removed${sessionPid ? ` for PID=${sessionPid}` : ''}, hot reload stopped`);
       }
     }),
   );

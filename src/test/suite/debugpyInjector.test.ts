@@ -1,11 +1,17 @@
 import * as assert from 'assert';
 import { describe, it, before, after } from 'mocha';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
+import { once } from 'events';
 import { promisify } from 'util';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
-import { DebugpyInjector, BOOTSTRAP_VERSION } from '../../debugpyInjector';
+import {
+  BootstrapNotLoadedError,
+  BootstrapRuntimeVersionError,
+  DebugpyInjector,
+  BOOTSTRAP_VERSION,
+} from '../../debugpyInjector';
 import { getPerf } from './perfReporter';
 import { findSystemPython, projectRoot } from './testHelpers';
 
@@ -101,6 +107,50 @@ describe('Feature: debugpy injector bootstrap lifecycle', function () {
   it('getActivePort returns null when bootstrap has not activated', async function () {
     const result = await injector.getActivePort(999_999);
     assert.strictEqual(result, null);
+  });
+
+  it('BootstrapNotLoadedError reports the signal that was sent', function () {
+    const err = new BootstrapNotLoadedError(1234, 5678, 'SIGUSR2');
+    assert.ok(err.message.includes('Sent SIGUSR2 to PID 1234'));
+  });
+
+  it('BootstrapRuntimeVersionError explains that the target must restart', function () {
+    const err = new BootstrapRuntimeVersionError(1234, null, BOOTSTRAP_VERSION);
+    assert.ok(err.message.includes('Restart the target process after setup'));
+  });
+
+  it('accepts bootstrap runtime state inherited from a parent process', async function () {
+    this.timeout(10_000);
+
+    const stateDir = '/tmp/django-process-debugger';
+    const statePath = path.join(stateDir, `${process.pid}.bootstrap.json`);
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 10000)'], {
+      stdio: 'ignore',
+    });
+
+    try {
+      assert.ok(child.pid, 'child pid should be available');
+      await fs.mkdir(stateDir, { recursive: true });
+      await fs.writeFile(
+        statePath,
+        JSON.stringify({ version: BOOTSTRAP_VERSION, pid: process.pid }),
+        'utf-8',
+      );
+
+      const state = await (injector as unknown as {
+        getLoadedBootstrapState(pid: number): Promise<{ pid: number; version: string } | null>;
+      }).getLoadedBootstrapState(child.pid);
+
+      assert.deepStrictEqual(state, { pid: process.pid, version: BOOTSTRAP_VERSION });
+    } finally {
+      await fs.unlink(statePath).catch(() => {});
+      if (child.pid && !child.killed) {
+        child.kill();
+      }
+      if (child.exitCode === null) {
+        await once(child, 'exit').catch(() => {});
+      }
+    }
   });
 
   it('uninstallBootstrap removes both files', async function () {

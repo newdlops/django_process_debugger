@@ -25,6 +25,11 @@ export function logError(message: string, err?: unknown): void {
     }
     // Capture stderr from child_process errors
     const anyErr = err as unknown as Record<string, unknown>;
+    for (const key of ['code', 'signal', 'killed', 'cmd'] as const) {
+      if (anyErr[key] !== undefined) {
+        logger.appendLine(`  ${key}: ${String(anyErr[key])}`);
+      }
+    }
     if (anyErr['stderr']) {
       logger.appendLine(`  stderr: ${anyErr['stderr']}`);
     }

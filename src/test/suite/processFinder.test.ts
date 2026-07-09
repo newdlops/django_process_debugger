@@ -2,8 +2,10 @@ import * as assert from 'assert';
 import { describe, it, before, after } from 'mocha';
 import {
   buildPortManagerDjangoProcesses,
+  collectPortManagerCeleryScanRoots,
   DjangoProcess,
   DjangoProcessFinder,
+  isCeleryWorkerCommand,
   isIpv4LoopbackEndpoint,
   mergeLoopbackAliasEndpoints,
 } from '../../processFinder';
@@ -52,6 +54,29 @@ describe('Feature: process discovery', function () {
       assert.strictEqual(
         finder.classifyProcess('celery -A myapp worker --loglevel=info'),
         'celery',
+      );
+      assert.strictEqual(
+        finder.classifyProcess('uv run celery multi start 1 --pidfile=.celery/%n.pid --logfile=.celery/celery.log'),
+        'celery',
+      );
+      assert.strictEqual(
+        finder.classifyProcess('/app/.venv/bin/celeryd --loglevel=info'),
+        'celery',
+      );
+    });
+
+    it('recognizes celery command variants without matching worker names alone', function () {
+      assert.strictEqual(
+        isCeleryWorkerCommand('/app/.venv/bin/python -m celery -A zuzu.worker worker --loglevel=INFO'),
+        true,
+      );
+      assert.strictEqual(
+        isCeleryWorkerCommand('/app/.venv/bin/celery -A zuzu.worker multi start 1 --pidfile=.celery/%n.pid'),
+        true,
+      );
+      assert.strictEqual(
+        isCeleryWorkerCommand('redis-server *:6379 # redis-worker'),
+        false,
       );
     });
 
@@ -236,6 +261,7 @@ describe('Feature: process discovery', function () {
           name: 'python3',
           command: 'python3',
           cwd: '/Users/lky/project/app',
+          processGroupId: 1234,
           requestedPort: 8004,
           actualPort: 8004,
           status: 'running',
@@ -265,6 +291,8 @@ describe('Feature: process discovery', function () {
       assert.strictEqual(processes[0].pid, 8288);
       assert.strictEqual(processes[0].type, 'django');
       assert.strictEqual(processes[0].pythonPath, 'python3');
+      assert.strictEqual(processes[0].cwd, '/Users/lky/project/app');
+      assert.strictEqual(processes[0].processGroupId, 1234);
       assert.strictEqual(processes[0].command, 'python3 (Port Manager, /Users/lky/project/app, :8004)');
       assert.deepStrictEqual(processes[0].endpoints, [
         { host: '127.103.218.122', port: 8004 },
@@ -294,6 +322,26 @@ describe('Feature: process discovery', function () {
             status: 'running',
             source: 'hooked',
           },
+          {
+            id: 'managed-redis-worker',
+            pid: 41485,
+            name: 'redis-worker',
+            command: 'redis-server *:6379',
+            requestedPort: 6379,
+            actualPort: 6379,
+            status: 'running',
+            source: 'hooked',
+          },
+          {
+            id: 'debugpy-adapter',
+            pid: 72506,
+            name: 'python3',
+            command: '/repo/.venv/bin/python3 /extension/debugpy/debugpy/adapter --for-server 53451 --host 127.0.0.1 --port 53449 --server-access-token token',
+            requestedPort: 53449,
+            actualPort: 53449,
+            status: 'running',
+            source: 'hooked',
+          },
         ],
         routes: [
           {
@@ -314,10 +362,72 @@ describe('Feature: process discovery', function () {
             processName: 'node',
             status: 'running',
           },
+          {
+            logicalPort: 6379,
+            actualPort: 6379,
+            routeDirection: 'listen',
+            host: '127.0.0.1',
+            processId: 'managed-redis-worker',
+            processName: 'redis-worker',
+            status: 'running',
+          },
+          {
+            logicalPort: 53449,
+            actualPort: 53449,
+            routeDirection: 'listen',
+            host: '127.0.0.1',
+            processId: 'debugpy-adapter',
+            processName: 'python3',
+            status: 'running',
+          },
         ],
       });
 
       assert.deepStrictEqual(processes, []);
+    });
+
+    it('collects celery pidfile scan roots from running managed cwd rows', function () {
+      const roots = collectPortManagerCeleryScanRoots({
+        processes: [
+          {
+            cwd: '/repo',
+            status: 'running',
+            source: 'hooked',
+          },
+          {
+            cwd: '/repo/docker',
+            status: 'running',
+            source: 'hooked',
+          },
+          {
+            cwd: '/repo/zuzu/client',
+            status: 'running',
+            source: 'hooked',
+          },
+          {
+            cwd: '/ignored/stopped',
+            status: 'stopped',
+            source: 'hooked',
+          },
+          {
+            cwd: '/ignored/detected',
+            status: 'running',
+            source: 'detected',
+          },
+          {
+            command: '/repo/.venv/bin/python3 /extension/debugpy/debugpy/adapter --for-server 53451 --server-access-token token',
+            cwd: '/ignored/debugpy',
+            status: 'running',
+            source: 'hooked',
+          },
+        ],
+      });
+
+      assert.deepStrictEqual(roots, [
+        '/repo',
+        '/repo/docker',
+        '/repo/zuzu/client',
+      ]);
     });
 
     it('merges multiple running routes owned by the same python pid', function () {
@@ -360,6 +470,83 @@ describe('Feature: process discovery', function () {
         { host: '127.10.0.1', port: 8004 },
         { host: '127.10.0.1', port: 8005 },
       ]);
+    });
+
+    it('collects worker pids from the same execution scope and port', function () {
+      const processes = buildPortManagerDjangoProcesses({
+        processes: [
+          {
+            id: 'managed-owner',
+            pid: 1001,
+            name: 'python3',
+            command: 'python3',
+            cwd: '/app',
+            networkId: 'network-1',
+            terminalSessionId: 'terminal-1',
+            processGroupId: 7001,
+            requestedPort: 8004,
+            actualPort: 8004,
+            status: 'running',
+            source: 'hooked',
+          },
+          {
+            id: 'managed-worker',
+            pid: 1002,
+            name: 'python3',
+            command: 'python3',
+            cwd: '/app',
+            networkId: 'network-1',
+            terminalSessionId: 'terminal-1',
+            processGroupId: 7001,
+            requestedPort: 8004,
+            actualPort: 8004,
+            status: 'running',
+            source: 'hooked',
+          },
+          {
+            id: 'other-port',
+            pid: 1003,
+            name: 'python3',
+            command: 'python3',
+            cwd: '/app',
+            networkId: 'network-1',
+            terminalSessionId: 'terminal-1',
+            processGroupId: 7001,
+            requestedPort: 8005,
+            actualPort: 8005,
+            status: 'running',
+            source: 'hooked',
+          },
+        ],
+        routes: [{
+          logicalPort: 8004,
+          actualPort: 8004,
+          routeDirection: 'listen',
+          host: '127.10.0.1',
+          processId: 'managed-owner',
+          processName: 'python3',
+          status: 'running',
+        }],
+        listeners: [
+          {
+            localAddress: '127.10.0.1',
+            port: 8004,
+            pid: 1004,
+            processName: 'python3.11',
+            command: 'python3.11',
+          },
+          {
+            localAddress: '127.10.0.1',
+            port: 8005,
+            pid: 1005,
+            processName: 'python3.11',
+            command: 'python3.11',
+          },
+        ],
+      });
+
+      assert.strictEqual(processes.length, 1);
+      assert.deepStrictEqual(processes[0].workerPids, [1002, 1004]);
     });
   });
 

@@ -1,9 +1,10 @@
 import * as assert from 'assert';
 import { describe, it, before, after } from 'mocha';
-import { execFile } from 'child_process';
+import { ChildProcess, execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import * as path from 'path';
 import * as net from 'net';
+import * as fs from 'fs/promises';
 import { DebugpyInjector } from '../../debugpyInjector';
 import { getPerf } from './perfReporter';
 import {
@@ -148,7 +149,103 @@ describe('Feature: end-to-end attach flow', function () {
     { group: 'attach-e2e' });
     assert.strictEqual(resolved.pid, server.pid);
   });
+
+  it('does not reuse an active file when a different PID has that port open on another host', async function () {
+    const child = await startChildTcpListener();
+    const activeFile = path.join('/tmp/django-process-debugger', `${process.pid}.active`);
+
+    try {
+      await fs.mkdir(path.dirname(activeFile), { recursive: true });
+      await fs.writeFile(activeFile, JSON.stringify({ host: '127.250.250.250', port: child.port }), 'utf-8');
+
+      const endpoint = await injector.getActiveEndpoint(process.pid);
+      assert.strictEqual(endpoint, null);
+      await assert.rejects(fs.access(activeFile));
+    } finally {
+      await fs.unlink(activeFile).catch(() => {});
+      child.stop();
+    }
+  });
+
+  it('resolves an active endpoint through a PID-owned loopback alias', async function () {
+    const listener = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      listener.once('error', reject);
+      listener.listen(0, '127.0.0.1', () => resolve());
+    });
+
+    const address = listener.address();
+    assert.ok(address && typeof address === 'object');
+    const activeFile = path.join('/tmp/django-process-debugger', `${process.pid}.active`);
+
+    try {
+      await fs.mkdir(path.dirname(activeFile), { recursive: true });
+      await fs.writeFile(activeFile, JSON.stringify({ host: '127.250.250.250', port: address.port }), 'utf-8');
+
+      const endpoint = await injector.getActiveEndpoint(process.pid);
+      assert.ok(endpoint);
+      assert.strictEqual(endpoint.port, address.port);
+      assert.strictEqual(endpoint.host, '127.0.0.1');
+    } finally {
+      await fs.unlink(activeFile).catch(() => {});
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+    }
+  });
 });
+
+async function startChildTcpListener(): Promise<{ port: number; stop(): void }> {
+  const script = [
+    'const net = require("net");',
+    'const server = net.createServer();',
+    'server.listen(0, "127.0.0.1", () => { console.log(server.address().port); });',
+    'process.on("SIGTERM", () => server.close(() => process.exit(0)));',
+    'setInterval(() => {}, 1000);',
+  ].join('\n');
+
+  const child: ChildProcess = spawn(process.execPath, ['-e', script], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  const port = await new Promise<number>((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error(`child listener did not start. stderr=${stderr}`));
+    }, 5_000);
+
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString();
+      const match = stdout.match(/(\d+)/);
+      if (match) {
+        clearTimeout(timer);
+        resolve(parseInt(match[1], 10));
+      }
+    });
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    child.once('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.once('exit', (code, signal) => {
+      if (!stdout.match(/(\d+)/)) {
+        clearTimeout(timer);
+        reject(new Error(`child listener exited before port was reported: code=${code} signal=${signal} stderr=${stderr}`));
+      }
+    });
+  });
+
+  return {
+    port,
+    stop: () => {
+      if (!child.killed) {
+        child.kill('SIGTERM');
+      }
+    },
+  };
+}
 
 async function canImportBootstrap(pythonPath: string): Promise<boolean> {
   try {

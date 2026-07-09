@@ -92,10 +92,66 @@ async function resolvePathIfPossible(filePath: string): Promise<string> {
   }
 }
 
+function pythonProbeEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  env.PORT_MANAGER_HOOK = '0';
+  env.PORT_MANAGER_HOOK_DISABLED = '1';
+  delete env.DYLD_INSERT_LIBRARIES;
+  delete env.LD_PRELOAD;
+  return env;
+}
+
+function describeExecFailure(err: unknown): string {
+  if (!(err instanceof Error)) {
+    return String(err);
+  }
+
+  const anyErr = err as unknown as Record<string, unknown>;
+  const hasExitDetail = anyErr.code !== undefined || anyErr.signal !== undefined;
+  const details: string[] = [hasExitDetail ? 'process exited unexpectedly' : err.message];
+  if (anyErr.code !== undefined) {
+    details.push(`code=${String(anyErr.code)}`);
+  }
+  if (anyErr.signal !== undefined) {
+    details.push(`signal=${String(anyErr.signal)}`);
+  }
+  if (anyErr.stderr) {
+    details.push(`stderr=${String(anyErr.stderr).trim()}`);
+  }
+  return details.filter(Boolean).join(' ');
+}
+
+function isLikelySigkill(err: unknown): boolean {
+  if (!(err instanceof Error)) {
+    return false;
+  }
+  const anyErr = err as unknown as Record<string, unknown>;
+  return anyErr.signal === 'SIGKILL' || anyErr.code === 137;
+}
+
+async function hasPyvenvCfg(...pythonPaths: string[]): Promise<boolean> {
+  const candidates = new Set<string>();
+  for (const pythonPath of pythonPaths) {
+    const venvDir = path.resolve(path.dirname(pythonPath), '..');
+    candidates.add(path.join(venvDir, 'pyvenv.cfg'));
+  }
+
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate, fsConstants.F_OK);
+      return true;
+    } catch {
+      // Try the next possible venv root.
+    }
+  }
+  return false;
+}
+
 function describeProcess(processInfo: DjangoProcess): string {
   const kind = processInfo.type === 'celery' ? 'Running Celery worker' : 'Running server';
   const port = processInfo.port ? `:${processInfo.port}` : '';
-  return `${kind}${port} (PID ${processInfo.pid})`;
+  const cwd = processInfo.cwd ? ` @ ${processInfo.cwd}` : '';
+  return `${kind}${port} (PID ${processInfo.pid})${cwd}`;
 }
 
 function candidateSortLabel(candidate: RuntimeCandidate): string {
@@ -196,7 +252,12 @@ export async function discoverRuntimeCandidates(
       describeProcess(resolvedProcess),
       `$(play) ${path.basename(resolvedProcess.pythonPath)}`,
       describeProcess(resolvedProcess),
-      `${resolvedProcess.pythonPath}\n${resolvedProcess.command}`,
+      [
+        resolvedProcess.pythonPath,
+        resolvedProcess.cwd ? `CWD: ${resolvedProcess.cwd}` : undefined,
+        resolvedProcess.workerPids?.length ? `Workers: ${resolvedProcess.workerPids.join(', ')}` : undefined,
+        resolvedProcess.command,
+      ].filter((line): line is string => !!line).join('\n'),
       10,
       true,
       resolvedProcess,
@@ -425,7 +486,10 @@ async function inspectPythonInterpreter(pythonPath: string): Promise<PythonInspe
     'print(json.dumps(payload))',
   ].join('\n');
 
-  const { stdout } = await execFileAsync(pythonPath, ['-c', inspectionScript], { timeout: 10_000 });
+  const { stdout } = await execFileAsync(pythonPath, ['-c', inspectionScript], {
+    timeout: 10_000,
+    env: pythonProbeEnv(),
+  });
   return JSON.parse(stdout.trim()) as PythonInspectionPayload;
 }
 
@@ -446,11 +510,27 @@ export async function inspectRuntimePreflight(
   // ~/.asdf/.../python3.11), running the resolved path would return the
   // global site-packages instead of the venv's site-packages.
   let inspection: PythonInspectionPayload | undefined;
+  let inspectionFailure: string | undefined;
   try {
     inspection = await inspectPythonInterpreter(pythonPath);
   } catch (err) {
     logError(`[RuntimeSetup] Failed to inspect Python runtime ${pythonPath}`, err);
-    errors.push(`Could not execute ${pythonPath} to inspect the runtime.`);
+    inspectionFailure = describeExecFailure(err);
+
+    if (process.platform === 'darwin' && isLikelySigkill(err)) {
+      log(`[RuntimeSetup] SIGKILL detected while inspecting ${pythonPath}; attempting runtime repair...`);
+      const repaired = await debugpyManager.repairPythonRuntime(pythonPath);
+      if (repaired) {
+        try {
+          inspection = await inspectPythonInterpreter(pythonPath);
+          inspectionFailure = undefined;
+          warnings.push(`Repaired macOS code signature/quarantine for ${pythonPath}.`);
+        } catch (retryErr) {
+          logError(`[RuntimeSetup] Python runtime still fails after repair ${pythonPath}`, retryErr);
+          inspectionFailure = describeExecFailure(retryErr);
+        }
+      }
+    }
   }
 
   let sitePackages = '';
@@ -462,6 +542,16 @@ export async function inspectRuntimePreflight(
     } catch (err) {
       logError(`[RuntimeSetup] Failed to resolve site-packages for ${pythonPath}`, err);
       errors.push('Could not resolve site-packages for this interpreter.');
+    }
+  }
+
+  if (inspectionFailure) {
+    if (sitePackages) {
+      warnings.push(
+        `Could not execute ${pythonPath} to inspect the runtime; setup will use inferred site-packages. ${inspectionFailure}`
+      );
+    } else {
+      errors.push(`Could not execute ${pythonPath} to inspect the runtime. ${inspectionFailure}`);
     }
   }
 
@@ -487,7 +577,7 @@ export async function inspectRuntimePreflight(
     sitePackages && workspaceFolders?.some((folder) => isSubPath(sitePackages, folder.uri.fsPath))
   );
 
-  const isVirtualEnv = inspection?.isVirtualEnv ?? false;
+  const isVirtualEnv = inspection?.isVirtualEnv ?? await hasPyvenvCfg(pythonPath, resolvedPythonPath);
   if (!isVirtualEnv) {
     warnings.push('This is not a virtualenv. Setup will modify a shared Python runtime.');
   }

@@ -1,4 +1,5 @@
 import { execFile } from 'child_process';
+import * as fs from 'fs/promises';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
@@ -13,6 +14,7 @@ import {
 
 const execFileAsync = promisify(execFile);
 const PORT_MANAGER_AGENT_REQUEST_TIMEOUT_MS = 1_000;
+const CELERY_PIDFILE_SCAN_LIMIT = 64;
 
 export type ProcessType = 'django' | 'celery';
 
@@ -22,6 +24,9 @@ export interface DjangoProcess {
   pythonPath: string;
   arch: string;
   type: ProcessType;
+  cwd?: string;
+  processGroupId?: number;
+  workerPids?: number[];
   host?: string;
   port?: number;
   endpoints?: TcpListeningEndpoint[];
@@ -38,6 +43,9 @@ export interface PortManagerProcessRow {
   name?: string;
   command?: string;
   cwd?: string;
+  networkId?: string;
+  terminalSessionId?: string;
+  processGroupId?: number;
   requestedPort?: number;
   actualPort?: number;
   status?: string;
@@ -121,6 +129,18 @@ function isPositivePid(pid: unknown): pid is number {
   return Number.isInteger(pid) && (pid as number) > 0;
 }
 
+function uniqueSortedPids(...pidLists: Array<ReadonlyArray<number | undefined> | undefined>): number[] {
+  const pids = new Set<number>();
+  for (const pidList of pidLists) {
+    for (const pid of pidList ?? []) {
+      if (isPositivePid(pid)) {
+        pids.add(pid);
+      }
+    }
+  }
+  return [...pids].sort((a, b) => a - b);
+}
+
 function isPythonLikeText(text: string | undefined): boolean {
   if (!text) {
     return false;
@@ -128,6 +148,29 @@ function isPythonLikeText(text: string | undefined): boolean {
   const firstToken = text.trim().split(/\s+/, 1)[0] ?? '';
   const executableName = path.basename(firstToken).toLowerCase();
   return /^python(?:\d+(?:\.\d+)*)?$/.test(executableName);
+}
+
+function isInternalDebugProcessText(text: string | undefined): boolean {
+  if (!text) {
+    return false;
+  }
+  return [
+    /(?:^|\s)\S*debugpy[\\/]adapter(?:\s|$)/i,
+    /(?:^|\s)--for-server\s+\d+.*(?:^|\s)--server-access-token\s+/i,
+    /(?:^|\s)\S*debugpy[\\/]launcher(?:\s|$)/i,
+  ].some((pattern) => pattern.test(text));
+}
+
+export function isCeleryWorkerCommand(line: string | undefined): boolean {
+  if (!line) {
+    return false;
+  }
+  return [
+    /(?:^|\s)(?:\S*\/)?celery(?:\s|$).*?\bworker\b/i,
+    /(?:^|\s)-m\s+celery(?:\s|$).*?\bworker\b/i,
+    /(?:^|\s)(?:\S*\/)?celery(?:\s|$).*?\bmulti\s+start\b/i,
+    /(?:^|\s)(?:\S*\/)?celeryd(?:\s|$)/i,
+  ].some((pattern) => pattern.test(line));
 }
 
 function isPortManagerPythonProcess(
@@ -139,6 +182,119 @@ function isPortManagerPythonProcess(
     isPythonLikeText(processRow.name) ||
     isPythonLikeText(routeRow?.processName)
   );
+}
+
+function isPortManagerInternalDebugProcess(
+  processRow: PortManagerProcessRow,
+  routeRow: PortManagerRouteRow,
+  listenerRows: PortManagerListenerRow[] = [],
+): boolean {
+  return [
+    processRow.command,
+    processRow.name,
+    routeRow.processName,
+    ...listenerRows.map((listener) => listener.command),
+    ...listenerRows.map((listener) => listener.processName),
+  ].some(isInternalDebugProcessText);
+}
+
+function portManagerRoutePort(route: PortManagerRouteRow): number | undefined {
+  return isValidPort(route.actualPort)
+    ? route.actualPort
+    : isValidPort(route.logicalPort)
+      ? route.logicalPort
+      : undefined;
+}
+
+function portManagerProcessPorts(processRow: PortManagerProcessRow): number[] {
+  return [
+    processRow.actualPort,
+    processRow.requestedPort,
+  ].filter(isValidPort);
+}
+
+function portManagerProcessMatchesRoutePort(
+  processRow: PortManagerProcessRow,
+  routePort: number | undefined,
+): boolean {
+  if (!routePort) {
+    return true;
+  }
+  const processPorts = portManagerProcessPorts(processRow);
+  return processPorts.length === 0 || processPorts.includes(routePort);
+}
+
+function hasSamePortManagerExecutionScope(
+  left: PortManagerProcessRow,
+  right: PortManagerProcessRow,
+): boolean {
+  if (
+    isPositivePid(left.processGroupId) &&
+    isPositivePid(right.processGroupId) &&
+    left.processGroupId === right.processGroupId
+  ) {
+    return true;
+  }
+  if (
+    left.terminalSessionId &&
+    right.terminalSessionId &&
+    left.terminalSessionId === right.terminalSessionId
+  ) {
+    return true;
+  }
+  return !!(
+    left.cwd &&
+    right.cwd &&
+    left.cwd === right.cwd &&
+    left.networkId &&
+    right.networkId &&
+    left.networkId === right.networkId
+  );
+}
+
+function addPortManagerCwdRoot(roots: Set<string>, cwd: string | undefined): void {
+  if (!cwd || cwd.trim().length === 0) {
+    return;
+  }
+  const resolved = path.resolve(cwd);
+  if (resolved === path.parse(resolved).root) {
+    return;
+  }
+  roots.add(resolved);
+}
+
+function addLikelyProjectRoots(roots: Set<string>, cwd: string | undefined): void {
+  if (!cwd || cwd.trim().length === 0) {
+    return;
+  }
+
+  const resolved = path.resolve(cwd);
+  addPortManagerCwdRoot(roots, resolved);
+
+  if (path.basename(resolved) === 'docker') {
+    addPortManagerCwdRoot(roots, path.dirname(resolved));
+  }
+
+  const parent = path.dirname(resolved);
+  if (path.basename(resolved) === 'client' && path.basename(parent) === 'zuzu') {
+    addPortManagerCwdRoot(roots, path.dirname(parent));
+  }
+}
+
+export function collectPortManagerCeleryScanRoots(snapshot: PortManagerSnapshot): string[] {
+  const roots = new Set<string>();
+  for (const processRow of snapshot.processes ?? []) {
+    if (
+      processRow.status !== 'running' ||
+      processRow.source === 'detected' ||
+      isInternalDebugProcessText(processRow.command) ||
+      isInternalDebugProcessText(processRow.name)
+    ) {
+      continue;
+    }
+    addLikelyProjectRoots(roots, processRow.cwd);
+  }
+  return [...roots];
 }
 
 function endpointFromUrl(url: string | undefined): TcpListeningEndpoint | undefined {
@@ -161,11 +317,7 @@ function endpointFromUrl(url: string | undefined): TcpListeningEndpoint | undefi
 }
 
 function endpointFromRoute(route: PortManagerRouteRow): TcpListeningEndpoint | undefined {
-  const port = isValidPort(route.actualPort)
-    ? route.actualPort
-    : isValidPort(route.logicalPort)
-      ? route.logicalPort
-      : undefined;
+  const port = portManagerRoutePort(route);
   if (!port) {
     return undefined;
   }
@@ -228,10 +380,63 @@ function isPortManagerListenRoute(route: PortManagerRouteRow): boolean {
   return (
     route.status === 'running' &&
     (route.routeDirection === undefined || route.routeDirection === 'listen') &&
-    isValidPort(route.actualPort ?? route.logicalPort) &&
+    isValidPort(portManagerRoutePort(route)) &&
     typeof route.processId === 'string' &&
     route.processId.length > 0
   );
+}
+
+function findPortManagerWorkerPids(
+  processRow: PortManagerProcessRow,
+  route: PortManagerRouteRow,
+  processRows: PortManagerProcessRow[],
+  listenerRows: PortManagerListenerRow[],
+): number[] {
+  if (!isPositivePid(processRow.pid)) {
+    return [];
+  }
+
+  const routePort = portManagerRoutePort(route);
+  const siblingProcessPids = processRows
+    .filter((candidate) =>
+      candidate !== processRow &&
+      candidate.status === 'running' &&
+      candidate.source !== 'detected' &&
+      isPositivePid(candidate.pid) &&
+      candidate.pid !== processRow.pid &&
+      isPortManagerPythonProcess(candidate) &&
+      portManagerProcessMatchesRoutePort(candidate, routePort) &&
+      hasSamePortManagerExecutionScope(processRow, candidate),
+    )
+    .map((candidate) => candidate.pid);
+
+  const listenerPids = listenerRows
+    .filter((listener) => {
+      if (
+        !isPositivePid(listener.pid) ||
+        listener.pid === processRow.pid ||
+        (routePort !== undefined && listener.port !== routePort) ||
+        (!isPythonLikeText(listener.command) && !isPythonLikeText(listener.processName))
+      ) {
+        return false;
+      }
+
+      const listenerProcess = processRows.find((candidate) => candidate.pid === listener.pid);
+      if (!listenerProcess) {
+        return true;
+      }
+
+      return (
+        listenerProcess.status === 'running' &&
+        listenerProcess.source !== 'detected' &&
+        isPortManagerPythonProcess(listenerProcess) &&
+        portManagerProcessMatchesRoutePort(listenerProcess, routePort) &&
+        hasSamePortManagerExecutionScope(processRow, listenerProcess)
+      );
+    })
+    .map((listener) => listener.pid);
+
+  return uniqueSortedPids(siblingProcessPids, listenerPids);
 }
 
 export function buildPortManagerDjangoProcesses(snapshot: PortManagerSnapshot): DjangoProcess[] {
@@ -274,6 +479,10 @@ export function buildPortManagerDjangoProcesses(snapshot: PortManagerSnapshot): 
     }
 
     const processListeners = listenersByPid.get(processRow.pid) ?? [];
+    if (isPortManagerInternalDebugProcess(processRow, route, processListeners)) {
+      continue;
+    }
+
     const routeEndpoint = endpointFromRoute(route);
     const routePort = routeEndpoint?.port;
     const matchingListenerEndpoints = processListeners
@@ -293,6 +502,10 @@ export function buildPortManagerDjangoProcesses(snapshot: PortManagerSnapshot): 
     const existing = candidatesByPid.get(processRow.pid);
     if (existing) {
       existing.endpoints = mergeEndpoints(existing.endpoints, endpoints);
+      existing.workerPids = uniqueSortedPids(
+        existing.workerPids,
+        findPortManagerWorkerPids(processRow, route, processRows, listenerRows),
+      );
       continue;
     }
 
@@ -302,6 +515,9 @@ export function buildPortManagerDjangoProcesses(snapshot: PortManagerSnapshot): 
       pythonPath: portManagerPythonPath(processRow, route, processListeners),
       arch: process.arch,
       type: 'django',
+      cwd: processRow.cwd,
+      processGroupId: processRow.processGroupId,
+      workerPids: findPortManagerWorkerPids(processRow, route, processRows, listenerRows),
       host: endpoints[0].host,
       port: endpoints[0].port,
       endpoints,
@@ -363,7 +579,11 @@ export class DjangoProcessFinder {
       // Resolve listening endpoints for each process.
       await Promise.all(processes.map(async (p) => {
         const commandEndpoint = this.extractEndpointFromCommand(p.command);
-        const lsofEndpoints = await this.findListeningEndpoints(p.pid, commandEndpoint?.port);
+        const [lsofEndpoints, cwd] = await Promise.all([
+          this.findListeningEndpoints(p.pid, commandEndpoint?.port),
+          this.findProcessCwd(p.pid),
+        ]);
+        p.cwd = p.cwd ?? cwd;
         p.endpoints = lsofEndpoints.length > 0
           ? mergeEndpoints(lsofEndpoints)
           : mergeEndpoints(commandEndpoint ? [commandEndpoint] : undefined);
@@ -408,6 +628,9 @@ export class DjangoProcessFinder {
       existing.endpoints = mergeEndpoints(existing.endpoints, discovered.endpoints);
       existing.host = existing.endpoints[0]?.host ?? existing.host;
       existing.port = existing.endpoints[0]?.port ?? existing.port;
+      existing.cwd = existing.cwd ?? discovered.cwd;
+      existing.processGroupId = existing.processGroupId ?? discovered.processGroupId;
+      existing.workerPids = uniqueSortedPids(existing.workerPids, discovered.workerPids);
       if (!existing.pythonPath || existing.pythonPath === 'python') {
         existing.pythonPath = discovered.pythonPath;
       }
@@ -421,10 +644,239 @@ export class DjangoProcessFinder {
     }
 
     const processes = buildPortManagerDjangoProcesses(snapshot);
+    const celeryPidfileProcesses = await this.findPortManagerCeleryPidfileProcesses(snapshot);
+    this.mergeDiscoveredProcesses(processes, celeryPidfileProcesses);
     if (processes.length > 0) {
-      log(`[ProcessFinder] Port Manager snapshot contributed ${processes.length} Django process candidate(s)`);
+      log(`[ProcessFinder] Port Manager snapshot contributed ${processes.length} runtime process candidate(s)`);
     }
     return processes;
+  }
+
+  private async findPortManagerCeleryPidfileProcesses(snapshot: PortManagerSnapshot): Promise<DjangoProcess[]> {
+    const roots = collectPortManagerCeleryScanRoots(snapshot);
+    if (roots.length === 0) {
+      return [];
+    }
+
+    const celeryDirs = await this.findCeleryPidfileDirs(roots);
+    const processes: DjangoProcess[] = [];
+    const seenPids = new Set<number>();
+    let scannedPidfiles = 0;
+
+    for (const celeryDir of celeryDirs) {
+      let entries: Array<{ name: string; isFile(): boolean; isSymbolicLink(): boolean }>;
+      try {
+        entries = await fs.readdir(celeryDir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+
+      for (const entry of entries) {
+        if (
+          scannedPidfiles >= CELERY_PIDFILE_SCAN_LIMIT ||
+          !entry.name.endsWith('.pid') ||
+          (!entry.isFile() && !entry.isSymbolicLink())
+        ) {
+          continue;
+        }
+
+        scannedPidfiles++;
+        const pidFilePath = path.join(celeryDir, entry.name);
+        const pid = await this.readPidFile(pidFilePath);
+        if (!isPositivePid(pid) || seenPids.has(pid)) {
+          continue;
+        }
+
+        const command = await this.findProcessCommand(pid);
+        if (!isCeleryWorkerCommand(command)) {
+          continue;
+        }
+
+        seenPids.add(pid);
+        const cwd = await this.findProcessCwd(pid);
+        const commandText = command!;
+        const processCwd = cwd ?? this.rootFromCeleryDir(celeryDir);
+        processes.push({
+          pid,
+          command: commandText,
+          pythonPath: this.extractPythonPath(commandText),
+          arch: process.arch,
+          type: 'celery',
+          cwd: processCwd,
+          workerPids: await this.findCeleryChildPids(pid, commandText, processCwd),
+        });
+      }
+    }
+
+    if (processes.length > 0) {
+      log(`[ProcessFinder] Celery pidfiles contributed ${processes.length} worker candidate(s)`);
+    }
+    return processes;
+  }
+
+  private async findCeleryPidfileDirs(roots: string[]): Promise<string[]> {
+    const celeryDirs = new Set<string>();
+
+    for (const root of roots) {
+      const direct = path.join(root, '.celery');
+      if (await this.isDirectory(direct)) {
+        celeryDirs.add(direct);
+      }
+
+      const portManagerFilesDir = path.join(root, '.portmanager', 'files');
+      let entries: Array<{ name: string; isDirectory(): boolean }>;
+      try {
+        entries = await fs.readdir(portManagerFilesDir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+
+      for (const entry of entries) {
+        if (!entry.isDirectory()) {
+          continue;
+        }
+        const scopedCeleryDir = path.join(portManagerFilesDir, entry.name, '.celery');
+        if (await this.isDirectory(scopedCeleryDir)) {
+          celeryDirs.add(scopedCeleryDir);
+        }
+      }
+    }
+
+    return [...celeryDirs];
+  }
+
+  private async isDirectory(dirPath: string): Promise<boolean> {
+    try {
+      const stat = await fs.stat(dirPath);
+      return stat.isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
+  private async readPidFile(pidFilePath: string): Promise<number | undefined> {
+    try {
+      const content = await fs.readFile(pidFilePath, 'utf-8');
+      const pid = parseInt(content.trim(), 10);
+      return isPositivePid(pid) ? pid : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async findProcessCommand(pid: number): Promise<string | undefined> {
+    try {
+      const { stdout } = await execFileAsync('ps', ['-p', String(pid), '-o', 'command=']);
+      const command = stdout.trim();
+      return command.length > 0 ? command : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async findCeleryChildPids(
+    masterPid: number,
+    command: string,
+    cwd: string | undefined,
+  ): Promise<number[]> {
+    const sharedPaths = await this.findCeleryMultiprocessingPaths(masterPid);
+    const childPids = new Set<number>();
+
+    for (const sharedPath of sharedPaths) {
+      for (const pid of await this.findPythonPidsUsingPath(sharedPath, masterPid, cwd)) {
+        childPids.add(pid);
+      }
+    }
+
+    if (childPids.size === 0) {
+      const logfile = this.extractCeleryLogfile(command);
+      if (logfile) {
+        for (const pid of await this.findPythonPidsUsingPath(logfile, masterPid, cwd)) {
+          childPids.add(pid);
+        }
+      }
+    }
+
+    return uniqueSortedPids([...childPids]);
+  }
+
+  private async findCeleryMultiprocessingPaths(masterPid: number): Promise<string[]> {
+    const paths = new Set<string>();
+    try {
+      const { stdout } = await execFileAsync('lsof', ['-nP', '-p', String(masterPid)]);
+      for (const line of stdout.split('\n')) {
+        const filePath = this.parseLsofName(line);
+        if (filePath?.includes(`/pym-${masterPid}-`)) {
+          paths.add(filePath);
+        }
+      }
+    } catch {
+      // lsof may fail for permission reasons; fall back to logfile sharing.
+    }
+    return [...paths];
+  }
+
+  private extractCeleryLogfile(command: string): string | undefined {
+    const equalsMatch = command.match(/--logfile=(\S+)/);
+    if (equalsMatch) {
+      return equalsMatch[1];
+    }
+    const separatedMatch = command.match(/--logfile\s+(\S+)/);
+    return separatedMatch?.[1];
+  }
+
+  private async findPythonPidsUsingPath(
+    filePath: string,
+    ownerPid: number,
+    expectedCwd: string | undefined,
+  ): Promise<number[]> {
+    const pids = new Set<number>();
+    try {
+      const { stdout } = await execFileAsync('lsof', ['-nP', filePath]);
+      for (const line of stdout.split('\n')) {
+        const pid = parseLsofPid(line);
+        if (!isPositivePid(pid) || pid === ownerPid) {
+          continue;
+        }
+
+        const commandName = line.trim().split(/\s+/, 1)[0];
+        if (!isPythonLikeText(commandName)) {
+          continue;
+        }
+
+        if (expectedCwd) {
+          const cwd = await this.findProcessCwd(pid);
+          if (cwd && cwd !== expectedCwd) {
+            continue;
+          }
+        }
+
+        pids.add(pid);
+      }
+    } catch {
+      // lsof may fail for permission reasons; worker pid discovery is best-effort.
+    }
+    return [...pids];
+  }
+
+  private parseLsofName(line: string): string | undefined {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 9 || parts[0] === 'COMMAND') {
+      return undefined;
+    }
+    const name = parts.slice(8).join(' ');
+    return name.startsWith('/') ? name : undefined;
+  }
+
+  private rootFromCeleryDir(celeryDir: string): string | undefined {
+    if (path.basename(celeryDir) !== '.celery') {
+      return undefined;
+    }
+    const parent = path.dirname(celeryDir);
+    if (path.basename(path.dirname(parent)) === 'files') {
+      return path.dirname(path.dirname(path.dirname(parent)));
+    }
+    return parent;
   }
 
   private async queryPortManagerSnapshot(): Promise<PortManagerSnapshot | undefined> {
@@ -518,11 +970,7 @@ export class DjangoProcessFinder {
   }
 
   classifyProcess(line: string): ProcessType | null {
-    const celeryPatterns = [
-      /celery\s+.*worker/,
-      /-m\s+celery\s+worker/,
-    ];
-    if (celeryPatterns.some((p) => p.test(line))) {
+    if (isCeleryWorkerCommand(line)) {
       return 'celery';
     }
 
@@ -679,6 +1127,22 @@ export class DjangoProcessFinder {
       // lsof may fail for permission reasons — that's fine
     }
     return mergeEndpoints(endpoints);
+  }
+
+  private async findProcessCwd(pid: number): Promise<string | undefined> {
+    try {
+      const { stdout } = await execFileAsync('lsof', [
+        '-a', '-p', String(pid), '-d', 'cwd', '-Fn',
+      ]);
+      for (const line of stdout.split('\n')) {
+        if (line.startsWith('n') && line.length > 1) {
+          return line.slice(1);
+        }
+      }
+    } catch {
+      // cwd lookup is best-effort; process discovery should still succeed.
+    }
+    return undefined;
   }
 
   private async addLoopbackAliasEndpoints(processes: DjangoProcess[]): Promise<void> {

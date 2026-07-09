@@ -194,7 +194,7 @@ export class DebugpyManager {
     // If killed by SIGKILL, likely macOS code signature issue — auto-repair and retry
     if (result.signal === 'SIGKILL' && process.platform === 'darwin') {
       log('[DebugpyManager] SIGKILL detected — attempting macOS code signature repair...');
-      const repaired = await this.repairCodeSignature(pythonPath);
+      const repaired = await this.repairPythonRuntime(pythonPath);
       if (repaired) {
         log('[DebugpyManager] Code signature repaired, retrying pip install...');
         result = await this.tryPipInstall(pythonPath, pipArgs);
@@ -284,7 +284,7 @@ export class DebugpyManager {
    * Repair macOS code signature for a Python binary and related binaries in the same dir.
    * Returns true if repair was attempted.
    */
-  private async repairCodeSignature(pythonPath: string): Promise<boolean> {
+  async repairPythonRuntime(pythonPath: string): Promise<boolean> {
     const binDir = path.dirname(pythonPath);
     let repaired = false;
 
