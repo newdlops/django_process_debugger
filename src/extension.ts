@@ -16,6 +16,21 @@ import { DebugpyManager, DebugpyProvisioningInfo } from './debugpyManager';
 import { log, logError, getLogger } from './logger';
 import { shouldIgnoreForHotReload } from './hotReloadFilter';
 import { TcpListeningEndpoint, formatEndpoint } from './listeningEndpoint';
+import { summarizeDapMessage } from './dapLogging';
+import {
+  DEBUG_SESSION_LOCK_TOKEN_KEY,
+  DebugSessionLockGuard,
+  DebugSessionLockTarget,
+  DjangoDebugSessionFactory,
+  ensureDebugSessionLockToken,
+} from './debugSession';
+import {
+  DEFAULT_DEBUG_ENGINE,
+  DebugEngine,
+  debugEngineDisplayName,
+  normalizeDebugEngine,
+  supportsHotReload,
+} from './debugEngine';
 import {
   RuntimeCandidate,
   SetupProfile,
@@ -32,11 +47,17 @@ import {
 
 const LOCK_DIR = '/tmp/django-process-debugger';
 const LEGACY_LOCK_FILE = path.join(LOCK_DIR, 'debug-session.lock');
+const PENDING_LOCK_TTL_MS = 30_000;
 
 interface LockInfo {
   pid: number;
   host?: string;
   port: number;
+  engine?: DebugEngine;
+  sessionId?: string;
+  ownerToken?: string;
+  ownerExtensionPid?: number;
+  phase?: 'pending' | 'active';
   workspaceId: string;
   workspaceName: string;
   timestamp: string;
@@ -67,13 +88,52 @@ function readLockForPid(pid: number): LockInfo | null {
 }
 
 function writeLock(info: LockInfo): void {
-  fs.mkdirSync(LOCK_DIR, { recursive: true });
-  fs.writeFileSync(lockFileForPid(info.pid), JSON.stringify(info), 'utf-8');
+  fs.mkdirSync(LOCK_DIR, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(LOCK_DIR, 0o700); } catch { /* best effort */ }
+
+  const lockFile = lockFileForPid(info.pid);
+  const tempFile = `${lockFile}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    fs.writeFileSync(tempFile, JSON.stringify(info), {
+      encoding: 'utf-8',
+      flag: 'wx',
+      mode: 0o600,
+    });
+    fs.renameSync(tempFile, lockFile);
+  } finally {
+    try { fs.unlinkSync(tempFile); } catch { /* already renamed or never created */ }
+  }
 
   // Do not leave a stale global lock that can block a different worker PID.
   const legacyLock = readLockFile(LEGACY_LOCK_FILE);
   if (legacyLock?.pid === info.pid) {
     try { fs.unlinkSync(LEGACY_LOCK_FILE); } catch { /* ignore */ }
+  }
+}
+
+function createLockExclusive(info: LockInfo): boolean {
+  fs.mkdirSync(LOCK_DIR, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(LOCK_DIR, 0o700); } catch { /* best effort */ }
+
+  const lockFile = lockFileForPid(info.pid);
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(lockFile, 'wx', 0o600);
+    fs.writeFileSync(fd, JSON.stringify(info), 'utf-8');
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST') {
+      return false;
+    }
+    if (fd !== undefined) {
+      try { fs.unlinkSync(lockFile); } catch { /* ignore partial claim cleanup */ }
+    }
+    throw err;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
   }
 }
 
@@ -90,7 +150,7 @@ function removeLock(pid?: number): void {
   try { fs.unlinkSync(LEGACY_LOCK_FILE); } catch { /* ignore */ }
   try {
     for (const entry of fs.readdirSync(LOCK_DIR)) {
-      if (/^debug-session\.\d+\.lock$/.test(entry)) {
+      if (/^debug-session\.\d+\.(?:lock|claim)$/.test(entry)) {
         try { fs.unlinkSync(path.join(LOCK_DIR, entry)); } catch { /* ignore */ }
       }
     }
@@ -107,12 +167,32 @@ function getWorkspaceName(): string {
 }
 
 function targetPidFromSession(session: vscode.DebugSession): number | undefined {
+  const configuredPid = session.configuration.pid;
+  if (typeof configuredPid === 'number' && Number.isInteger(configuredPid) && configuredPid > 0) {
+    return configuredPid;
+  }
+
   const match = session.name.match(/\(PID:\s*(\d+)\)/);
   if (!match) {
     return undefined;
   }
   const pid = parseInt(match[1], 10);
   return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+function getConfiguredDebugEngine(): DebugEngine {
+  const raw = vscode.workspace
+    .getConfiguration('djangoProcessDebugger')
+    .get<unknown>('engine', DEFAULT_DEBUG_ENGINE);
+  const engine = normalizeDebugEngine(raw);
+  if (raw !== engine) {
+    log(`[Engine] Unknown configured engine ${JSON.stringify(raw)}; falling back to ${engine}`);
+  }
+  return engine;
+}
+
+function targetEngineFromSession(session: vscode.DebugSession): DebugEngine {
+  return normalizeDebugEngine(session.configuration.engine ?? getConfiguredDebugEngine());
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -122,21 +202,329 @@ export function activate(context: vscode.ExtensionContext) {
   const injector = new DebugpyInjector();
   const debugpyManager = new DebugpyManager(context);
 
+  interface InMemorySessionClaim {
+    sessionId: string;
+    ownerToken: string;
+  }
+  const claimedSessionsByPid = new Map<number, InMemorySessionClaim>();
+
+  function isTargetProcessAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  interface ClaimGuardInfo {
+    ownerExtensionPid?: number;
+    ownerToken?: string;
+    timestamp: string;
+  }
+
+  function claimGuardFileForPid(pid: number): string {
+    return path.join(LOCK_DIR, `debug-session.${pid}.claim`);
+  }
+
+  function readClaimGuard(pid: number): ClaimGuardInfo | null {
+    const guardFile = claimGuardFileForPid(pid);
+    try {
+      return JSON.parse(fs.readFileSync(guardFile, 'utf-8')) as ClaimGuardInfo;
+    } catch {
+      try {
+        const stat = fs.statSync(guardFile);
+        return { timestamp: stat.mtime.toISOString() };
+      } catch {
+        return null;
+      }
+    }
+  }
+
+  async function acquirePidClaimGuard(pid: number): Promise<() => void> {
+    fs.mkdirSync(LOCK_DIR, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(LOCK_DIR, 0o700); } catch { /* best effort */ }
+
+    const guardFile = claimGuardFileForPid(pid);
+    const ownerToken = `claim:${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    const guardInfo: ClaimGuardInfo = {
+      ownerExtensionPid: process.pid,
+      ownerToken,
+      timestamp: new Date().toISOString(),
+    };
+
+    for (let attempt = 0; attempt < 500; attempt++) {
+      let fd: number | undefined;
+      let guardCreated = false;
+      try {
+        fd = fs.openSync(guardFile, 'wx', 0o600);
+        guardCreated = true;
+        fs.writeFileSync(fd, JSON.stringify(guardInfo), 'utf-8');
+        fs.closeSync(fd);
+        fd = undefined;
+        return () => {
+          const current = readClaimGuard(pid);
+          if (current?.ownerToken === ownerToken) {
+            try { fs.unlinkSync(guardFile); } catch { /* ignore */ }
+          }
+        };
+      } catch (err) {
+        if (fd !== undefined) {
+          try { fs.closeSync(fd); } catch { /* ignore */ }
+        }
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'EEXIST') {
+          if (guardCreated) {
+            try { fs.unlinkSync(guardFile); } catch { /* ignore partial guard */ }
+          }
+          throw err;
+        }
+      }
+
+      const observed = readClaimGuard(pid);
+      const timestamp = observed ? Date.parse(observed.timestamp) : Number.NaN;
+      const ownerDead = typeof observed?.ownerExtensionPid === 'number'
+        && !isTargetProcessAlive(observed.ownerExtensionPid);
+      const guardOwnerMissing = observed?.ownerExtensionPid === undefined
+        && Number.isFinite(timestamp)
+        && Date.now() - timestamp > 1_000;
+      const guardExpired = Number.isFinite(timestamp)
+        && Date.now() - timestamp > 120_000;
+      if (observed && (ownerDead || guardOwnerMissing || guardExpired)) {
+        // Re-read the token immediately before cleanup so a contender that has
+        // already replaced the stale guard is not removed by an old snapshot.
+        const current = readClaimGuard(pid);
+        if (current?.ownerToken === observed.ownerToken) {
+          try { fs.unlinkSync(guardFile); } catch { /* another contender won */ }
+        }
+        continue;
+      }
+
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+
+    throw new Error(`Timed out acquiring the PID ${pid} debug-session claim guard.`);
+  }
+
+  async function isPidLockLive(info: LockInfo): Promise<boolean> {
+    if (!isTargetProcessAlive(info.pid)) {
+      return false;
+    }
+
+    const inMemoryClaim = claimedSessionsByPid.get(info.pid);
+    if (inMemoryClaim
+      && inMemoryClaim.sessionId === info.sessionId
+      && inMemoryClaim.ownerToken === info.ownerToken) {
+      return true;
+    }
+
+    if (info.phase === 'pending') {
+      const timestamp = Date.parse(info.timestamp);
+      return Number.isFinite(timestamp)
+        && Date.now() - timestamp >= 0
+        && Date.now() - timestamp <= PENDING_LOCK_TTL_MS;
+    }
+
+    // A Python engine listener can intentionally outlive its VS Code client.
+    // New-format active locks therefore belong to the extension host, not just
+    // the persistent listener. Legacy locks fall back to the old port probe.
+    if (typeof info.ownerExtensionPid === 'number') {
+      return isTargetProcessAlive(info.ownerExtensionPid);
+    }
+
+    try {
+      return await injector.isPortListeningPublic(info.port, info.host);
+    } catch {
+      return false;
+    }
+  }
+
+  function lockInfoForTarget(
+    session: vscode.DebugSession,
+    target: DebugSessionLockTarget,
+    phase: LockInfo['phase'],
+  ): LockInfo {
+    return {
+      pid: target.pid,
+      engine: target.engine,
+      sessionId: session.id,
+      ownerToken: target.ownerToken,
+      ownerExtensionPid: process.pid,
+      phase,
+      host: target.host,
+      port: target.port,
+      workspaceId: getWorkspaceId(),
+      workspaceName: getWorkspaceName(),
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  type LockReservation =
+    | { acquired: true; previous: LockInfo | null }
+    | { acquired: false; conflict: LockInfo | null };
+
+  async function reservePidLock(info: LockInfo): Promise<LockReservation> {
+    const releaseClaimGuard = await acquirePidClaimGuard(info.pid);
+    try {
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const existingLock = readLockForPid(info.pid);
+        if (existingLock) {
+          const sameOwner = existingLock.workspaceId === info.workspaceId
+            && ((typeof existingLock.ownerToken === 'string'
+                && existingLock.ownerToken === info.ownerToken)
+              || (typeof existingLock.sessionId === 'string'
+                && existingLock.sessionId === info.sessionId));
+          if (sameOwner) {
+            writeLock(info);
+            return { acquired: true, previous: existingLock };
+          }
+          if (await isPidLockLive(existingLock)) {
+            return { acquired: false, conflict: existingLock };
+          }
+
+          log(`[DebugSession] Removing stale lock before claiming PID=${info.pid}`);
+          removeLock(info.pid);
+          continue;
+        }
+
+        // `wx` protects the lock contract even from older extension builds
+        // that do not participate in the per-PID claim guard.
+        if (createLockExclusive(info)) {
+          return { acquired: true, previous: null };
+        }
+      }
+
+      return { acquired: false, conflict: readLockForPid(info.pid) };
+    } finally {
+      releaseClaimGuard();
+    }
+  }
+
+  async function removeStalePidLock(pid: number): Promise<void> {
+    const releaseClaimGuard = await acquirePidClaimGuard(pid);
+    try {
+      const current = readLockForPid(pid);
+      if (current && !await isPidLockLive(current)) {
+        removeLock(pid);
+      }
+    } finally {
+      releaseClaimGuard();
+    }
+  }
+
+  async function removePidLockIf(
+    pid: number,
+    matches: (current: LockInfo) => boolean,
+  ): Promise<boolean> {
+    const releaseClaimGuard = await acquirePidClaimGuard(pid);
+    try {
+      const current = readLockForPid(pid);
+      if (!current || !matches(current)) {
+        return false;
+      }
+      removeLock(pid);
+      return true;
+    } finally {
+      releaseClaimGuard();
+    }
+  }
+
+  async function updatePidLockIf(
+    pid: number,
+    matches: (current: LockInfo) => boolean,
+    next: LockInfo,
+  ): Promise<boolean> {
+    const releaseClaimGuard = await acquirePidClaimGuard(pid);
+    try {
+      const current = readLockForPid(pid);
+      if (!current || !matches(current)) {
+        return false;
+      }
+      writeLock(next);
+      return true;
+    } finally {
+      releaseClaimGuard();
+    }
+  }
+
+  const sessionLockGuard: DebugSessionLockGuard = {
+    async claim(session, target) {
+      const previousClaim = claimedSessionsByPid.get(target.pid);
+      const claimMatches = previousClaim
+        && (previousClaim.sessionId === session.id
+          || previousClaim.ownerToken === target.ownerToken);
+      const restorableClaim = claimMatches ? previousClaim : undefined;
+
+      if (previousClaim && !claimMatches) {
+        if (isTargetProcessAlive(target.pid)) {
+          return {
+            allowed: false,
+            message: `Cannot attach to PID ${target.pid}: another debug session in this VS Code window already owns it. Stop that session first.`,
+          };
+        }
+        claimedSessionsByPid.delete(target.pid);
+      }
+
+      const reservation = await reservePidLock(lockInfoForTarget(session, target, 'pending'));
+      if (!reservation.acquired) {
+        const existingLock = reservation.conflict;
+        const lockedEngine = normalizeDebugEngine(existingLock?.engine);
+        return {
+          allowed: false,
+          message: existingLock
+            ? `Cannot attach: a debug session is already active in workspace ` +
+              `"${existingLock.workspaceName}" (PID ${existingLock.pid}, engine ${lockedEngine}, ` +
+              `${existingLock.host ? `${existingLock.host}:` : 'port '}${existingLock.port}). ` +
+              `Stop the existing session first.`
+            : `Cannot attach to PID ${target.pid}: another VS Code window is claiming it. Try again after stopping that session.`,
+        };
+      }
+
+      const restorableLock = reservation.previous;
+      claimedSessionsByPid.set(target.pid, {
+        sessionId: session.id,
+        ownerToken: target.ownerToken,
+      });
+
+      return {
+        allowed: true,
+        async release() {
+          const releaseClaimGuard = await acquirePidClaimGuard(target.pid);
+          try {
+            const currentLock = readLockForPid(target.pid);
+            if (currentLock?.sessionId === session.id
+              && currentLock.ownerToken === target.ownerToken) {
+              if (restorableLock) {
+                writeLock(restorableLock);
+              } else {
+                removeLock(target.pid);
+              }
+            }
+
+            const currentClaim = claimedSessionsByPid.get(target.pid);
+            if (currentClaim?.sessionId === session.id
+              && currentClaim.ownerToken === target.ownerToken) {
+              if (restorableClaim) {
+                claimedSessionsByPid.set(target.pid, restorableClaim);
+              } else {
+                claimedSessionsByPid.delete(target.pid);
+              }
+            }
+          } finally {
+            releaseClaimGuard();
+          }
+        },
+      };
+    },
+  };
+
   // Register our own debug adapter factory.
   // This connects directly to debugpy's DAP server via TCP —
   // no dependency on ms-python.python or ms-python.debugpy extensions.
   // Debug adapter: connects directly to debugpy's DAP server via TCP
   const factory = vscode.debug.registerDebugAdapterDescriptorFactory(
     'django-process',
-    {
-      createDebugAdapterDescriptor(session: vscode.DebugSession) {
-        const config = session.configuration;
-        const host: string = config.host ?? '127.0.0.1';
-        const port: number = config.port ?? 5678;
-        log(`[DebugAdapter] Connecting to DAP server at ${host}:${port}`);
-        return new vscode.DebugAdapterServer(port, host);
-      },
-    }
+    new DjangoDebugSessionFactory(injector, getConfiguredDebugEngine, sessionLockGuard),
   );
 
   // Sessions currently paused at a breakpoint (all threads stopped).
@@ -155,7 +543,7 @@ export function activate(context: vscode.ExtensionContext) {
             log(`[DAP] Session starting`);
           },
           onWillReceiveMessage(message: unknown) {
-            log(`[DAP] -> send: ${JSON.stringify(message)}`);
+            log(`[DAP] -> send: ${summarizeDapMessage(message)}`);
           },
           onDidSendMessage(message: unknown) {
             const msg = message as DapEvent;
@@ -170,7 +558,7 @@ export function activate(context: vscode.ExtensionContext) {
                 pausedSessions.delete(session.id);
               }
             }
-            log(`[DAP] <- recv: ${JSON.stringify(message)}`);
+            log(`[DAP] <- recv: ${summarizeDapMessage(message)}`);
           },
           onError(error: Error) {
             logError(`[DAP] Error`, error);
@@ -375,7 +763,7 @@ export function activate(context: vscode.ExtensionContext) {
           title: 'Preparing Django Process Debugger runtime...',
         },
         async (progress) => {
-          progress.report({ message: 'Preparing bundled debugpy...' });
+          progress.report({ message: 'Preparing debugger backends...' });
           debugpyInfo = await ensureDebugpy(selection.preflight.resolvedPythonPath);
           progress.report({ message: `Installing bootstrap into ${selection.preflight.sitePackages}...` });
           await injector.installBootstrap(selection.preflight.sitePackages);
@@ -401,6 +789,7 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   async function showSetupStatus(): Promise<void> {
+    const engine = getConfiguredDebugEngine();
     const profile = await getSetupProfile(context);
     const debugpyInfo = await debugpyManager.getProvisioningInfo();
     const bootstrapInstalled = profile
@@ -408,6 +797,16 @@ export function activate(context: vscode.ExtensionContext) {
       : false;
 
     const items: StatusQuickPickItem[] = [];
+    items.push({
+      label: engine === 'experimental'
+        ? '$(beaker) Experimental Native Tracer'
+        : '$(debug-alt) debugpy',
+      description: engine === 'experimental' ? 'Experimental opt-in' : 'Stable default',
+      detail: engine === 'experimental'
+        ? 'Limited feature set. Restart an already-activated target before switching engines.'
+        : 'Full-featured stable backend.',
+    });
+
     if (profile) {
       items.push({
         label: '$(checklist) Configured Runtime',
@@ -429,7 +828,9 @@ export function activate(context: vscode.ExtensionContext) {
     items.push({
       label: '$(debug-alt) Bundled debugpy',
       description: `${debugpyInfo.source}${debugpyInfo.version ? ` ${debugpyInfo.version}` : ''}`,
-      detail: debugpyInfo.path,
+      detail: engine === 'experimental'
+        ? `Stable fallback • ${debugpyInfo.path}`
+        : debugpyInfo.path,
     });
 
     items.push({ label: '', kind: vscode.QuickPickItemKind.Separator });
@@ -486,7 +887,9 @@ export function activate(context: vscode.ExtensionContext) {
   const attachCmd = vscode.commands.registerCommand(
     'djangoProcessDebugger.attachToProcess',
     async () => {
-      log('Command: attachToProcess');
+      const engine = getConfiguredDebugEngine();
+      const engineName = debugEngineDisplayName(engine);
+      log(`Command: attachToProcess (engine=${engine})`);
 
       const processes = await processFinder.findDjangoProcesses();
       log(`Found ${processes.length} Django process(es)`);
@@ -579,12 +982,12 @@ export function activate(context: vscode.ExtensionContext) {
           : [...new Set([representative.resolvedPid, ...groupedPids])];
         let activeEndpoint: TcpListeningEndpoint | null = null;
         for (const activeCheckPid of activeCheckPids) {
-          activeEndpoint = await injector.getActiveEndpoint(activeCheckPid);
+          activeEndpoint = await injector.getActiveEndpoint(activeCheckPid, engine);
           if (activeEndpoint) { break; }
         }
         const portStatus = activeEndpoint
-          ? `$(debug-alt) debugpy active on ${formatEndpoint(activeEndpoint)}`
-          : '$(circle-slash) debugpy not attached';
+          ? `$(debug-alt) ${engineName} active on ${formatEndpoint(activeEndpoint)}`
+          : `$(circle-slash) ${engineName} not attached`;
         const endpointLabel = representative.endpoint
           ? `Port: ${representative.endpoint.port} | Host: ${representative.endpoint.host}`
           : `PID: ${representative.resolvedPid}`;
@@ -620,7 +1023,7 @@ export function activate(context: vscode.ExtensionContext) {
       }
 
       const selected = await vscode.window.showQuickPick(items, {
-        placeHolder: 'Select a Django process to attach debugger',
+        placeHolder: `Select a Django process to attach ${engineName}`,
       });
 
       if (!selected) {
@@ -647,31 +1050,29 @@ export function activate(context: vscode.ExtensionContext) {
         targetProcess,
       );
       const port = await findFreePort();
-      log(`Selected PID=${selected.process.pid} → attach target PID=${pid} (${resolvedPythonPath})`);
+      log(`Selected PID=${selected.process.pid} → attach target PID=${pid} (${resolvedPythonPath}, engine=${engine})`);
 
-      // Check if another VS Code window already has an active debug session
+      // Keep a single debug session per target PID, regardless of engine or window.
       const existingLock = readLockForPid(pid);
-      if (existingLock && existingLock.workspaceId !== getWorkspaceId()) {
-        // Verify the lock is still valid: process alive AND port still listening
-        let lockValid = false;
-        try {
-          process.kill(existingLock.pid, 0); // process alive?
-          lockValid = await injector.isPortListeningPublic(existingLock.port, existingLock.host);
-        } catch {
-          lockValid = false;
-        }
+      if (existingLock) {
+        const lockValid = await isPidLockLive(existingLock);
 
         if (lockValid) {
-          log(`Active debug session detected from workspace "${existingLock.workspaceName}" (PID ${existingLock.pid})`);
+          const lockedEngine = normalizeDebugEngine(existingLock.engine);
+          log(
+            `Active ${lockedEngine} debug session detected from workspace ` +
+            `"${existingLock.workspaceName}" (PID ${existingLock.pid})`
+          );
           vscode.window.showErrorMessage(
             `Cannot attach: a debug session is already active in workspace "${existingLock.workspaceName}" ` +
-            `(PID ${existingLock.pid}, ${existingLock.host ? `${existingLock.host}:` : 'port '}${existingLock.port}). ` +
+            `(PID ${existingLock.pid}, engine ${lockedEngine}, ` +
+            `${existingLock.host ? `${existingLock.host}:` : 'port '}${existingLock.port}). ` +
             `Stop the existing session first.`
           );
           return;
         } else {
-          log(`Found stale lock file for PID=${pid}, removing`);
-          removeLock(pid);
+          log(`Found stale lock file for PID=${pid}, removing atomically`);
+          await removeStalePidLock(pid);
         }
       }
 
@@ -707,7 +1108,7 @@ export function activate(context: vscode.ExtensionContext) {
             await injector.installBootstrap(sitePackages);
             log(`[Attach] Bootstrap auto-updated. Note: takes effect on next Django restart.`);
             vscode.window.showInformationMessage(
-              `Bootstrap updated to v${BOOTSTRAP_VERSION}. Hot reload improvements will take effect after restarting the Django server.`
+              `Debugger bootstrap updated to v${BOOTSTRAP_VERSION}. Restart the Django server to load the new engine support.`
             );
           } catch (updateErr) {
             logError('[Attach] Bootstrap auto-update failed', updateErr);
@@ -717,33 +1118,35 @@ export function activate(context: vscode.ExtensionContext) {
         logError(`[Attach] Failed to inspect runtime ${resolvedPythonPath}`, err);
       }
 
-      try {
-        await ensureDebugpy(resolvedPythonPath);
-      } catch (err) {
-        logError('Failed to prepare bundled debugpy', err);
-        const choice = await vscode.window.showErrorMessage(
-          'Failed to prepare bundled debugpy.',
-          'Run Setup',
-          'Show Status',
-          'Show Logs',
-        );
-        if (choice === 'Run Setup') {
-          await vscode.commands.executeCommand('djangoProcessDebugger.setup');
-        } else if (choice === 'Show Status') {
-          await showSetupStatus();
-        } else if (choice === 'Show Logs') {
-          getLogger().show();
+      if (engine === 'debugpy') {
+        try {
+          await ensureDebugpy(resolvedPythonPath);
+        } catch (err) {
+          logError('Failed to prepare bundled debugpy', err);
+          const choice = await vscode.window.showErrorMessage(
+            'Failed to prepare bundled debugpy.',
+            'Run Setup',
+            'Show Status',
+            'Show Logs',
+          );
+          if (choice === 'Run Setup') {
+            await vscode.commands.executeCommand('djangoProcessDebugger.setup');
+          } else if (choice === 'Show Status') {
+            await showSetupStatus();
+          } else if (choice === 'Show Logs') {
+            getLogger().show();
+          }
+          return;
         }
-        return;
       }
 
       let debugEndpoint: TcpListeningEndpoint;
       try {
-        debugEndpoint = await injector.activateEndpoint(pid, port);
+        debugEndpoint = await injector.activateEndpoint(pid, port, engine);
         if (debugEndpoint.port !== port) {
-          log(`debugpy was already active on ${formatEndpoint(debugEndpoint)}, reusing`);
+          log(`${engineName} was already active on ${formatEndpoint(debugEndpoint)}, reusing`);
         }
-        log(`debugpy activated for PID=${pid} on ${formatEndpoint(debugEndpoint)}`);
+        log(`${engineName} activated for PID=${pid} on ${formatEndpoint(debugEndpoint)}`);
       } catch (err) {
         logError(`Attach failed for PID=${pid}`, err);
 
@@ -806,43 +1209,62 @@ export function activate(context: vscode.ExtensionContext) {
 
       log(`Starting debug session for PID=${pid}`);
 
-      // Use our own debug type — connects directly to debugpy DAP server
+      // Use our own debug type — connects directly to the selected engine's DAP server.
       const justMyCode = vscode.workspace.getConfiguration('djangoProcessDebugger').get<boolean>('justMyCode', true);
       const processType = selected.process.type;
       const sessionLabel = processType === 'celery' ? 'Celery Worker' : 'Django';
       const redirectOutput = vscode.workspace.getConfiguration('djangoProcessDebugger').get<boolean>('redirectOutput', true);
+      const ownerToken = `attach:${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
       const debugConfig: vscode.DebugConfiguration = {
         type: 'django-process',
         request: 'attach',
         name: `${sessionLabel} (PID: ${pid})`,
+        pid,
+        engine,
         host: debugEndpoint.host,
         port: debugEndpoint.port,
         justMyCode,
         redirectOutput,
       };
+      debugConfig[DEBUG_SESSION_LOCK_TOKEN_KEY] = ownerToken;
 
-      log(`Debug config: ${JSON.stringify(debugConfig)}`);
+      log(
+        `Debug config: type=django-process request=attach pid=${pid} engine=${engine} ` +
+        `endpoint=${formatEndpoint(debugEndpoint)} justMyCode=${justMyCode} redirectOutput=${redirectOutput}`
+      );
 
-      // Write lock before starting session
-      writeLock({
+      // Claim atomically immediately before starting: activation/setup can take
+      // long enough for a direct launch.json session to reserve this PID.
+      const provisionalReservation = await reservePidLock({
         pid,
+        engine,
+        ownerToken,
+        ownerExtensionPid: process.pid,
+        phase: 'pending',
         host: debugEndpoint.host,
         port: debugEndpoint.port,
         workspaceId: getWorkspaceId(),
         workspaceName: getWorkspaceName(),
         timestamp: new Date().toISOString(),
       });
+      if (!provisionalReservation.acquired) {
+        const lockedEngine = normalizeDebugEngine(provisionalReservation.conflict?.engine);
+        vscode.window.showErrorMessage(
+          `Cannot attach: PID ${pid} was claimed by another ${lockedEngine} debug session while preparing the target. ` +
+          `Stop that session first.`
+        );
+        return;
+      }
 
       const started = await vscode.debug.startDebugging(undefined, debugConfig);
       log(`Debug session started: ${started}`);
 
       if (started) {
-        startHotReloadWatcher(pid);
         vscode.window.showInformationMessage(
-          `$(debug-alt) ${sessionLabel} (PID: ${pid}) attached on ${formatEndpoint(debugEndpoint)}`
+          `$(debug-alt) ${sessionLabel} (PID: ${pid}) attached with ${engineName} on ${formatEndpoint(debugEndpoint)}`
         );
       } else {
-        removeLock(pid);
+        await removePidLockIf(pid, (failedLock) => failedLock.ownerToken === ownerToken);
         vscode.window.showErrorMessage(
           'Failed to start debug session. Check logs for details.',
           'Show Logs',
@@ -964,7 +1386,7 @@ export function activate(context: vscode.ExtensionContext) {
 
       const actions: string[] = [];
 
-      // ── 1. Remove ALL bootstrap .pth and _django_debug_bootstrap.py files ──
+      // ── 1. Remove ALL shared bootstrap and tracer files ──
       // These are the root cause of Python process poisoning.
       // Search workspace venvs, asdf installs, and common Python locations.
       const home = os.homedir();
@@ -991,7 +1413,11 @@ export function activate(context: vscode.ExtensionContext) {
       const bootstrapFiles = [
         'django_process_debugger.pth',
         '_django_debug_bootstrap.py',
+        '_django_debug_tracer.py',
       ];
+      const bootstrapFindExpression = bootstrapFiles.flatMap((fileName, index) =>
+        index === 0 ? ['-name', fileName] : ['-o', '-name', fileName]
+      );
 
       for (const root of searchRoots) {
         try {
@@ -1001,7 +1427,7 @@ export function activate(context: vscode.ExtensionContext) {
         try {
           const { stdout } = await execFileAsync('find', [
             root, '-maxdepth', '8',
-            '(', '-name', 'django_process_debugger.pth', '-o', '-name', '_django_debug_bootstrap.py', ')',
+            '(', ...bootstrapFindExpression, ')',
             '-type', 'f',
           ], { timeout: 10_000 });
 
@@ -1064,8 +1490,8 @@ export function activate(context: vscode.ExtensionContext) {
             label = 'celery';
           } else if (/jedi|pylance|pyright|language.server/i.test(command)) {
             label = 'language-server';
-          } else if (/debugpy|_django_debug_bootstrap/.test(command)) {
-            label = 'debugpy';
+          } else if (/debugpy|_django_debug_bootstrap|_django_debug_tracer|django_process_debugger_tracer/.test(command)) {
+            label = 'debug-agent';
           }
 
           try {
@@ -1317,11 +1743,13 @@ export function activate(context: vscode.ExtensionContext) {
   // ── Hot Reload: file watcher management ──
   let hotReloadWatcher: vscode.FileSystemWatcher | undefined;
   let hotReloadPid: number | undefined;
+  let hotReloadSessionId: string | undefined;
+  const effectiveSessionEngines = new Map<string, DebugEngine>();
   let hotReloadDebounceTimer: ReturnType<typeof setTimeout> | undefined;
   let hotReloadPendingFiles: Set<string> = new Set();
   const hotReloadStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
 
-  function startHotReloadWatcher(pid: number): void {
+  function startHotReloadWatcher(pid: number, sessionId: string): void {
     const hotReloadEnabled = vscode.workspace.getConfiguration('djangoProcessDebugger').get<boolean>('hotReload', true);
     if (!hotReloadEnabled) {
       log('[HotReload] Disabled by setting');
@@ -1330,6 +1758,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     stopHotReloadWatcher();
     hotReloadPid = pid;
+    hotReloadSessionId = sessionId;
 
     hotReloadWatcher = vscode.workspace.createFileSystemWatcher('**/*.py');
     hotReloadWatcher.onDidChange((uri) => onPyFileChanged(uri));
@@ -1353,6 +1782,7 @@ export function activate(context: vscode.ExtensionContext) {
       hotReloadWatcher = undefined;
     }
     hotReloadPid = undefined;
+    hotReloadSessionId = undefined;
     hotReloadStatusItem.hide();
     log('[HotReload] File watcher stopped');
   }
@@ -1449,16 +1879,117 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Debug session lifecycle logging
   context.subscriptions.push(
-    vscode.debug.onDidStartDebugSession((session) => {
-      log(`[DebugSession] Started: ${session.name} (type=${session.type})`);
+    vscode.debug.onDidStartDebugSession(async (session) => {
+      const engine = session.type === 'django-process' ? targetEngineFromSession(session) : undefined;
+      const sessionPid = session.type === 'django-process' ? targetPidFromSession(session) : undefined;
+      if (engine) {
+        effectiveSessionEngines.set(session.id, engine);
+      }
+      if (engine && sessionPid !== undefined) {
+        const configuredHost = session.configuration.host;
+        const configuredPort = session.configuration.port;
+        const host = typeof configuredHost === 'string' && configuredHost.length > 0
+          ? configuredHost
+          : '127.0.0.1';
+        const port = typeof configuredPort === 'number' && Number.isInteger(configuredPort) && configuredPort > 0
+          ? configuredPort
+          : 5678;
+        const lockTarget: DebugSessionLockTarget = {
+          pid: sessionPid,
+          engine,
+          host,
+          port,
+          ownerToken: ensureDebugSessionLockToken(session),
+        };
+
+        // The descriptor factory normally owns the lock before this event. Run
+        // the same guard again as a lifecycle fallback so an alternate VS Code
+        // startup path can never overwrite a live session's lock.
+        const claim = await sessionLockGuard.claim(session, lockTarget);
+        if (!claim.allowed) {
+          effectiveSessionEngines.delete(session.id);
+          log(`[DebugSession] Stopping unclaimed session ${session.id}: ${claim.message}`);
+          void vscode.window.showErrorMessage(claim.message);
+          await vscode.debug.stopDebugging(session);
+          return;
+        }
+
+        // The attach command reserves the lock before session startup. Refresh it
+        // here as well because VS Code's Restart flow bypasses that command.
+        const promoted = await updatePidLockIf(
+          sessionPid,
+          (current) => current.sessionId === session.id
+            && current.ownerToken === lockTarget.ownerToken,
+          lockInfoForTarget(session, lockTarget, 'active'),
+        );
+        if (!promoted) {
+          effectiveSessionEngines.delete(session.id);
+          const currentClaim = claimedSessionsByPid.get(sessionPid);
+          if (currentClaim?.sessionId === session.id
+            && currentClaim.ownerToken === lockTarget.ownerToken) {
+            claimedSessionsByPid.delete(sessionPid);
+          }
+          log(`[DebugSession] Stopping session ${session.id}: its PID lock changed before activation`);
+          void vscode.window.showErrorMessage(
+            `Cannot attach to PID ${sessionPid}: its debug-session lock changed during startup.`
+          );
+          await vscode.debug.stopDebugging(session);
+          return;
+        }
+        log(`[DebugSession] Lock file active for PID=${sessionPid} (engine=${engine})`);
+
+        if (supportsHotReload(engine)) {
+          startHotReloadWatcher(sessionPid, session.id);
+        } else {
+          log(`[HotReload] Disabled for ${engine}; the experimental tracer does not start the reload watcher yet`);
+        }
+      }
+      log(
+        `[DebugSession] Started: ${session.name} (type=${session.type}` +
+        `${engine ? `, engine=${engine}` : ''}` +
+        `${sessionPid !== undefined ? `, pid=${sessionPid}` : ''})`
+      );
     }),
-    vscode.debug.onDidTerminateDebugSession((session) => {
+    vscode.debug.onDidTerminateDebugSession(async (session) => {
       log(`[DebugSession] Terminated: ${session.name}`);
       if (session.type === 'django-process') {
         const sessionPid = targetPidFromSession(session);
-        removeLock(sessionPid);
-        stopHotReloadWatcher();
-        log(`[DebugSession] Lock file removed${sessionPid ? ` for PID=${sessionPid}` : ''}, hot reload stopped`);
+        const engine = effectiveSessionEngines.get(session.id) ?? targetEngineFromSession(session);
+        effectiveSessionEngines.delete(session.id);
+        const sessionOwnerToken = session.configuration[DEBUG_SESSION_LOCK_TOKEN_KEY];
+        let lockRemoved = false;
+        if (sessionPid !== undefined) {
+          try {
+            lockRemoved = await removePidLockIf(
+              sessionPid,
+              (activeLock) => activeLock.sessionId === session.id
+                || (activeLock.sessionId === undefined
+                  && typeof sessionOwnerToken === 'string'
+                  && sessionOwnerToken.length > 0
+                  && activeLock.ownerToken === sessionOwnerToken),
+            );
+          } catch (err) {
+            logError(`[DebugSession] Failed to release PID=${sessionPid} lock`, err);
+          }
+        }
+        if (sessionPid !== undefined) {
+          const inMemoryClaim = claimedSessionsByPid.get(sessionPid);
+          if (inMemoryClaim?.sessionId === session.id
+            && typeof sessionOwnerToken === 'string'
+            && inMemoryClaim.ownerToken === sessionOwnerToken) {
+            claimedSessionsByPid.delete(sessionPid);
+          }
+        }
+        const hotReloadStopped = sessionPid !== undefined
+          && hotReloadPid === sessionPid
+          && hotReloadSessionId === session.id;
+        if (hotReloadStopped) {
+          stopHotReloadWatcher();
+        }
+        log(
+          `[DebugSession] ${lockRemoved ? `Lock file removed for PID=${sessionPid}` : 'No PID lock to remove'} ` +
+          `(engine=${engine})${hotReloadStopped ? ', hot reload stopped' : ''}`
+        );
       }
     }),
   );

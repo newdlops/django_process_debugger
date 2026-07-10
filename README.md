@@ -6,10 +6,11 @@ Attach a debugger to a running Django or Celery process without modifying your c
 
 - Detect running Django and Celery processes with PID and port info
 - Attach debugpy at runtime via SIGUSR1/SIGUSR2 signal — no lldb, no code changes
-- **Hot Reload** — edit Python files while debugging and see changes immediately without restarting Django or losing your debug session
+- Opt in to a fully independent native tracer while keeping debugpy as the stable default
+- **Hot Reload (debugpy)** — edit Python files while debugging and see changes immediately without restarting Django or losing your debug session
 - Smart process tree resolution — select any process (uv wrapper, autoreloader, or child) and the debugger attaches to the right one
 - Vendored debugpy bundle shipped with the extension — no target-runtime pip install required
-- `print()` output redirected to VS Code Debug Console by default
+- `print()` output redirected to VS Code Debug Console by default with the debugpy backend
 - Guided runtime setup with preflight checks, recommendation ranking, and workspace profile reuse
 - Auto-discover Python interpreters from running servers, VS Code selection, asdf, pyenv, mise, conda, Poetry, pipenv, Homebrew, and more
 - Host/port-grouped attach picker — attachable Django servers are grouped by listener host and port
@@ -34,15 +35,17 @@ This installs a lightweight bootstrap into the target runtime's `site-packages` 
 
 Restart your Django server through your normal workflow (`manage.py runserver`, `uv run python manage.py runserver`, etc.). The bootstrap loads automatically.
 
+To try the native tracer, set `djangoProcessDebugger.engine` to `experimental` before attaching. No setting change is needed for the stable debugpy backend.
+
 ### 3. Attach
 
 Run **Django Debugger: Attach to Django Process** from the Command Palette.
 
-Select the server you want to debug — attachable Django processes are grouped by listener host and port, with the related PIDs shown in the item description. The extension automatically resolves the correct child process in the Django process tree, activates debugpy, and connects VS Code's debugger.
+Select the server you want to debug — attachable Django processes are grouped by listener host and port, with the related PIDs shown in the item description. The extension automatically resolves the correct child process in the Django process tree, activates the selected debug engine, and connects VS Code's debugger.
 
-### 4. Edit & Debug (Hot Reload)
+### 4. Edit & Debug (debugpy Hot Reload)
 
-With the debugger attached, simply edit and save any `.py` file. The extension automatically:
+With the default debugpy backend attached, simply edit and save any `.py` file. The extension automatically:
 
 1. Detects the file change
 2. Reloads the module in the running process via `importlib.reload()`
@@ -56,7 +59,7 @@ Your debug session stays alive, breakpoints remain active, and the next request 
 | Command | Description |
 |---------|-------------|
 | **Django Debugger: Setup** | Install debug bootstrap into the runtime that launches Django/Celery |
-| **Django Debugger: Show Setup Status** | Show the saved runtime profile, bootstrap status, and bundled debugpy source |
+| **Django Debugger: Show Setup Status** | Show the selected engine, saved runtime profile, bootstrap status, and bundled debugpy fallback |
 | **Django Debugger: Attach to Django Process** | Attach debugger to a running Django/Celery process |
 | **Django Debugger: Kill Django/Celery Process** | Kill selected processes (multi-select supported) |
 | **Django Debugger: Reinstall debugpy** | Remove and reinstall the bundled debugpy |
@@ -64,17 +67,33 @@ Your debug session stays alive, breakpoints remain active, and the next request 
 
 ## How It Works
 
+### Debug Engines
+
+`debugpy` remains the default and recommended backend. The `experimental` backend is a new tracer implemented independently of debugpy and is available as an explicit opt-in:
+
+```json
+{
+  "djangoProcessDebugger.engine": "experimental"
+}
+```
+
+The experimental tracer currently supports line breakpoints, stack frames, scopes, read-only variables, continue, step over, step in, and step out. Conditional breakpoints, expression evaluation, variable mutation, exception breakpoints, and function breakpoints are not supported yet. Hot reload also remains debugpy-only for now.
+
+Changing the setting affects new sessions only. Both engines retain process-level tracing state after a DAP session ends, so the first activated engine owns that PID until it restarts. Restart the target process before attaching it with the other engine.
+
+On Python 3.11 and earlier, pure `sys.settrace` cannot immediately install tracing into every already-running non-main thread. The experimental backend guarantees the current/main thread that handles activation and threads created after activation; broader existing-thread support is still under development. It also refuses activation when another coverage/debug/profiling trace hook is already installed instead of replacing that hook.
+
 ### Debug Attach
 
 1. **Setup** installs a `.pth` file and a small Python module into your target runtime's `site-packages`. The `.pth` file causes Python to auto-load the module at startup, which registers a SIGUSR1/SIGUSR2 signal handler. Only long-running server processes (runserver, celery worker, etc.) are affected — tools like pip, pytest, and language servers are explicitly excluded via a blocklist.
 
-2. **Attach** finds the target process, resolves the process tree to find the actual debuggable child process (handling `uv run`, `poetry run`, Django autoreloader, etc.), writes a port number to a temp file, sends SIGUSR1 (or SIGUSR2 for Celery), and waits for debugpy to start listening. Then VS Code connects via DAP (Debug Adapter Protocol) over TCP.
+2. **Attach** finds the target process, resolves the process tree to find the actual debuggable child process (handling `uv run`, `poetry run`, Django autoreloader, etc.), writes an engine activation request to a temp file, sends SIGUSR1 (or SIGUSR2 for Celery), and waits for the selected engine to start listening. Then VS Code connects via DAP (Debug Adapter Protocol) over TCP.
 
 3. **debugpy** is shipped as a vendored bundle inside the extension and copied into private extension storage on first use, so your target runtime stays clean. If macOS blocks the Python binary (code signature issue), the extension still auto-repairs it with `codesign --force --deep --sign -` when pip fallback is needed.
 
 ### Hot Reload
 
-When debugpy activates, a background watcher thread starts in the Django process. On the VS Code side, a `FileSystemWatcher` monitors `**/*.py` files.
+When debugpy activates, a background watcher thread starts in the Django process. On the VS Code side, a `FileSystemWatcher` monitors `**/*.py` files. This hot-reload path is currently disabled for the experimental tracer.
 
 When you save a file:
 
@@ -137,11 +156,21 @@ You can select **any** process in the tree — the extension walks down to the d
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `djangoProcessDebugger.justMyCode` | `true` | Only debug user-written code. Set to `false` to step into Django/Celery internals. |
-| `djangoProcessDebugger.redirectOutput` | `true` | Redirect `print()` / stdout / stderr to the VS Code Debug Console. |
-| `djangoProcessDebugger.hotReload` | `true` | Hot-reload changed `.py` files without restarting Django. Django's autoreloader is suppressed while active. |
+| `djangoProcessDebugger.engine` | `debugpy` | Debug backend for new attach sessions. Restart an already-activated target before switching engines. |
+| `djangoProcessDebugger.justMyCode` | `true` | Only debug user-written code. Set to `false` to step into Django/Celery internals. Currently debugpy-only. |
+| `djangoProcessDebugger.redirectOutput` | `true` | Redirect `print()` / stdout / stderr to the VS Code Debug Console. Currently debugpy-only. |
+| `djangoProcessDebugger.hotReload` | `true` | Hot-reload changed `.py` files without restarting Django. Currently debugpy-only. |
 
 ## Troubleshooting
+
+### Experimental tracer limitations
+
+- The experimental tracer intentionally advertises only the DAP features it currently implements. Use `debugpy` when you need conditions, expression evaluation, value changes, exception/function breakpoints, or hot reload.
+- `justMyCode` filtering and Debug Console output redirection are not implemented by the experimental tracer yet.
+- Stop the current session before changing engines, then restart the target process before attaching it with the other engine.
+- The experimental trace hook remains installed for same-engine reattach after disconnect. Restart the target process to remove its tracing overhead completely.
+- On Python 3.11 and earlier, a thread that was already running before attach may not be traced until broader existing-thread support is implemented.
+- The experimental backend will not replace an existing `sys.settrace`/`threading.settrace` hook. Stop the other coverage, profiler, or debugger integration and restart the target first.
 
 ### Hot reload not reflecting changes
 

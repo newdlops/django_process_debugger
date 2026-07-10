@@ -5,7 +5,7 @@ import { promisify } from 'util';
 import * as path from 'path';
 import * as net from 'net';
 import * as fs from 'fs/promises';
-import { DebugpyInjector } from '../../debugpyInjector';
+import { DebugEngineConflictError, DebugpyInjector } from '../../debugpyInjector';
 import { getPerf } from './perfReporter';
 import {
   findSystemPython,
@@ -35,8 +35,11 @@ describe('Feature: end-to-end attach flow', function () {
   const injector = new DebugpyInjector();
   let venv: Awaited<ReturnType<typeof createTempVenv>> = null;
   let server: SpawnedProcess | null = null;
+  let experimentalServer: SpawnedProcess | null = null;
   const serverPort = 49_872;
   const debugPort = 49_873;
+  const experimentalServerPort = 49_874;
+  const experimentalDebugPort = 49_875;
 
   before(async function () {
     this.timeout(60_000);
@@ -64,6 +67,7 @@ describe('Feature: end-to-end attach flow', function () {
     server = await perf.measure('spawn fake runserver', async () =>
       spawnFakeRunserver(venv!.python, serverPort),
     { group: 'attach-e2e' });
+    experimentalServer = await spawnFakeRunserver(venv.python, experimentalServerPort);
 
     // Give the bootstrap's signal handler a moment to register.
     await sleep(200);
@@ -90,6 +94,9 @@ describe('Feature: end-to-end attach flow', function () {
     if (server) {
       await server.stop();
     }
+    if (experimentalServer) {
+      await experimentalServer.stop();
+    }
     if (venv) {
       await venv.cleanup();
     }
@@ -111,6 +118,37 @@ describe('Feature: end-to-end attach flow', function () {
 
     const listening = await isPortListening(endpoint.port, endpoint.host);
     assert.strictEqual(listening, true, `debugpy should be listening on ${endpoint.host}:${debugPort}`);
+  });
+
+  it('activateEndpoint() starts the independent experimental tracer through the bootstrap', async function () {
+    if (!experimentalServer || !venv) { this.skip(); return; }
+    this.timeout(20_000);
+
+    const endpoint = await perf.measure('injector.activate (experimental)', async () =>
+      injector.activateEndpoint(experimentalServer!.pid, experimentalDebugPort, 'experimental'),
+    { group: 'attach-e2e', meta: { pid: experimentalServer.pid, requested: experimentalDebugPort } });
+
+    assert.strictEqual(endpoint.port, experimentalDebugPort);
+    assert.strictEqual(
+      await injector.getActiveEndpoint(experimentalServer.pid, 'debugpy'),
+      null,
+      'experimental activation must not publish a debugpy marker',
+    );
+    const active = await injector.getActiveEndpoint(experimentalServer.pid, 'experimental');
+    assert.ok(active, 'experimental endpoint should be discoverable by its own engine');
+    assert.strictEqual(active.port, experimentalDebugPort);
+  });
+
+  it('does not switch an experimental PID to debugpy without a target restart', async function () {
+    if (!experimentalServer || !venv) { this.skip(); return; }
+    this.timeout(10_000);
+
+    await assert.rejects(
+      injector.activateEndpoint(experimentalServer.pid, experimentalDebugPort + 100, 'debugpy'),
+      (error: unknown) => error instanceof DebugEngineConflictError
+        && error.activeEngine === 'experimental'
+        && error.requestedEngine === 'debugpy',
+    );
   });
 
   it('activate() is idempotent — second call reuses the same port', async function () {

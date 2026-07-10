@@ -39,6 +39,10 @@ describe('Feature: runtime discovery', function () {
     const defaults = manifest.contributes.configuration.properties;
 
     assert.strictEqual(
+      config.get<string>('engine') ?? defaults['djangoProcessDebugger.engine'].default,
+      'debugpy',
+    );
+    assert.strictEqual(
       config.get<boolean>('justMyCode') ?? defaults['djangoProcessDebugger.justMyCode'].default,
       true,
     );

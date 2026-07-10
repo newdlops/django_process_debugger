@@ -2,6 +2,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { DEFAULT_DEBUG_ENGINE, isDebugEngine, type DebugEngine } from './debugEngine';
 import { log, logError } from './logger';
 import {
   TcpListeningEndpoint,
@@ -14,11 +15,20 @@ const execFileAsync = promisify(execFile);
 
 const PTH_FILENAME = 'django_process_debugger.pth';
 const BOOTSTRAP_MODULE = '_django_debug_bootstrap';
-export const BOOTSTRAP_VERSION = '2026.07.10.2';
+const TRACER_MODULE_FILENAME = '_django_debug_tracer.py';
+const TRACER_SOURCE_PATH = path.resolve(
+  __dirname,
+  '..',
+  'python',
+  'django_process_debugger_tracer.py',
+);
+export const BOOTSTRAP_VERSION = '2026.07.10.4';
 export type DebugpyEndpoint = TcpListeningEndpoint;
 type BootstrapRuntimeState = {
   pid: number;
   version: string;
+  engines?: DebugEngine[];
+  activationVersion?: number;
 };
 
 function pythonProbeEnv(): NodeJS.ProcessEnv {
@@ -32,20 +42,41 @@ function pythonProbeEnv(): NodeJS.ProcessEnv {
 
 /**
  * Bootstrap script installed into the target venv's site-packages.
- * Installs a SIGUSR1 handler that starts debugpy on demand.
+ * Installs a SIGUSR1/SIGUSR2 handler that starts the selected engine on demand.
  *
- * The bundled debugpy path is read from a companion config file
- * so we don't need env vars.
+ * The generated bootstrap embeds the bundled debugpy path and imports the
+ * installed native tracer companion when experimental mode is selected.
  */
 /**
- * Port file path: the extension writes the desired port here before
- * sending SIGUSR1. The bootstrap reads it to know which port to listen on.
+ * Activation file path: the extension writes a versioned engine/port payload
+ * here before sending a signal. The legacy .port filename and integer content
+ * remain supported for debugpy compatibility.
  * Using a file avoids the problem of not being able to set env vars on
  * an already-running process.
  */
 const PORT_FILE_DIR = '/tmp/django-process-debugger';
+
+async function ensurePrivatePortFileDir(): Promise<void> {
+  await fs.mkdir(PORT_FILE_DIR, { recursive: true, mode: 0o700 });
+  try {
+    await fs.chmod(PORT_FILE_DIR, 0o700);
+  } catch {
+    // A pre-existing directory may not be owned by this user. The subsequent
+    // file operation will surface a useful error if it is not writable.
+  }
+}
 function portFilePath(pid: number): string {
   return `${PORT_FILE_DIR}/${pid}.port`;
+}
+
+function activeFilePath(pid: number, engine: DebugEngine): string {
+  return engine === 'experimental'
+    ? `${PORT_FILE_DIR}/${pid}.experimental.active`
+    : `${PORT_FILE_DIR}/${pid}.active`;
+}
+
+function otherDebugEngine(engine: DebugEngine): DebugEngine {
+  return engine === 'debugpy' ? 'experimental' : 'debugpy';
 }
 
 function reloadFilePath(pid: number): string {
@@ -151,9 +182,17 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '        def _write_bootstrap_state():',
     '            try:',
     '                _os.makedirs(_PORT_FILE_DIR, exist_ok=True)',
+    '                try:',
+    '                    _os.chmod(_PORT_FILE_DIR, 0o700)',
+    '                except Exception:',
+    '                    pass',
     '                import json as _json',
-    '                with open(f"{_PORT_FILE_DIR}/{_os.getpid()}.bootstrap.json", "w") as _f:',
-    '                    _f.write(_json.dumps({"version": ' + JSON.stringify(BOOTSTRAP_VERSION) + ', "pid": _os.getpid()}))',
+    '                _state_file = f"{_PORT_FILE_DIR}/{_os.getpid()}.bootstrap.json"',
+    '                _state_tmp = _state_file + ".tmp"',
+    '                with open(_state_tmp, "w") as _f:',
+    '                    _f.write(_json.dumps({"version": ' + JSON.stringify(BOOTSTRAP_VERSION) + ', "pid": _os.getpid(), "engines": ["debugpy", "experimental"], "activationVersion": 1}))',
+    '                _os.chmod(_state_tmp, 0o600)',
+    '                _os.replace(_state_tmp, _state_file)',
     '            except Exception as _e:',
     '                _dbg_log(f"Failed to write bootstrap state: {_e}")',
     '',
@@ -161,7 +200,22 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '        _write_bootstrap_state()',
     '',
     '        _hot_reload_watcher_started = False',
-    '        _debugpy_endpoint = None',
+    '        _engine_endpoints = {}',
+    '        _activated_engine = None',
+    '        _bootstrap_pid = _os.getpid()',
+    '',
+    '        def _reset_bootstrap_after_fork():',
+    '            global _hot_reload_watcher_started, _engine_endpoints, _activated_engine, _bootstrap_pid',
+    '            # The child has no copy of parent daemon threads and must own',
+    '            # a fresh activation lifecycle. Never retain parent endpoints.',
+    '            _bootstrap_pid = _os.getpid()',
+    '            _engine_endpoints = {}',
+    '            _activated_engine = None',
+    '            _hot_reload_watcher_started = False',
+    '',
+    '        _register_at_fork = getattr(_os, "register_at_fork", None)',
+    '        if _register_at_fork is not None:',
+    '            _register_at_fork(after_in_child=_reset_bootstrap_after_fork)',
     '',
     '        # Persistent storage: keeps references to the ORIGINAL functions',
     '        # (before any reload) so we always patch the ones Django actually calls.',
@@ -425,11 +479,21 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '            _dbg_log("Hot reload watcher started")',
     '',
     '        def _django_debugger_signal_handler(signum, frame):',
-    '            global _hot_reload_watcher_started, _debugpy_endpoint',
+    '            global _hot_reload_watcher_started, _engine_endpoints, _activated_engine, _bootstrap_pid',
+    '            _current_pid = _os.getpid()',
+    '            if _bootstrap_pid != _current_pid:',
+    '                # A forked child has its own lifecycle. Do not reuse the',
+    '                # parent engine ownership or endpoints; the experimental',
+    '                # tracer at-fork callback has also closed inherited sockets.',
+    '                _bootstrap_pid = _current_pid',
+    '                _engine_endpoints = {}',
+    '                _activated_engine = None',
+    '                _hot_reload_watcher_started = False',
+    '                _dbg_log("Fork detected; reset inherited engine ownership")',
     '            _dbg_log(f"Signal {signum} received")',
     '            _write_bootstrap_state()',
-    '            _active_file = f"{_PORT_FILE_DIR}/{_os.getpid()}.active"',
-    '            _port_file = f"{_PORT_FILE_DIR}/{_os.getpid()}.port"',
+    '            _pid = _os.getpid()',
+    '            _port_file = f"{_PORT_FILE_DIR}/{_pid}.port"',
     '            def _clear_pending_port_file():',
     '                try:',
     '                    _os.unlink(_port_file)',
@@ -437,97 +501,181 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                    pass',
     '                except Exception as _e:',
     '                    _dbg_log(f"Failed to remove stale port file: {_e}")',
-    '            def _endpoint_is_alive(_host, _port):',
+    '            def _active_file_for(_engine_name):',
+    '                if _engine_name == "experimental":',
+    '                    return f"{_PORT_FILE_DIR}/{_pid}.experimental.active"',
+    '                return f"{_PORT_FILE_DIR}/{_pid}.active"',
+    '            def _endpoint_is_alive(_host, _port_value):',
     '                try:',
     '                    import socket as _socket',
     '                    _sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)',
     '                    _sock.settimeout(0.2)',
     '                    try:',
-    '                        return _sock.connect_ex((_host or "127.0.0.1", int(_port))) == 0',
+    '                        return _sock.connect_ex((_host or "127.0.0.1", int(_port_value))) == 0',
     '                    finally:',
     '                        _sock.close()',
     '                except Exception as _e:',
-    '                    _dbg_log(f"Endpoint check failed for {_host}:{_port}: {_e}")',
+    '                    _dbg_log(f"Endpoint check failed for {_host}:{_port_value}: {_e}")',
     '                    return False',
-    '            def _read_active_endpoint():',
+    '            def _read_active_endpoint(_file_path, _expected_engine):',
     '                try:',
-    '                    with open(_active_file) as _f:',
+    '                    with open(_file_path) as _f:',
     '                        _content = _f.read().strip()',
     '                    try:',
     '                        import json as _json',
     '                        _parsed = _json.loads(_content)',
-    '                        return (str(_parsed.get("host") or "127.0.0.1"), int(_parsed.get("port")))',
+    '                        if isinstance(_parsed, dict):',
+    '                            _recorded_engine = _parsed.get("engine")',
+    '                            if _recorded_engine is not None and _recorded_engine != _expected_engine:',
+    '                                return None',
+    '                            if _expected_engine == "experimental" and _recorded_engine != "experimental":',
+    '                                return None',
+    '                            return (str(_parsed.get("host") or "127.0.0.1"), int(_parsed.get("port")))',
     '                    except Exception:',
+    '                        pass',
+    '                    if _expected_engine == "debugpy":',
     '                        return ("127.0.0.1", int(_content))',
+    '                    return None',
     '                except FileNotFoundError:',
     '                    return None',
     '                except Exception as _e:',
-    '                    _dbg_log(f"Failed to read active endpoint: {_e}")',
+    '                    _dbg_log(f"Failed to read {_expected_engine} active endpoint: {_e}")',
     '                    return None',
-    '            _existing_endpoint = _read_active_endpoint()',
-    '            if _existing_endpoint is not None:',
-    '                if _endpoint_is_alive(_existing_endpoint[0], _existing_endpoint[1]):',
-    '                    _clear_pending_port_file()',
-    '                    _dbg_log(f"debugpy already active on {_existing_endpoint[0]}:{_existing_endpoint[1]}, skipping")',
-    '                    return',
+    '            def _remove_active_file(_file_path):',
     '                try:',
-    '                    _os.unlink(_active_file)',
+    '                    _os.unlink(_file_path)',
     '                except FileNotFoundError:',
     '                    pass',
-    '                _dbg_log(f"Removed stale active endpoint {_existing_endpoint[0]}:{_existing_endpoint[1]}")',
-    '            if _debugpy_endpoint is not None:',
-    '                if not _endpoint_is_alive(_debugpy_endpoint[0], _debugpy_endpoint[1]):',
-    '                    _dbg_log(f"Stored debugpy endpoint is stale: {_debugpy_endpoint[0]}:{_debugpy_endpoint[1]}")',
-    '                    _debugpy_endpoint = None',
+    '                except Exception as _e:',
+    '                    _dbg_log(f"Failed to remove stale active file {_file_path}: {_e}")',
+    '            def _write_active_endpoint(_file_path, _engine_name, _host, _port_value):',
+    '                import json as _json',
+    '                _tmp_file = _file_path + ".tmp"',
+    '                with open(_tmp_file, "w") as _f:',
+    '                    _f.write(_json.dumps({"version": 1, "engine": _engine_name, "host": _host, "port": _port_value}))',
+    '                _os.chmod(_tmp_file, 0o600)',
+    '                _os.replace(_tmp_file, _file_path)',
+    '',
+    '            # Read activation intent before inspecting endpoint markers. Older',
+    '            # extensions wrote a bare integer; that remains a debugpy request.',
+    '            _engine = "debugpy"',
+    '            _port = 5678',
+    '            try:',
+    '                with open(_port_file) as _f:',
+    '                    _request_content = _f.read().strip()',
+    '                import json as _json',
+    '                try:',
+    '                    _request = _json.loads(_request_content)',
+    '                except Exception:',
+    '                    _request = int(_request_content)',
+    '                if isinstance(_request, dict):',
+    '                    if int(_request.get("version", 0)) != 1:',
+    '                        raise ValueError("unsupported activation request version")',
+    '                    _requested_engine = _request.get("engine", "debugpy")',
+    '                    if _requested_engine not in ("debugpy", "experimental"):',
+    '                        raise ValueError(f"unsupported debug engine: {_requested_engine}")',
+    '                    _engine = _requested_engine',
+    '                    _port = int(_request.get("port", 5678))',
+    '                else:',
+    '                    _port = int(_request)',
+    '                if _port < 0 or _port > 65535:',
+    '                    raise ValueError(f"invalid debug port: {_port}")',
+    '                _clear_pending_port_file()',
+    '                _dbg_log(f"Read activation request engine={_engine} port={_port}")',
+    '            except FileNotFoundError:',
+    '                _dbg_log(f"Activation file not found, using defaults engine={_engine} port={_port}")',
+    '            except Exception as _e:',
+    '                _clear_pending_port_file()',
+    '                _dbg_log(f"Invalid activation request: {_e}")',
+    '                return',
+    '',
+    '            # A tracer owns interpreter-wide hooks that cannot be safely',
+    '            # replaced in every existing thread on all supported Python',
+    '            # versions. Ownership therefore lasts until process restart.',
+    '            if _activated_engine is not None:',
+    '                if _activated_engine != _engine:',
+    '                    _dbg_log(f"Cannot activate {_engine}: {_activated_engine} owns this PID until restart")',
+    '                    return',
+    '                _owned_endpoint = _engine_endpoints.get(_activated_engine)',
+    '                if _owned_endpoint is not None and _endpoint_is_alive(_owned_endpoint[0], _owned_endpoint[1]):',
+    '                    try:',
+    '                        _write_active_endpoint(_active_file_for(_engine), _engine, _owned_endpoint[0], _owned_endpoint[1])',
+    '                    except Exception as _e:',
+    '                        _dbg_log(f"Failed to restore owned {_engine} endpoint: {_e}")',
+    '                    return',
+    '                _dbg_log(f"Cannot reactivate {_engine}: its process-level hooks were already installed; restart required")',
+    '                return',
+    '',
+    '            _active_file = _active_file_for(_engine)',
+    '            _existing_endpoint = _read_active_endpoint(_active_file, _engine)',
+    '            if _existing_endpoint is not None:',
+    '                if _endpoint_is_alive(_existing_endpoint[0], _existing_endpoint[1]):',
+    '                    _dbg_log(f"{_engine} already active on {_existing_endpoint[0]}:{_existing_endpoint[1]}, skipping")',
+    '                    return',
+    '                _remove_active_file(_active_file)',
+    '                _dbg_log(f"Removed stale {_engine} endpoint {_existing_endpoint[0]}:{_existing_endpoint[1]}")',
+    '',
+    '            # The first experimental tracer intentionally runs exclusively.',
+    '            # Keep per-engine files so this guard can be relaxed in the future.',
+    '            _other_engine = "experimental" if _engine == "debugpy" else "debugpy"',
+    '            _other_active_file = _active_file_for(_other_engine)',
+    '            _other_endpoint = _read_active_endpoint(_other_active_file, _other_engine)',
+    '            if _other_endpoint is None:',
+    '                _other_endpoint = _engine_endpoints.get(_other_engine)',
+    '            if _other_endpoint is not None:',
+    '                if _endpoint_is_alive(_other_endpoint[0], _other_endpoint[1]):',
+    '                    _dbg_log(f"Cannot activate {_engine}: {_other_engine} is already active on {_other_endpoint[0]}:{_other_endpoint[1]}")',
+    '                    return',
+    '                _remove_active_file(_other_active_file)',
+    '',
+    '            _stored_endpoint = _engine_endpoints.get(_engine)',
+    '            if _stored_endpoint is not None:',
+    '                if not _endpoint_is_alive(_stored_endpoint[0], _stored_endpoint[1]):',
+    '                    _dbg_log(f"Stored {_engine} endpoint is stale: {_stored_endpoint[0]}:{_stored_endpoint[1]}")',
+    '                    _engine_endpoints.pop(_engine, None)',
     '                else:',
     '                    try:',
-    '                        import json as _json',
-    '                        with open(_active_file, "w") as _f:',
-    '                            _f.write(_json.dumps({"host": _debugpy_endpoint[0], "port": _debugpy_endpoint[1]}))',
-    '                        _clear_pending_port_file()',
-    '                        _dbg_log(f"debugpy endpoint restored in active file: {_debugpy_endpoint[0]}:{_debugpy_endpoint[1]}")',
+    '                        _write_active_endpoint(_active_file, _engine, _stored_endpoint[0], _stored_endpoint[1])',
+    '                        _dbg_log(f"{_engine} endpoint restored in active file: {_stored_endpoint[0]}:{_stored_endpoint[1]}")',
     '                    except Exception as _e:',
-    '                        _dbg_log(f"Failed to restore active file: {_e}")',
+    '                        _dbg_log(f"Failed to restore {_engine} active file: {_e}")',
     '                    return',
-    '            _bundled = ' + JSON.stringify(bundledDebugpyPath),
-    '            if _bundled and _bundled not in _sys.path:',
-    '                _sys.path.insert(0, _bundled)',
-    '                _dbg_log(f"Added bundled path: {_bundled}")',
+    '',
+    '            # Claim process-level tracing ownership before importing or',
+    '            # starting the engine. A partial activation is also unsafe to',
+    '            # replace without restarting the target process.',
+    '            _activated_engine = _engine',
     '            try:',
-    '                import debugpy',
-    '                _dbg_log(f"debugpy imported from {debugpy.__file__}")',
-    '                _port = 5678',
-    '                try:',
-    '                    with open(_port_file) as _f:',
-    '                        _port = int(_f.read().strip())',
-    '                    _os.unlink(_port_file)',
-    '                    _dbg_log(f"Read port {_port} from {_port_file}")',
-    '                except FileNotFoundError:',
-    '                    _dbg_log(f"Port file not found, using default {_port}")',
-    '                except ValueError as ve:',
-    '                    _dbg_log(f"Bad port file content: {ve}")',
-    '                _listen_result = debugpy.listen(("127.0.0.1", _port))',
+    '                if _engine == "debugpy":',
+    '                    _bundled = ' + JSON.stringify(bundledDebugpyPath),
+    '                    if _bundled and _bundled not in _sys.path:',
+    '                        _sys.path.insert(0, _bundled)',
+    '                        _dbg_log(f"Added bundled path: {_bundled}")',
+    '                    import debugpy',
+    '                    _dbg_log(f"debugpy imported from {debugpy.__file__}")',
+    '                    _listen_result = debugpy.listen(("127.0.0.1", _port))',
+    '                else:',
+    '                    import _django_debug_tracer as _experimental_tracer',
+    '                    _dbg_log(f"experimental tracer imported from {_experimental_tracer.__file__}")',
+    '                    _listen_result = _experimental_tracer.start("127.0.0.1", _port)',
     '                _host = "127.0.0.1"',
     '                _actual_port = _port',
     '                if isinstance(_listen_result, (tuple, list)) and len(_listen_result) >= 2:',
     '                    _host = str(_listen_result[0])',
     '                    _actual_port = int(_listen_result[1])',
-    '                import json as _json',
-    '                with open(_active_file, "w") as _f:',
-    '                    _f.write(_json.dumps({"host": _host, "port": _actual_port}))',
-    '                _debugpy_endpoint = (_host, _actual_port)',
-    '                _dbg_log(f"debugpy listening on {_host}:{_actual_port}")',
-    '                # Start hot reload watcher after debugpy is active',
-    '                if not _hot_reload_watcher_started:',
+    '                _write_active_endpoint(_active_file, _engine, _host, _actual_port)',
+    '                _engine_endpoints[_engine] = (_host, _actual_port)',
+    '                _dbg_log(f"{_engine} listening on {_host}:{_actual_port}")',
+    '                if _engine == "debugpy" and not _hot_reload_watcher_started:',
     '                    _start_hot_reload_watcher()',
     '                    _hot_reload_watcher_started = True',
-    '            except RuntimeError as e:',
-    '                if "already" in str(e).lower():',
-    '                    _dbg_log(f"debugpy already listening: {e}")',
+    '            except RuntimeError as _e:',
+    '                if "already" in str(_e).lower():',
+    '                    _dbg_log(f"{_engine} already listening: {_e}")',
     '                else:',
-    '                    _dbg_log(f"RuntimeError: {e}\\n{_traceback.format_exc()}")',
-    '            except Exception as e:',
-    '                _dbg_log(f"ERROR: {e}\\n{_traceback.format_exc()}")',
+    '                    _dbg_log(f"{_engine} RuntimeError: {_e}\\n{_traceback.format_exc()}")',
+    '            except Exception as _e:',
+    '                _dbg_log(f"{_engine} ERROR: {_e}\\n{_traceback.format_exc()}")',
     '',
     '        _signal.signal(_signal.SIGUSR1, _django_debugger_signal_handler)',
     '        _signal.signal(_signal.SIGUSR2, _django_debugger_signal_handler)',
@@ -574,11 +722,14 @@ export class DebugpyInjector {
 
     const pthPath = path.join(venvSitePackages, PTH_FILENAME);
     const modulePath = path.join(venvSitePackages, `${BOOTSTRAP_MODULE}.py`);
+    const tracerModulePath = path.join(venvSitePackages, TRACER_MODULE_FILENAME);
 
     log(`[Injector] Installing bootstrap to ${venvSitePackages}`);
     log(`[Injector]   .pth file: ${pthPath}`);
     log(`[Injector]   module: ${modulePath}`);
+    log(`[Injector]   tracer: ${tracerModulePath}`);
 
+    await fs.copyFile(TRACER_SOURCE_PATH, tracerModulePath);
     await fs.writeFile(modulePath, makeBootstrapScript(this.bundledDebugpyPath), 'utf-8');
     await fs.writeFile(pthPath, PTH_CONTENT, 'utf-8');
 
@@ -604,8 +755,9 @@ export class DebugpyInjector {
   async uninstallBootstrap(venvSitePackages: string): Promise<void> {
     const pthPath = path.join(venvSitePackages, PTH_FILENAME);
     const modulePath = path.join(venvSitePackages, `${BOOTSTRAP_MODULE}.py`);
+    const tracerModulePath = path.join(venvSitePackages, TRACER_MODULE_FILENAME);
 
-    for (const f of [pthPath, modulePath]) {
+    for (const f of [pthPath, modulePath, tracerModulePath]) {
       try {
         await fs.unlink(f);
         log(`[Injector] Removed: ${f}`);
@@ -622,8 +774,9 @@ export class DebugpyInjector {
    */
   async requestHotReload(pid: number, filePaths: string[]): Promise<void> {
     if (filePaths.length === 0) { return; }
-    await fs.mkdir(PORT_FILE_DIR, { recursive: true });
-    await fs.writeFile(reloadFilePath(pid), filePaths.join('\n'), 'utf-8');
+    await ensurePrivatePortFileDir();
+    await fs.writeFile(reloadFilePath(pid), filePaths.join('\n'), { encoding: 'utf-8', mode: 0o600 });
+    await fs.chmod(reloadFilePath(pid), 0o600);
     log(`[Injector] Hot reload requested for PID=${pid}: ${filePaths.join(', ')}`);
   }
 
@@ -704,7 +857,13 @@ export class DebugpyInjector {
     try {
       const modulePath = path.join(venvSitePackages, `${BOOTSTRAP_MODULE}.py`);
       const content = await fs.readFile(modulePath, 'utf-8');
-      return content.includes(`bootstrap ${BOOTSTRAP_VERSION}`);
+      if (!content.includes(`bootstrap ${BOOTSTRAP_VERSION}`)) {
+        return false;
+      }
+
+      const installedTracer = await fs.readFile(path.join(venvSitePackages, TRACER_MODULE_FILENAME));
+      const bundledTracer = await fs.readFile(TRACER_SOURCE_PATH);
+      return installedTracer.equals(bundledTracer);
     } catch {
       return false;
     }
@@ -853,11 +1012,14 @@ export class DebugpyInjector {
   }
 
   /**
-   * Check if debugpy is already active for a given PID.
+   * Check if a debug engine is already active for a given PID.
    * Returns the endpoint if active, null otherwise.
    */
-  async getActiveEndpoint(pid: number): Promise<DebugpyEndpoint | null> {
-    const activeFile = path.join(PORT_FILE_DIR, `${pid}.active`);
+  async getActiveEndpoint(
+    pid: number,
+    engine: DebugEngine = DEFAULT_DEBUG_ENGINE,
+  ): Promise<DebugpyEndpoint | null> {
+    const activeFile = activeFilePath(pid, engine);
     try {
       this.verifyProcessAlive(pid);
     } catch {
@@ -867,24 +1029,29 @@ export class DebugpyInjector {
 
     try {
       const content = await fs.readFile(activeFile, 'utf-8');
-      const recorded = this.parseActiveFile(content);
+      const recorded = this.parseActiveFile(content, engine);
       if (recorded) {
-        const endpoint = recorded.host
-          ? await this.findListeningEndpoint(recorded.port, undefined, recorded.host)
-          : await this.findListeningEndpoint(recorded.port);
+        // The experimental server lives inside the target process, so require
+        // PID ownership. debugpy listens from its adapter child process and
+        // therefore must continue to resolve by recorded host/port.
+        const endpoint = engine === 'experimental'
+          ? await this.findListeningEndpoint(recorded.port, pid, recorded.host)
+          : recorded.host
+            ? await this.findListeningEndpoint(recorded.port, undefined, recorded.host)
+            : await this.findListeningEndpoint(recorded.port);
         if (endpoint) {
           return endpoint;
         }
         const pidOwnedEndpoint = await this.findListeningEndpoint(recorded.port, pid);
         if (pidOwnedEndpoint) {
           log(
-            `[Injector] Active endpoint host ${recorded.host ?? 'unknown'} for PID=${pid} ` +
+            `[Injector] ${engine} endpoint host ${recorded.host ?? 'unknown'} for PID=${pid} ` +
             `resolved through PID-owned listener ${formatEndpoint(pidOwnedEndpoint)}`
           );
           return pidOwnedEndpoint;
         }
       }
-      // Stale active file — debugpy no longer listening
+      // Stale or incompatible active file — the selected engine is not listening.
       await fs.unlink(activeFile).catch(() => {});
       return null;
     } catch {
@@ -893,18 +1060,31 @@ export class DebugpyInjector {
   }
 
   /**
-   * Check if debugpy is already active for a given PID.
+   * Check if a debug engine is already active for a given PID.
    * Returns the port if active, null otherwise.
    */
-  async getActivePort(pid: number): Promise<number | null> {
-    const endpoint = await this.getActiveEndpoint(pid);
+  async getActivePort(
+    pid: number,
+    engine: DebugEngine = DEFAULT_DEBUG_ENGINE,
+  ): Promise<number | null> {
+    const endpoint = await this.getActiveEndpoint(pid, engine);
     return endpoint?.port ?? null;
   }
 
-  private parseActiveFile(content: string): { host?: string; port: number } | null {
+  private parseActiveFile(
+    content: string,
+    expectedEngine: DebugEngine = DEFAULT_DEBUG_ENGINE,
+  ): { host?: string; port: number } | null {
     const trimmed = content.trim();
     try {
-      const parsed = JSON.parse(trimmed) as { host?: unknown; port?: unknown };
+      const parsed = JSON.parse(trimmed) as { engine?: unknown; host?: unknown; port?: unknown };
+      const recordedEngine = typeof parsed.engine === 'string' ? parsed.engine : undefined;
+      if (recordedEngine !== undefined && recordedEngine !== expectedEngine) {
+        return null;
+      }
+      if (expectedEngine === 'experimental' && recordedEngine !== 'experimental') {
+        return null;
+      }
       if (typeof parsed.port === 'number' && Number.isInteger(parsed.port)) {
         return {
           host: typeof parsed.host === 'string' ? parsed.host : undefined,
@@ -915,29 +1095,46 @@ export class DebugpyInjector {
       // Legacy active files contain only the port.
     }
 
+    if (expectedEngine !== DEFAULT_DEBUG_ENGINE) {
+      return null;
+    }
     const port = parseInt(trimmed, 10);
     return Number.isInteger(port) ? { port } : null;
   }
 
   /**
-   * Activate debugpy in a running Django process by sending SIGUSR1.
-   * Returns the endpoint debugpy is listening on.
+   * Activate a debug engine in a running Django process by sending SIGUSR1.
+   * Returns the endpoint the selected engine is listening on.
    *
-   * If debugpy is already active, returns the existing endpoint.
+   * If that engine is already active, returns the existing endpoint.
    * SAFETY: Will NOT send SIGUSR1 unless the bootstrap module is confirmed
    * importable, because Python's default SIGUSR1 handler terminates the process.
    */
-  async activateEndpoint(pid: number, port: number): Promise<DebugpyEndpoint> {
-    log(`[Injector] Activating debugpy for PID=${pid} port=${port}`);
+  async activateEndpoint(
+    pid: number,
+    port: number,
+    engine: DebugEngine = DEFAULT_DEBUG_ENGINE,
+  ): Promise<DebugpyEndpoint> {
+    log(`[Injector] Activating ${engine} for PID=${pid} port=${port}`);
 
     this.verifyProcessAlive(pid);
     log(`[Injector] Process ${pid} is alive`);
 
-    // Check if debugpy is already active for this PID
-    const existingEndpoint = await this.getActiveEndpoint(pid);
+    // Reuse only the requested engine. A persistent debugpy endpoint must never
+    // be mistaken for the experimental tracer (or vice versa).
+    const existingEndpoint = await this.getActiveEndpoint(pid, engine);
     if (existingEndpoint !== null) {
-      log(`[Injector] debugpy already active for PID=${pid} on ${formatEndpoint(existingEndpoint)}`);
+      log(`[Injector] ${engine} already active for PID=${pid} on ${formatEndpoint(existingEndpoint)}`);
       return existingEndpoint;
+    }
+
+    // The initial native tracer and debugpy both own interpreter tracing state.
+    // Keep them selectable side-by-side, but do not run them simultaneously in
+    // the same target process until coexistence is explicitly supported.
+    const conflictingEngine = otherDebugEngine(engine);
+    const conflictingEndpoint = await this.getActiveEndpoint(pid, conflictingEngine);
+    if (conflictingEndpoint !== null) {
+      throw new DebugEngineConflictError(pid, engine, conflictingEngine, conflictingEndpoint);
     }
 
     // SAFETY: Verify bootstrap is installed before sending SIGUSR1
@@ -967,10 +1164,16 @@ export class DebugpyInjector {
       );
     }
 
-    // Write the desired port to a file the bootstrap will read
-    await fs.mkdir(PORT_FILE_DIR, { recursive: true });
-    await fs.writeFile(portFilePath(pid), String(port), 'utf-8');
-    log(`[Injector] Wrote port file: ${portFilePath(pid)} = ${port}`);
+    // Keep the legacy .port filename, but use a versioned payload. The new
+    // bootstrap also accepts the old bare-integer format as a debugpy request.
+    await ensurePrivatePortFileDir();
+    const activationRequest = { version: 1, engine, port };
+    await fs.writeFile(portFilePath(pid), JSON.stringify(activationRequest), {
+      encoding: 'utf-8',
+      mode: 0o600,
+    });
+    await fs.chmod(portFilePath(pid), 0o600);
+    log(`[Injector] Wrote activation request: ${portFilePath(pid)} = ${JSON.stringify(activationRequest)}`);
 
     // Determine which signal to send: celery overrides SIGUSR1 for log reopen,
     // so we use SIGUSR2 for celery workers and SIGUSR1 for everything else.
@@ -982,26 +1185,36 @@ export class DebugpyInjector {
     try {
       process.kill(pid, signal);
     } catch (err) {
+      await fs.unlink(portFilePath(pid)).catch(() => {});
       logError(`[Injector] Failed to send ${signal} to PID=${pid}`, err);
-      throw new SignalError(pid, err instanceof Error ? err : new Error(String(err)));
+      throw new SignalError(pid, err instanceof Error ? err : new Error(String(err)), signal);
     }
 
     // Wait for the target process to publish a live active endpoint.
-    log(`[Injector] Waiting for debugpy active endpoint on port ${port}...`);
-    const endpoint = await this.waitForActiveEndpoint(pid, port, 5000);
+    log(`[Injector] Waiting for ${engine} active endpoint on port ${port}...`);
+    const endpoint = await this.waitForActiveEndpoint(pid, port, 5000, engine);
     if (!endpoint) {
-      log(`[Injector] Active endpoint for PID=${pid} port=${port} not available after ${signal}`);
-      throw new BootstrapNotLoadedError(pid, port, signal);
+      await fs.unlink(portFilePath(pid)).catch(() => {});
+      const racedConflict = await this.getActiveEndpoint(pid, conflictingEngine);
+      if (racedConflict !== null) {
+        throw new DebugEngineConflictError(pid, engine, conflictingEngine, racedConflict);
+      }
+      log(`[Injector] ${engine} endpoint for PID=${pid} port=${port} not available after ${signal}`);
+      throw new BootstrapNotLoadedError(pid, port, signal, engine);
     }
-    log(`[Injector] debugpy is listening on ${formatEndpoint(endpoint)}`);
+    log(`[Injector] ${engine} is listening on ${formatEndpoint(endpoint)}`);
     return endpoint;
   }
 
   /**
    * Backward-compatible helper for callers that only need the port.
    */
-  async activate(pid: number, port: number): Promise<number> {
-    const endpoint = await this.activateEndpoint(pid, port);
+  async activate(
+    pid: number,
+    port: number,
+    engine: DebugEngine = DEFAULT_DEBUG_ENGINE,
+  ): Promise<number> {
+    const endpoint = await this.activateEndpoint(pid, port, engine);
     return endpoint.port;
   }
 
@@ -1034,11 +1247,23 @@ export class DebugpyInjector {
     try {
       this.verifyProcessAlive(pid);
       const content = await fs.readFile(bootstrapStateFilePath(pid), 'utf-8');
-      const parsed = JSON.parse(content) as { pid?: unknown; version?: unknown };
+      const parsed = JSON.parse(content) as {
+        pid?: unknown;
+        version?: unknown;
+        engines?: unknown;
+        activationVersion?: unknown;
+      };
       if (parsed.pid !== pid || typeof parsed.version !== 'string') {
         return null;
       }
-      return { pid, version: parsed.version };
+      const state: BootstrapRuntimeState = { pid, version: parsed.version };
+      if (Array.isArray(parsed.engines)) {
+        state.engines = parsed.engines.filter(isDebugEngine);
+      }
+      if (typeof parsed.activationVersion === 'number' && Number.isInteger(parsed.activationVersion)) {
+        state.activationVersion = parsed.activationVersion;
+      }
+      return state;
     } catch {
       return null;
     }
@@ -1143,14 +1368,15 @@ export class DebugpyInjector {
     pid: number,
     expectedPort: number,
     timeoutMs: number,
+    engine: DebugEngine = DEFAULT_DEBUG_ENGINE,
   ): Promise<DebugpyEndpoint | null> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const endpoint = await this.getActiveEndpoint(pid);
+      const endpoint = await this.getActiveEndpoint(pid, engine);
       if (endpoint) {
         if (endpoint.port !== expectedPort) {
           log(
-            `[Injector] Reusing existing debugpy endpoint ${formatEndpoint(endpoint)} ` +
+            `[Injector] Reusing existing ${engine} endpoint ${formatEndpoint(endpoint)} ` +
             `for PID=${pid}; requested port was ${expectedPort}`
           );
           await fs.unlink(portFilePath(pid)).catch(() => {});
@@ -1174,9 +1400,25 @@ export class SignalError extends Error {
   constructor(
     public readonly pid: number,
     public readonly cause: Error,
+    public readonly signal: NodeJS.Signals = 'SIGUSR1',
   ) {
-    super(`Failed to send SIGUSR1 to PID ${pid}: ${cause.message}`);
+    super(`Failed to send ${signal} to PID ${pid}: ${cause.message}`);
     this.name = 'SignalError';
+  }
+}
+
+export class DebugEngineConflictError extends Error {
+  constructor(
+    public readonly pid: number,
+    public readonly requestedEngine: DebugEngine,
+    public readonly activeEngine: DebugEngine,
+    public readonly activeEndpoint: DebugpyEndpoint,
+  ) {
+    super(
+      `Cannot activate ${requestedEngine} for PID ${pid} because ${activeEngine} is already active ` +
+      `on ${formatEndpoint(activeEndpoint)}. Restart the target process before switching debug engines.`
+    );
+    this.name = 'DebugEngineConflictError';
   }
 }
 
@@ -1210,9 +1452,10 @@ export class BootstrapNotLoadedError extends Error {
     public readonly pid: number,
     public readonly port: number,
     public readonly signal: NodeJS.Signals = 'SIGUSR1',
+    public readonly engine: DebugEngine = DEFAULT_DEBUG_ENGINE,
   ) {
     super(
-      `Sent ${signal} to PID ${pid} but debugpy did not start listening on port ${port}. ` +
+      `Sent ${signal} to PID ${pid} but ${engine} did not start listening on port ${port}. ` +
       `The Django process was likely not started with the debug bootstrap loaded.`
     );
     this.name = 'BootstrapNotLoadedError';

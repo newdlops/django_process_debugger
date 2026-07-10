@@ -2,7 +2,7 @@
   "name": "django-process-debugger",
   "displayName": "Django Process Debugger",
   "description": "Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase",
-  "version": "0.2.808",
+  "version": "0.2.901",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "icon.png",
@@ -40,15 +40,33 @@
         "configurationAttributes": {
           "attach": {
             "properties": {
+              "pid": {
+                "type": "number",
+                "minimum": 1,
+                "description": "Process ID to activate and attach to"
+              },
               "host": {
                 "type": "string",
                 "default": "127.0.0.1",
-                "description": "Host address of the debugpy server"
+                "description": "Host address of the selected debug engine's DAP server"
               },
               "port": {
                 "type": "number",
                 "default": 5678,
-                "description": "Port of the debugpy server"
+                "description": "Port of the selected debug engine's DAP server"
+              },
+              "engine": {
+                "type": "string",
+                "enum": [
+                  "debugpy",
+                  "experimental"
+                ],
+                "enumDescriptions": [
+                  "Stable debugpy backend (recommended)",
+                  "Experimental built-in tracer with a limited feature set"
+                ],
+                "default": "debugpy",
+                "description": "Debug engine used for this attach session"
               },
               "justMyCode": {
                 "type": "boolean",
@@ -68,6 +86,7 @@
               "name": "Attach to Django Process",
               "host": "127.0.0.1",
               "port": 5678,
+              "engine": "debugpy",
               "justMyCode": true
             }
           }
@@ -77,6 +96,19 @@
     "configuration": {
       "title": "Django Process Debugger",
       "properties": {
+        "djangoProcessDebugger.engine": {
+          "type": "string",
+          "enum": [
+            "debugpy",
+            "experimental"
+          ],
+          "enumDescriptions": [
+            "Stable debugpy backend (recommended)",
+            "Experimental built-in tracer with a limited feature set"
+          ],
+          "default": "debugpy",
+          "description": "Debug engine used for new attach sessions. Restart an already-activated target process before switching engines."
+        },
         "djangoProcessDebugger.justMyCode": {
           "type": "boolean",
           "default": true,

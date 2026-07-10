@@ -4,6 +4,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { getPerf } from './perfReporter';
+import { normalizeDebugEngine } from '../../debugEngine';
 
 /**
  * Lock-file behavior is currently inlined in extension.ts (readLock/writeLock/removeLock).
@@ -47,6 +48,7 @@ describe('Feature: debug session lock-file contract', function () {
     const payload = {
       pid: 12345,
       port: 5678,
+      engine: 'experimental',
       workspaceId: 'abc',
       workspaceName: 'test-workspace',
       timestamp: new Date().toISOString(),
@@ -60,6 +62,28 @@ describe('Feature: debug session lock-file contract', function () {
       readLockForPid(payload.pid),
     { group: 'lock' });
     assert.deepStrictEqual(round, payload);
+  });
+
+  it('keeps one PID-scoped lock across both engines and defaults legacy locks to debugpy', async function () {
+    const pid = 33333;
+    const lockFile = lockFileForPid(pid);
+    const legacyPayload = {
+      pid,
+      port: 5678,
+      workspaceId: 'legacy',
+      workspaceName: 'legacy-workspace',
+      timestamp: new Date().toISOString(),
+    };
+    await fs.writeFile(lockFile, JSON.stringify(legacyPayload), 'utf-8');
+
+    const legacy = await readLockForPid(pid);
+    assert.ok(legacy);
+    assert.strictEqual(normalizeDebugEngine(legacy.engine), 'debugpy');
+
+    const experimentalPayload = { ...legacyPayload, engine: 'experimental' };
+    await fs.writeFile(lockFile, JSON.stringify(experimentalPayload), 'utf-8');
+    assert.strictEqual(lockFileForPid(pid), lockFile, 'engine selection must not create a second lock path');
+    assert.deepStrictEqual(await readLockForPid(pid), experimentalPayload);
   });
 
   it('legacy global lock is ignored for a different target PID', async function () {

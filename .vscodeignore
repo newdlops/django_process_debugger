@@ -1,6 +1,14 @@
 .vscode/**
 .vscode-test/**
 .claude/**
+.codex/**
+.codeidx/**
+.lh/**
+.portmanager/**
+.zoek-rs/**
+.mcp.json
+.DS_Store
+log.txt
 src/**
 node_modules/**
 .git/**
@@ -8,6 +16,8 @@ node_modules/**
 tsconfig.json
 **/*.ts
 **/*.map
+**/*.pyc
+**/__pycache__/**
 .eslintrc*
 *.vsix
 CLAUDE.md

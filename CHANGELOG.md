@@ -2,8 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+- Added `djangoProcessDebugger.engine` with stable `debugpy` as the default and an explicit `experimental` opt-in for the independent native tracer.
+- Added engine-aware attach configuration, status, PID lock metadata, and focused configuration tests.
+- Added a dependency-free experimental DAP tracer with line breakpoints, stack/scopes, read-only variables, stepping, pause, and safe protocol-log redaction.
+
 ### Fixed
 - Attach process picker now shows attachable Django server targets grouped by listener host and port, so parent/child/wrapper processes collapse only when they resolve to the same `host:port`.
+- Experimental tracer state is discarded safely in forked workers so inherited hooks, sockets, and locks cannot suspend a child without a DAP controller.
+- Experimental DAP handles are now stop-scoped and synchronized across threads, with variable paging and bounded message handling.
+- PID debug-session claims are now atomic across VS Code windows and expire with their owning extension host, while Restart safely transfers the same claim.
+
+### Changed
+- Bootstrap version bumped to `2026.07.10.4`. Existing runtimes auto-update on the next attach; restart running Django/Celery processes afterward so the new engine bootstrap is loaded.
 
 ## [0.2.7] - 2026-06-09
 
