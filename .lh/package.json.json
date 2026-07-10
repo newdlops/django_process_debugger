@@ -3,7 +3,7 @@
     "activeCommit": 0,
     "commits": [
         {
-            "activePatchIndex": 9,
+            "activePatchIndex": 16,
             "patches": [
                 {
                     "date": 1782910139567,
@@ -44,6 +44,34 @@
                 {
                     "date": 1783653337837,
                     "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-process-debugger\",\n   \"displayName\": \"Django Process Debugger\",\n   \"description\": \"Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase\",\n-  \"version\": \"0.2.808\",\n+  \"version\": \"0.2.901\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"icon.png\",\n   \"galleryBanner\": {\n@@ -39,18 +39,36 @@\n         \"label\": \"Django Process Debugger\",\n         \"configurationAttributes\": {\n           \"attach\": {\n             \"properties\": {\n+              \"pid\": {\n+                \"type\": \"number\",\n+                \"minimum\": 1,\n+                \"description\": \"Process ID to activate and attach to\"\n+              },\n               \"host\": {\n                 \"type\": \"string\",\n                 \"default\": \"127.0.0.1\",\n-                \"description\": \"Host address of the debugpy server\"\n+                \"description\": \"Host address of the selected debug engine's DAP server\"\n               },\n               \"port\": {\n                 \"type\": \"number\",\n                 \"default\": 5678,\n-                \"description\": \"Port of the debugpy server\"\n+                \"description\": \"Port of the selected debug engine's DAP server\"\n               },\n+              \"engine\": {\n+                \"type\": \"string\",\n+                \"enum\": [\n+                  \"debugpy\",\n+                  \"experimental\"\n+                ],\n+                \"enumDescriptions\": [\n+                  \"Stable debugpy backend (recommended)\",\n+                  \"Experimental built-in tracer with a limited feature set\"\n+                ],\n+                \"default\": \"debugpy\",\n+                \"description\": \"Debug engine used for this attach session\"\n+              },\n               \"justMyCode\": {\n                 \"type\": \"boolean\",\n                 \"default\": true,\n                 \"description\": \"Only debug user-written code\"\n@@ -67,8 +85,9 @@\n               \"request\": \"attach\",\n               \"name\": \"Attach to Django Process\",\n               \"host\": \"127.0.0.1\",\n               \"port\": 5678,\n+              \"engine\": \"debugpy\",\n               \"justMyCode\": true\n             }\n           }\n         ]\n@@ -76,8 +95,21 @@\n     ],\n     \"configuration\": {\n       \"title\": \"Django Process Debugger\",\n       \"properties\": {\n+        \"djangoProcessDebugger.engine\": {\n+          \"type\": \"string\",\n+          \"enum\": [\n+            \"debugpy\",\n+            \"experimental\"\n+          ],\n+          \"enumDescriptions\": [\n+            \"Stable debugpy backend (recommended)\",\n+            \"Experimental built-in tracer with a limited feature set\"\n+          ],\n+          \"default\": \"debugpy\",\n+          \"description\": \"Debug engine used for new attach sessions. Restart an already-activated target process before switching engines.\"\n+        },\n         \"djangoProcessDebugger.justMyCode\": {\n           \"type\": \"boolean\",\n           \"default\": true,\n           \"description\": \"When true, the debugger only steps through your code. When false, it also steps into library/framework code (e.g., Django, Celery internals).\"\n"
+                },
+                {
+                    "date": 1783659222916,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-process-debugger\",\n   \"displayName\": \"Django Process Debugger\",\n   \"description\": \"Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase\",\n-  \"version\": \"0.2.901\",\n+  \"version\": \"0.2.902\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"icon.png\",\n   \"galleryBanner\": {\n"
+                },
+                {
+                    "date": 1783667698307,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-process-debugger\",\n   \"displayName\": \"Django Process Debugger\",\n   \"description\": \"Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase\",\n-  \"version\": \"0.2.902\",\n+  \"version\": \"0.2.903\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"icon.png\",\n   \"galleryBanner\": {\n"
+                },
+                {
+                    "date": 1783671441841,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-process-debugger\",\n   \"displayName\": \"Django Process Debugger\",\n   \"description\": \"Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase\",\n-  \"version\": \"0.2.903\",\n+  \"version\": \"0.2.904\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"icon.png\",\n   \"galleryBanner\": {\n"
+                },
+                {
+                    "date": 1783673368877,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-process-debugger\",\n   \"displayName\": \"Django Process Debugger\",\n   \"description\": \"Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase\",\n-  \"version\": \"0.2.904\",\n+  \"version\": \"0.2.905\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"icon.png\",\n   \"galleryBanner\": {\n"
+                },
+                {
+                    "date": 1783674350084,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-process-debugger\",\n   \"displayName\": \"Django Process Debugger\",\n   \"description\": \"Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase\",\n-  \"version\": \"0.2.905\",\n+  \"version\": \"0.2.906\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"icon.png\",\n   \"galleryBanner\": {\n"
+                },
+                {
+                    "date": 1783679111356,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-process-debugger\",\n   \"displayName\": \"Django Process Debugger\",\n   \"description\": \"Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase\",\n-  \"version\": \"0.2.906\",\n+  \"version\": \"0.2.907\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"icon.png\",\n   \"galleryBanner\": {\n"
+                },
+                {
+                    "date": 1783689972933,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-process-debugger\",\n   \"displayName\": \"Django Process Debugger\",\n   \"description\": \"Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase\",\n-  \"version\": \"0.2.907\",\n+  \"version\": \"0.2.908\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"icon.png\",\n   \"galleryBanner\": {\n"
                 }
             ],
             "date": 1782910139567,

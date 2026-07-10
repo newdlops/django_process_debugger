@@ -3,9 +3,8 @@ real Django/ASGI apps use:
 
   URLCONF   — dict of callable (mirrors Django's `path(..., view_func)` flow
               where the view function is stored in the URL resolver).
-              This pattern exposes a hot-reload LIMITATION: the dict holds
-              the OLD function object, so `URLCONF['/']()` keeps returning
-              old values even after reload of views.py.
+              Deep reload tracks every still-live function generation, so the
+              captured object continues receiving new code across reloads.
 
   SAVED_CLASS — direct reference to a class (mirrors `path(..., MyView.as_view())`
               where the class survives in the resolver). Deep-reload patches

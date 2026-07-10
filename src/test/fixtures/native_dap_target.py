@@ -13,7 +13,14 @@ sys.path.insert(0, sys.argv[1])
 from django_process_debugger_tracer import start
 
 
+GLOBAL_VALUE = 5
+SHADOWED_VALUE = "global"
+
+
 class DangerousValue:
+    def __init__(self):
+        self.state = "original"
+
     def __repr__(self):
         raise RuntimeError("application repr must not run in debugger")
 
@@ -21,11 +28,53 @@ class DangerousValue:
         raise RuntimeError("application str must not run in debugger")
 
 
+class LazyValue:
+    __slots__ = ("_calls", "label")
+
+    def __init__(self, calls):
+        self._calls = calls
+        self.label = "ready"
+
+    def __repr__(self):
+        self._calls.append(("repr", threading.current_thread().name))
+        return "LazyValue(label={!r})".format(self.label)
+
+    def __str__(self):
+        self._calls.append(("str", threading.current_thread().name))
+        return "lazy:{}".format(self.label)
+
+    @property
+    def worker_name(self):
+        self._calls.append(("property", threading.current_thread().name))
+        return threading.current_thread().name
+
+    @property
+    def structured(self):
+        self._calls.append(("structured", threading.current_thread().name))
+        return [self.label, threading.current_thread().name]
+
+    @property
+    def runtime_error(self):
+        self._calls.append(("runtime_error", threading.current_thread().name))
+        raise RuntimeError("lazy property failed")
+
+    @property
+    def system_exit(self):
+        self._calls.append(("system_exit", threading.current_thread().name))
+        raise SystemExit("lazy property must not escape")
+
+
 def calculate(seed):
+    SHADOWED_VALUE = "local"
     payload = {"seed": seed, "items": [seed, seed + 1]}
     large = list(range(500))
     total = sum(payload["items"])
-    dangerous = DangerousValue()
+    condition_false_probe = None  # CONDITION_FALSE
+    dangerous = DangerousValue()  # CONDITION_ERROR
+    lazy_calls = []
+    lazy_value = LazyValue(lazy_calls)
+    for hit_index in range(1, 5):
+        hit_probe = hit_index  # HIT_LOGPOINT
     result = total * 2  # BREAKPOINT
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:

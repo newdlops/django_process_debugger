@@ -11,7 +11,8 @@ Protocol:
   2. Watcher polls every RELOAD_POLL_SEC seconds.
   3. On each pass, if the .reload file exists, it is read and unlinked; paths
      are matched to loaded modules by __file__, and each is deep-reloaded.
-  4. Results written to /tmp/django-process-debugger/PID.reload.result:
+  4. A v2 JSON result envelope is atomically published at
+     /tmp/django-process-debugger/PID.reload.result. Its ``results`` rows are:
        OK:module.name (patched: ClassA.method1, ClassA.method2)
        ERR:module.name:Exception text
        SKIP:/absolute/path
@@ -19,14 +20,14 @@ Protocol:
 Deep-reload semantics (must match bootstrap):
   - BEFORE importlib.reload, walk mod.__dict__ and follow __wrapped__ AND
     __closure__ cells to collect every function whose __code__.co_filename ==
-    mod.__file__. Index by co_qualname so OLD/NEW pair by identity across
-    reload even if the decorator chain reshapes the object graph.
+    mod.__file__. Track all still-live generations weakly by logical + compiled
+    qualname so objects captured after any earlier reload remain patchable.
   - importlib.reload(mod) rebinds mod attributes to fresh objects.
   - Walk NEW mod.__dict__ the same way → {qualname: new_fn}.
-  - For each qualname, overwrite OLD.__code__ / __defaults__ / __kwdefaults__
-    / __dict__ in place. Outside holders (Django URL conf / GraphQL schema /
-    Celery registry) keep the SAME object and dispatch through the fresh
-    bytecode on next call.
+  - For each qualname, overwrite every live OLD generation's __code__ /
+    __defaults__ / __kwdefaults__ / __dict__ in place. Outside holders (Django
+    URL conf / GraphQL schema / Celery registry) keep the SAME object and
+    dispatch through the fresh bytecode on next call.
 
 Usage:
     python hot_reload_harness.py APP_DIR [MODULE_TO_PREIMPORT ...]
@@ -35,6 +36,8 @@ Special stdin commands (for testing externally held references):
     CALL <python-expression>   -> print repr(eval(expr))
 """
 import importlib
+import importlib.util
+import json
 import linecache
 import os
 import signal
@@ -43,6 +46,7 @@ import threading
 import time
 import traceback
 import types
+import weakref
 
 PORT_FILE_DIR = '/tmp/django-process-debugger'
 RELOAD_POLL_SEC = 0.05  # tighter than real bootstrap (0.3s) so tests are fast
@@ -52,15 +56,29 @@ RELOAD_POLL_SEC = 0.05  # tighter than real bootstrap (0.3s) so tests are fast
 _watcher_paused = threading.Event()
 
 
-# Persistent storage of original function refs per module. Mirrors the
-# bootstrap: we snapshot once and keep patching those same objects in place on
-# every subsequent reload so externally held references stay live.
+# Weak storage of every function generation observed for each module. A single
+# "original" snapshot is insufficient: application registries can capture the
+# fresh objects installed by any later importlib.reload(). WeakSet keeps those
+# generations patchable while an application still references them without
+# retaining otherwise-dead reload generations forever.
 _original_mod_funcs: dict = {}
 
 
 def _code_key(code):
     qn = getattr(code, 'co_qualname', None)
     return qn if qn else code.co_name
+
+
+def _function_key(fn):
+    """Pair logical and compiled qualnames across reload generations.
+
+    functools.wraps copies function.__qualname__ onto its wrapper but leaves
+    code.co_qualname intact. Keeping both prevents a wrapper and its wrapped
+    function from collapsing into the same registry entry.
+    """
+    code_name = _code_key(fn.__code__)
+    logical_name = getattr(fn, '__qualname__', None)
+    return (logical_name or code_name, code_name)
 
 
 def _walk_reachable(start_values):
@@ -102,9 +120,9 @@ def _walk_reachable(start_values):
 def _deep_reload_module(mod):
     """Mirror of the bootstrap's deep-reload.
 
-    Walks closures (not just __wrapped__) and pairs OLD/NEW by co_qualname so
-    decorator chains without @functools.wraps still get their inner user
-    function patched in place. Returns the patched qualnames.
+    Walks closures (not just __wrapped__) and pairs OLD/NEW by logical + code
+    qualname so decorator chains without @functools.wraps still get their inner
+    user function patched in place. Returns the patched logical qualnames.
     """
     mod_name = mod.__name__
     mod_file = getattr(mod, '__file__', None)
@@ -127,12 +145,44 @@ def _deep_reload_module(mod):
             c = fn.__code__
             if not _in_this_file(c):
                 continue
-            idx.setdefault(_code_key(c), fn)
+            # A decorator factory can create several wrapper objects with the
+            # same co_qualname. Keep every object instead of silently dropping
+            # all but the first generation/member.
+            idx.setdefault(_function_key(fn), []).append(fn)
         return idx
 
-    if mod_name not in _original_mod_funcs:
-        _original_mod_funcs[mod_name] = _index(mod)
+    tracked = _original_mod_funcs.setdefault(mod_name, {})
 
+    def _track(index):
+        for qn, functions in index.items():
+            generations = tracked.setdefault(qn, weakref.WeakSet())
+            for fn in functions:
+                generations.add(fn)
+
+    # Register the generation currently exposed by the module before reload.
+    # It may have been installed by an earlier reload and captured by Django,
+    # GraphQL, Celery, or another application registry since then.
+    # Keep the pre-reload index strongly reachable until patching completes.
+    # Otherwise functions with no external holder can disappear from WeakSet
+    # as soon as importlib.reload() replaces the module attribute.
+    current_fns = _index(mod)
+    _track(current_fns)
+
+    cached_file = getattr(mod, '__cached__', None)
+    canonical_cached_file = None
+    if type(mod_file) is str:
+        try:
+            canonical_cached_file = importlib.util.cache_from_source(mod_file)
+        except Exception:  # noqa: BLE001
+            pass
+    if type(canonical_cached_file) is str:
+        try:
+            os.unlink(canonical_cached_file)
+        except FileNotFoundError:
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+    importlib.invalidate_caches()
     importlib.reload(mod)
 
     try:
@@ -143,41 +193,116 @@ def _deep_reload_module(mod):
         pass
 
     new_fns = _index(mod)
-    patched = []
-    orig_map = _original_mod_funcs[mod_name]
-    for qn, old_fn in list(orig_map.items()):
-        new_fn = new_fns.get(qn)
-        if new_fn is None or new_fn is old_fn:
+    patched = set()
+    for function_key, generations in list(tracked.items()):
+        candidates = new_fns.get(function_key)
+        if not candidates:
             continue
-        try:
-            old_fn.__code__ = new_fn.__code__
-            old_fn.__defaults__ = new_fn.__defaults__
-            old_fn.__kwdefaults__ = getattr(new_fn, '__kwdefaults__', None)
-            old_fn.__dict__.update(new_fn.__dict__)
-            patched.append(qn)
-        except Exception:  # noqa: BLE001
-            pass
+        # Functions sharing a code qualname (notably repeated decorator
+        # wrappers) execute equivalent code. Their closure-held inner
+        # functions are tracked under their own qualnames and patched below.
+        new_fn = candidates[0]
+        for old_fn in list(generations):
+            if any(old_fn is candidate for candidate in candidates):
+                continue
+            try:
+                old_fn.__code__ = new_fn.__code__
+                old_fn.__defaults__ = new_fn.__defaults__
+                old_fn.__kwdefaults__ = getattr(new_fn, '__kwdefaults__', None)
+                old_fn.__dict__.update(new_fn.__dict__)
+                old_fn.__annotations__ = dict(
+                    getattr(new_fn, '__annotations__', {}),
+                )
+                old_fn.__doc__ = new_fn.__doc__
+                patched.add(function_key[0])
+            except Exception:  # noqa: BLE001
+                pass
 
-    for qn, new_fn in new_fns.items():
-        orig_map.setdefault(qn, new_fn)
+    # Track the newly installed generation immediately. This also covers a
+    # caller that captures it and then replaces/deletes the module attribute
+    # before the next reload scan.
+    _track(new_fns)
 
-    return patched
+    return sorted(patched)
 
 
 def _reload_watcher(pid: int) -> None:
     reload_file = f"{PORT_FILE_DIR}/{pid}.reload"
+    processing_file = f"{reload_file}.processing"
     result_file = f"{PORT_FILE_DIR}/{pid}.reload.result"
+
+    def publish_result(request_id, results):
+        result_tmp = f"{result_file}.{threading.get_ident()}.tmp"
+        payload = (
+            json.dumps({
+                'version': 2,
+                'requestId': request_id,
+                'results': results,
+            })
+            if request_id is not None
+            else '\n'.join(results)
+        )
+        try:
+            with open(result_tmp, 'w', encoding='utf-8') as f:
+                f.write(payload)
+            try:
+                os.chmod(result_tmp, 0o600)
+            except Exception:  # noqa: BLE001
+                pass
+            os.replace(result_tmp, result_file)
+        finally:
+            try:
+                os.unlink(result_tmp)
+            except FileNotFoundError:
+                pass
+
+    def clear_claim():
+        try:
+            os.unlink(processing_file)
+        except FileNotFoundError:
+            pass
+
     while True:
+        request_id = None
+        claimed = False
         try:
             time.sleep(RELOAD_POLL_SEC)
             if _watcher_paused.is_set():
                 continue  # simulates debugpy all-threads-stopped
-            if not os.path.exists(reload_file):
+
+            try:
+                os.replace(reload_file, processing_file)
+                claimed = True
+            except FileNotFoundError:
                 continue
-            with open(reload_file, 'r', encoding='utf-8') as f:
-                paths = [p.strip() for p in f.read().strip().split('\n') if p.strip()]
-            os.unlink(reload_file)
+
+            with open(processing_file, 'r', encoding='utf-8') as f:
+                raw_request = f.read()
+
+            try:
+                request = json.loads(raw_request)
+            except Exception:  # noqa: BLE001
+                if raw_request.lstrip().startswith('{'):
+                    raise
+                request = None
+            if isinstance(request, dict) and request.get('version') == 2:
+                request_id = request.get('requestId')
+                paths = request.get('paths')
+                if not isinstance(request_id, str) or not isinstance(paths, list):
+                    raise ValueError('Invalid hot reload v2 request')
+                if not all(isinstance(item, str) for item in paths):
+                    raise ValueError('Invalid hot reload path')
+                paths = [item for item in paths if item]
+            else:
+                paths = [
+                    item.strip()
+                    for item in raw_request.strip().split('\n')
+                    if item.strip()
+                ]
             if not paths:
+                publish_result(request_id, [])
+                clear_claim()
+                claimed = False
                 continue
 
             importlib.invalidate_caches()
@@ -204,11 +329,25 @@ def _reload_watcher(pid: int) -> None:
                 if not found:
                     results.append(f"SKIP:{fpath}")
 
-            with open(result_file, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(results))
+            publish_result(request_id, results)
+            clear_claim()
+            claimed = False
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"[harness] watcher error: {e}\n")
             sys.stderr.flush()
+            try:
+                publish_result(
+                    request_id,
+                    [f"ERR:protocol:{type(e).__name__}:{e}"],
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                if claimed:
+                    try:
+                        clear_claim()
+                    except Exception:  # noqa: BLE001
+                        pass
 
 
 def _stdin_evaluator() -> None:

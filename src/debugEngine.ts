@@ -16,6 +16,6 @@ export function debugEngineDisplayName(engine: DebugEngine): string {
   return engine === 'experimental' ? 'Experimental Native Tracer' : 'debugpy';
 }
 
-export function supportsHotReload(engine: DebugEngine): boolean {
-  return engine === 'debugpy';
+export function supportsHotReload(_engine: DebugEngine): boolean {
+  return true;
 }

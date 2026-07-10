@@ -26,9 +26,41 @@ import signal
 import sys
 import threading
 import traceback
+import types
 
 sys.path.insert(0, sys.argv[1])
 import django_process_debugger_tracer as tracer_module
+
+
+class ForkSignal:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.connect_calls = []
+        self.disconnect_calls = []
+
+    def connect(self, receiver, weak=True, dispatch_uid=None):
+        with self.lock:
+            self.connect_calls.append((receiver, weak, dispatch_uid))
+
+    def disconnect(self, receiver=None, dispatch_uid=None):
+        # This lock is deliberately owned by a vanished thread in the child.
+        # Calling disconnect from the at-fork reset would deadlock forever.
+        with self.lock:
+            self.disconnect_calls.append((receiver, dispatch_uid))
+        return True
+
+
+fork_signal = ForkSignal()
+signals_module = types.ModuleType("django.core.signals")
+signals_module.got_request_exception = fork_signal
+handler_module = types.ModuleType("django.core.handlers.exception")
+
+def response_for_exception(request, exc):
+    return request, exc
+
+handler_module.response_for_exception = response_for_exception
+sys.modules["django.core.signals"] = signals_module
+sys.modules["django.core.handlers.exception"] = handler_module
 
 endpoint = tracer_module.start("127.0.0.1", 0)
 inherited = tracer_module._ACTIVE_TRACER
@@ -36,6 +68,19 @@ inherited.configured = True
 inherited.breakpoints = {"inherited.py": {10}}
 inherited.steps = {123: ("next", 4)}
 inherited_server = inherited.server
+previous_sys_excepthook = sys.excepthook
+previous_threading_excepthook = threading.excepthook
+with inherited.condition:
+    inherited._install_uncaught_exception_hooks_locked()
+    inherited._install_django_exception_signal_locked()
+inherited.exception_filters = {"uncaught", "djangoRequestUnhandled"}
+inherited_django_receiver = inherited.django_exception_receiver
+django_receiver_calls = []
+
+def handle_django_exception(*args):
+    django_receiver_calls.append(args)
+
+inherited._handle_django_request_exception = handle_django_exception
 old_condition = inherited.condition
 old_send_lock = inherited.send_lock
 old_active_lock = tracer_module._ACTIVE_LOCK
@@ -44,10 +89,11 @@ locks_held = threading.Event()
 release_locks = threading.Event()
 
 def hold_inherited_locks():
-    with tracer_module._ACTIVE_LOCK:
-        with inherited.condition:
-            locks_held.set()
-            release_locks.wait(10)
+    with fork_signal.lock:
+        with tracer_module._ACTIVE_LOCK:
+            with inherited.condition:
+                locks_held.set()
+                release_locks.wait(10)
 
 holder = threading.Thread(target=hold_inherited_locks, daemon=True)
 holder.start()
@@ -60,6 +106,9 @@ if child_pid == 0:
     os.close(read_fd)
     result = {}
     try:
+        # The saved inherited receiver must become inert through its lock-free
+        # PID guard even though it is still registered in the child's Signal.
+        inherited_django_receiver(request=object())
         result.update({
             "active_cleared": tracer_module._ACTIVE_TRACER is None,
             "active_lock_replaced": tracer_module._ACTIVE_LOCK is not old_active_lock,
@@ -69,6 +118,22 @@ if child_pid == 0:
             "old_server_fd_closed": inherited_server.fileno() == -1,
             "current_trace_cleared": sys.gettrace() is None,
             "future_trace_cleared": tracer_module._existing_thread_trace_hook() is None,
+            "exception_hooks_restored": (
+                sys.excepthook is previous_sys_excepthook
+                and threading.excepthook is previous_threading_excepthook
+            ),
+            "exception_hook_state_cleared": (
+                inherited.sys_exception_hook is None
+                and inherited.threading_exception_hook is None
+            ),
+            "django_signal_disconnect_skipped": fork_signal.disconnect_calls == [],
+            "django_signal_state_cleared": (
+                inherited.django_exception_signal is None
+                and inherited.django_exception_receiver is None
+                and inherited.django_exception_dispatch_uid is None
+                and inherited.django_response_for_exception_code is None
+            ),
+            "inherited_django_receiver_inert": django_receiver_calls == [],
             "condition_replaced": inherited.condition is not old_condition,
             "send_lock_replaced": inherited.send_lock is not old_send_lock,
             "breakpoints_cleared": inherited.breakpoints == {},
@@ -101,6 +166,15 @@ try:
     parent_result = {
         "parent_tracer_preserved": tracer_module._ACTIVE_TRACER is inherited and inherited.enabled,
         "parent_listener_preserved": inherited.server is inherited_server and inherited_server.fileno() >= 0,
+        "parent_exception_hooks_preserved": (
+            sys.excepthook is inherited.sys_exception_hook
+            and threading.excepthook is inherited.threading_exception_hook
+        ),
+        "parent_django_receiver_preserved": (
+            inherited.django_exception_signal is fork_signal
+            and inherited.django_exception_receiver is inherited_django_receiver
+            and fork_signal.disconnect_calls == []
+        ),
         "child_exited_cleanly": os.WIFEXITED(child_status) and os.WEXITSTATUS(child_status) == 0,
     }
     print(json.dumps({"child": child_result, "parent": parent_result}, sort_keys=True))

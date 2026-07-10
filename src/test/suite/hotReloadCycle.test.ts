@@ -136,6 +136,7 @@ describe('Feature: hot reload full cycle (harness)', function () {
   const appDir = fixturesDir();
   const viewsPath = path.join(appDir, 'sampleapp', 'views.py');
   const modelsPath = path.join(appDir, 'sampleapp', 'models.py');
+  const slowReloadPath = path.join(appDir, 'sampleapp', 'slow_reload.py');
   const originalViews = fsSync.readFileSync(viewsPath, 'utf-8');
   const originalModels = fsSync.readFileSync(modelsPath, 'utf-8');
 
@@ -151,6 +152,7 @@ describe('Feature: hot reload full cycle (harness)', function () {
     harness = await startHarness(python, appDir, [
       'sampleapp.views',
       'sampleapp.models',
+      'sampleapp.slow_reload',
     ]);
   });
 
@@ -161,6 +163,7 @@ describe('Feature: hot reload full cycle (harness)', function () {
     if (harness) { await harness.stop(); }
     if (harness) {
       await fs.unlink(path.join(PORT_FILE_DIR, `${harness.pid}.reload`)).catch(() => {});
+      await fs.unlink(path.join(PORT_FILE_DIR, `${harness.pid}.reload.processing`)).catch(() => {});
       await fs.unlink(path.join(PORT_FILE_DIR, `${harness.pid}.reload.result`)).catch(() => {});
     }
   });
@@ -170,6 +173,7 @@ describe('Feature: hot reload full cycle (harness)', function () {
     await fs.writeFile(viewsPath, originalViews, 'utf-8');
     await fs.writeFile(modelsPath, originalModels, 'utf-8');
     await fs.unlink(path.join(PORT_FILE_DIR, `${harness.pid}.reload`)).catch(() => {});
+    await fs.unlink(path.join(PORT_FILE_DIR, `${harness.pid}.reload.processing`)).catch(() => {});
     await fs.unlink(path.join(PORT_FILE_DIR, `${harness.pid}.reload.result`)).catch(() => {});
   });
 
@@ -245,6 +249,120 @@ describe('Feature: hot reload full cycle (harness)', function () {
     assert.strictEqual(ok.length, 2, `expected 2 OK lines, got ${JSON.stringify(result)}`);
     assert.ok(ok.some((r) => r.startsWith('OK:sampleapp.views')));
     assert.ok(ok.some((r) => r.startsWith('OK:sampleapp.models')));
+  });
+
+  it('keeps a slow claimed request pending until its result is published', async function () {
+    if (!harness) { this.skip(); return; }
+    this.timeout(12_000);
+
+    const requestId = await injector.requestHotReload(harness.pid, [slowReloadPath]);
+    assert.ok(requestId);
+    const early = await injector.pollReloadResult(
+      harness.pid,
+      3_000,
+      20,
+      requestId ?? undefined,
+    );
+    assert.strictEqual(early, null);
+    await fs.access(path.join(PORT_FILE_DIR, `${harness.pid}.reload.processing`));
+    assert.strictEqual(
+      await injector.isReloadPending(harness.pid, requestId ?? undefined),
+      true,
+    );
+
+    const result = await injector.pollReloadResult(
+      harness.pid,
+      5_000,
+      20,
+      requestId ?? undefined,
+    );
+    assert.ok(result?.some((row) => row.startsWith('OK:sampleapp.slow_reload')));
+    await assert.rejects(
+      fs.access(path.join(PORT_FILE_DIR, `${harness.pid}.reload.processing`)),
+    );
+  });
+
+  it('recompiles same-size edits while preserving a non-canonical __cached__ path', async function () {
+    if (!harness) { this.skip(); return; }
+    this.timeout(15_000);
+
+    const sentinel = path.join(
+      PORT_FILE_DIR,
+      `hot-reload-cache-sentinel-${harness.pid}.txt`,
+    );
+    const cacheDir = path.join(appDir, 'sampleapp', '__pycache__');
+    const clearViewsBytecode = async (): Promise<void> => {
+      let entries: string[];
+      try {
+        entries = await fs.readdir(cacheDir);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') { return; }
+        throw error;
+      }
+      await Promise.all(
+        entries
+          .filter((entry) => /^views\..*\.pyc$/.test(entry))
+          .map((entry) => fs.unlink(path.join(cacheDir, entry))),
+      );
+    };
+    const v2Source = originalViews.replace("'direct v1'", "'direct v2'");
+    const v3Source = originalViews.replace("'direct v1'", "'direct v3'");
+    const fixedTimestamp = 1_700_000_000;
+
+    assert.strictEqual(Buffer.byteLength(v2Source), Buffer.byteLength(originalViews));
+    assert.strictEqual(Buffer.byteLength(v3Source), Buffer.byteLength(originalViews));
+
+    await fs.writeFile(sentinel, 'keep me', 'utf-8');
+    try {
+      await clearViewsBytecode();
+      await fs.writeFile(viewsPath, originalViews, 'utf-8');
+      await fs.utimes(viewsPath, fixedTimestamp, fixedTimestamp);
+      assert.strictEqual(
+        await harness.call('(importlib.invalidate_caches(), importlib.reload(views).greet())[1]'),
+        "'direct v1'",
+      );
+      await harness.call("globals().__setitem__('saved_cache_v1', views.greet)");
+      await harness.call("__import__('py_compile').compile(views.__file__, doraise=True)");
+
+      await harness.call(
+        `setattr(views, "__cached__", ${JSON.stringify(sentinel)})`,
+      );
+      await fs.writeFile(viewsPath, v2Source, 'utf-8');
+      await fs.utimes(viewsPath, fixedTimestamp, fixedTimestamp);
+      const firstRequestId = await injector.requestHotReload(harness.pid, [viewsPath]);
+      const firstResult = await injector.pollReloadResult(
+        harness.pid,
+        3_000,
+        20,
+        firstRequestId ?? undefined,
+      );
+      assert.ok(firstResult?.some((row) => row.startsWith('OK:sampleapp.views')));
+      assert.strictEqual(await harness.call('views.greet()'), "'direct v2'");
+      assert.strictEqual(await harness.call('saved_cache_v1()'), "'direct v2'");
+
+      await harness.call("globals().__setitem__('saved_cache_v2', views.greet)");
+      await harness.call("__import__('py_compile').compile(views.__file__, doraise=True)");
+      await harness.call(
+        `setattr(views, "__cached__", ${JSON.stringify(sentinel)})`,
+      );
+      await fs.writeFile(viewsPath, v3Source, 'utf-8');
+      await fs.utimes(viewsPath, fixedTimestamp, fixedTimestamp);
+      const secondRequestId = await injector.requestHotReload(harness.pid, [viewsPath]);
+      const secondResult = await injector.pollReloadResult(
+        harness.pid,
+        3_000,
+        20,
+        secondRequestId ?? undefined,
+      );
+      assert.ok(secondResult?.some((row) => row.startsWith('OK:sampleapp.views')));
+      assert.strictEqual(await harness.call('views.greet()'), "'direct v3'");
+      assert.strictEqual(await harness.call('saved_cache_v1()'), "'direct v3'");
+      assert.strictEqual(await harness.call('saved_cache_v2()'), "'direct v3'");
+      assert.strictEqual(await fs.readFile(sentinel, 'utf-8'), 'keep me');
+    } finally {
+      await clearViewsBytecode();
+      await fs.unlink(sentinel).catch(() => {});
+    }
   });
 
   it('consumes the request file within the watcher poll interval', async function () {
@@ -400,8 +518,8 @@ describe('Feature: hot reload reference semantics (Django/ASGI scenarios)', func
     //
     // NOTE: this used to be documented as a LIMITATION of plain importlib.
     // reload — it still is, but the bootstrap adds a layer on top that
-    // solves it for module-level functions. See
-    // `_original_mod_funcs` in makeBootstrapScript.
+    // solves it for module-level functions and every still-live generation.
+    // See `_original_mod_funcs` in makeBootstrapScript.
     const before = await harness.call('urls.call_urlconf()');
     assert.strictEqual(before, "'direct v1'");
 
@@ -417,6 +535,23 @@ describe('Feature: hot reload reference semantics (Django/ASGI scenarios)', func
     const afterViewsOnly = await harness.call('urls.call_urlconf()');
     assert.strictEqual(afterViewsOnly, "'direct via-code-patch'",
       'URLCONF dict holds the ORIGINAL greet object; bootstrap patches that object in place');
+
+    // Keep a reference to the generation created by the first edit and reload
+    // once more. The URLCONF generation and this newer generation must both be
+    // patched, proving tracking is not limited to a single original snapshot.
+    await harness.call('globals().__setitem__("saved_greet_generation_two", views.greet)');
+    await fs.writeFile(
+      viewsPath,
+      originalViews.replace("'direct v1'", "'direct all-generations'"),
+      'utf-8',
+    );
+    await injector.requestHotReload(harness.pid, [viewsPath]);
+    const nextResult = await pollForResult(harness.pid, 3_000);
+    assert.ok(nextResult?.some((r) => r.startsWith('OK:sampleapp.views')));
+    assert.strictEqual(await harness.call('urls.call_urlconf()'), "'direct all-generations'",
+      'the URLCONF-held generation must continue advancing after more than one reload');
+    assert.strictEqual(await harness.call('saved_greet_generation_two()'), "'direct all-generations'",
+      'a function captured from a later reload generation must advance as well');
   });
 
   it('LIMITATION: top-level constants rebound but prior by-value copies are stale', async function () {

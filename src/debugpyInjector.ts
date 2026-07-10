@@ -22,7 +22,7 @@ const TRACER_SOURCE_PATH = path.resolve(
   'python',
   'django_process_debugger_tracer.py',
 );
-export const BOOTSTRAP_VERSION = '2026.07.10.4';
+export const BOOTSTRAP_VERSION = '2026.07.10.9';
 export type DebugpyEndpoint = TcpListeningEndpoint;
 type BootstrapRuntimeState = {
   pid: number;
@@ -30,6 +30,12 @@ type BootstrapRuntimeState = {
   engines?: DebugEngine[];
   activationVersion?: number;
 };
+type HotReloadResultPayload = {
+  requestId?: string;
+  results: string[];
+};
+
+let hotReloadRequestSequence = 0;
 
 function pythonProbeEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
@@ -83,8 +89,47 @@ function reloadFilePath(pid: number): string {
   return `${PORT_FILE_DIR}/${pid}.reload`;
 }
 
+function reloadProcessingFilePath(pid: number): string {
+  return `${reloadFilePath(pid)}.processing`;
+}
+
 function reloadResultFilePath(pid: number): string {
   return `${PORT_FILE_DIR}/${pid}.reload.result`;
+}
+
+function isFsError(error: unknown, code: string): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === code;
+}
+
+function nextHotReloadRequestId(pid: number): string {
+  hotReloadRequestSequence += 1;
+  return `${pid}-${process.pid}-${Date.now().toString(36)}-${hotReloadRequestSequence.toString(36)}`;
+}
+
+function parseHotReloadResult(content: string): HotReloadResultPayload {
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    if (typeof parsed === 'object' && parsed !== null) {
+      const candidate = parsed as Record<string, unknown>;
+      if (
+        candidate.version === 2
+        && typeof candidate.requestId === 'string'
+        && Array.isArray(candidate.results)
+        && candidate.results.every((entry) => typeof entry === 'string')
+      ) {
+        return {
+          requestId: candidate.requestId,
+          results: candidate.results as string[],
+        };
+      }
+    }
+  } catch {
+    // Legacy bootstrap results are newline-delimited. Keep reading those so
+    // an attach can report a useful result while a process restart is pending.
+  }
+  return {
+    results: content.trim().split('\n').filter(Boolean),
+  };
 }
 
 function bootstrapStateFilePath(pid: number): string {
@@ -217,19 +262,23 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '        if _register_at_fork is not None:',
     '            _register_at_fork(after_in_child=_reset_bootstrap_after_fork)',
     '',
-    '        # Persistent storage: keeps references to the ORIGINAL functions',
-    '        # (before any reload) so we always patch the ones Django actually calls.',
-    '        # Keyed by module name -> {co_qualname: function_object}.',
+    '        # Persistent weak registry of every still-live function generation.',
+    '        # Django/GraphQL/Celery may capture a new module generation after any',
+    '        # reload, so retaining only the pre-first-reload objects is insufficient.',
+    '        # Keyed by module name -> {function_key: WeakSet(function_object)}.',
     '        _original_mod_funcs = {}',
     '',
     '        def _start_hot_reload_watcher():',
     '            """Start a daemon thread that watches for module reload requests."""',
     '            import threading',
     '            import importlib',
+    '            import importlib.util',
+    '            import json',
     '            import time',
     '',
     '            _pid = _os.getpid()',
     '            _reload_file = f"{_PORT_FILE_DIR}/{_pid}.reload"',
+    '            _reload_processing_file = _reload_file + ".processing"',
     '            _reload_result_file = f"{_PORT_FILE_DIR}/{_pid}.reload.result"',
     '',
     '            # ── Suppress Django autoreloader restarts (multi-layer) ──',
@@ -251,7 +300,11 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                def _suppress_autoreload(sender, file_path, **kwargs):',
     '                    _dbg_log(f"Autoreload suppressed (signal): {file_path}")',
     '                    return True',
-    '                _file_changed_signal.connect(_suppress_autoreload)',
+    '                _file_changed_signal.connect(',
+    '                    _suppress_autoreload,',
+    '                    weak=False,',
+    '                    dispatch_uid="django-process-debugger-hot-reload",',
+    '                )',
     '                _dbg_log("Django file_changed signal handler registered")',
     '            except Exception as _e:',
     '                _dbg_log(f"Could not register file_changed handler: {_e}")',
@@ -283,10 +336,9 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                     __code__.co_filename matches mod.__file__ belongs to',
     '                     this module regardless of where the outer wrapper',
     '                     was defined.',
-    '                  2. Index those functions by co_qualname so we can pair',
-    '                     OLD and NEW counterparts even if the decorator chain',
-    '                     reshapes the object graph.',
-    '                  3. Patch OLD.__code__ / __defaults__ / __kwdefaults__ /',
+    '                  2. Index those functions by logical + code qualname and',
+    '                     weakly track every live reload generation.',
+    '                  3. Patch every live OLD.__code__ / __defaults__ / __kwdefaults__ /',
     '                     __dict__ from the matching NEW function.',
     '',
     '                Externally held references (Django URL conf, GraphQL schema,',
@@ -294,6 +346,7 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                but the next call dispatches through the fresh bytecode."""',
     '                import types',
     '                import os',
+    '                import weakref',
     '',
     '                _mod_name = _mod.__name__',
     '                _mod_file = getattr(_mod, "__file__", None)',
@@ -309,6 +362,14 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                    # within a file; fall back to co_name on older runtimes.',
     '                    _qn = getattr(_code, "co_qualname", None)',
     '                    return _qn if _qn else _code.co_name',
+    '',
+    '                def _function_key(_fn):',
+    '                    # functools.wraps copies function.__qualname__ but not',
+    '                    # code.co_qualname. Keeping both distinguishes wrapper',
+    '                    # and wrapped functions while pairing generations.',
+    '                    _logical = getattr(_fn, "__qualname__", None)',
+    '                    _code_name = _code_key(_fn.__code__)',
+    '                    return ((_logical or _code_name), _code_name)',
     '',
     '                def _is_in_this_file(_code):',
     '                    if _mod_real is None:',
@@ -358,31 +419,69 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                                            _stack.append(_acc)',
     '',
     '                def _index_module_functions(_target_mod):',
-    '                    """Return {co_qualname: function_object} for functions',
-    '                    reachable from _target_mod.__dict__ whose code is in',
-    '                    this module file."""',
+    '                    """Return {function_key: [all reachable functions]}."""',
     '                    _idx = {}',
     '                    for _fn in _walk_reachable(list(_target_mod.__dict__.values())):',
     '                        _c = _fn.__code__',
     '                        if not _is_in_this_file(_c):',
     '                            continue',
-    '                        _idx.setdefault(_code_key(_c), _fn)',
+    '                        _idx.setdefault(_function_key(_fn), []).append(_fn)',
     '                    return _idx',
     '',
-    '                # First reload: capture ORIGINAL function refs (the ones',
-    '                # Django/GraphQL/Celery registered at import time) keyed by',
-    '                # co_qualname. Subsequent reloads keep patching these same',
-    '                # objects in place.',
-    '                if _mod_name not in _original_mod_funcs:',
-    '                    _original_mod_funcs[_mod_name] = _index_module_functions(_mod)',
-    '                    _dbg_log(',
-    '                        f"Captured {len(_original_mod_funcs[_mod_name])} original fn refs "',
-    '                        f"for {_mod_name}"',
-    '                    )',
+    '                _generation_registry = _original_mod_funcs.setdefault(',
+    '                    _mod_name,',
+    '                    {},',
+    '                )',
     '',
-    '                # Reload source — creates NEW code objects and rebinds the',
-    '                # module attributes. External references still point at the',
-    '                # OLD objects which we patched into _original_mod_funcs.',
+    '                def _remember_generation(_index):',
+    '                    for _key, _functions in _index.items():',
+    '                        _bucket = _generation_registry.get(_key)',
+    '                        if _bucket is None:',
+    '                            _bucket = weakref.WeakSet()',
+    '                            _generation_registry[_key] = _bucket',
+    '                        for _function in _functions:',
+    '                            _bucket.add(_function)',
+    '',
+    '                # Register the currently exported generation on EVERY',
+    '                # reload. Framework code may have captured it after an',
+    '                # earlier reload, so first-generation-only storage leaves',
+    '                # those newer references stale.',
+    '                _current_fns = _index_module_functions(_mod)',
+    '                _remember_generation(_current_fns)',
+    '',
+    '                # A timestamp-based .pyc can remain valid when an editor',
+    '                # makes a same-size change within one filesystem tick.',
+    '                # Derive the canonical cache from the matched source path',
+    '                # rather than trusting module.__cached__, which application',
+    '                # code can replace with an unrelated path. Always remove the',
+    '                # derived cache so source is recompiled; failures are non-fatal.',
+    '                _cached_file = getattr(_mod, "__cached__", None)',
+    '                _canonical_cached_file = None',
+    '                if type(_mod_file) is str:',
+    '                    try:',
+    '                        _canonical_cached_file = importlib.util.cache_from_source(',
+    '                            _mod_file,',
+    '                        )',
+    '                    except Exception:',
+    '                        pass',
+    '                if type(_canonical_cached_file) is str:',
+    '                    try:',
+    '                        _os.unlink(_canonical_cached_file)',
+    '                    except FileNotFoundError:',
+    '                        pass',
+    '                    except Exception as _e:',
+    '                        _dbg_log(f"Could not remove bytecode cache for {_mod_name}: {_e}")',
+    '                if (',
+    '                    _cached_file is not None',
+    '                    and (',
+    '                        type(_cached_file) is not str',
+    '                        or type(_canonical_cached_file) is not str',
+    '                        or os.path.realpath(_cached_file)',
+    '                        != os.path.realpath(_canonical_cached_file)',
+    '                    )',
+    '                ):',
+    '                    _dbg_log(f"Skipped non-canonical bytecode cache for {_mod_name}")',
+    '                importlib.invalidate_caches()',
     '                importlib.reload(_mod)',
     '',
     '                # Invalidate linecache so debugpy / traceback reads fresh',
@@ -397,40 +496,118 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '',
     '                _new_fns = _index_module_functions(_mod)',
     '',
-    '                # Pair OLD and NEW by co_qualname, swap __code__ in place.',
-    '                _patched = []',
-    '                _orig_map = _original_mod_funcs[_mod_name]',
-    '                for _qn, _old_fn in list(_orig_map.items()):',
-    '                    _new_fn = _new_fns.get(_qn)',
-    '                    if _new_fn is None or _new_fn is _old_fn:',
+    '                # Patch every still-live prior generation. WeakSets retain',
+    '                # externally held Django/GraphQL/Celery references without',
+    '                # leaking generations that nobody uses anymore.',
+    '                _patched = set()',
+    '                for _key, _bucket in list(_generation_registry.items()):',
+    '                    _new_candidates = _new_fns.get(_key)',
+    '                    if not _new_candidates:',
     '                        continue',
+    '                    _new_fn = _new_candidates[0]',
+    '                    for _old_fn in list(_bucket):',
+    '                        if any(_old_fn is _candidate for _candidate in _new_candidates):',
+    '                            continue',
+    '                        try:',
+    '                            _old_fn.__code__ = _new_fn.__code__',
+    '                            _old_fn.__defaults__ = _new_fn.__defaults__',
+    '                            _old_fn.__kwdefaults__ = getattr(_new_fn, "__kwdefaults__", None)',
+    '                            _old_fn.__dict__.update(_new_fn.__dict__)',
+    '                            _old_fn.__annotations__ = dict(',
+    '                                getattr(_new_fn, "__annotations__", {}),',
+    '                            )',
+    '                            _old_fn.__doc__ = _new_fn.__doc__',
+    '                            _patched.add(_key[0])',
+    '                        except Exception as _e:',
+    '                            _dbg_log(f"Failed to patch {_key[0]} in {_mod_name}: {_e}")',
+    '',
+    '                _remember_generation(_new_fns)',
+    '                return sorted(_patched)',
+    '',
+    '            def _publish_reload_result(_request_id, _results):',
+    '                _result_tmp = (',
+    '                    _reload_result_file',
+    '                    + "."',
+    '                    + str(threading.get_ident())',
+    '                    + ".tmp"',
+    '                )',
+    '                _payload = (',
+    '                    json.dumps({',
+    '                        "version": 2,',
+    '                        "requestId": _request_id,',
+    '                        "results": _results,',
+    '                    })',
+    '                    if _request_id is not None',
+    '                    else "\\n".join(_results)',
+    '                )',
+    '                try:',
+    '                    with open(_result_tmp, "w") as _f:',
+    '                        _f.write(_payload)',
     '                    try:',
-    '                        _old_fn.__code__ = _new_fn.__code__',
-    '                        _old_fn.__defaults__ = _new_fn.__defaults__',
-    '                        _old_fn.__kwdefaults__ = getattr(_new_fn, "__kwdefaults__", None)',
-    '                        _old_fn.__dict__.update(_new_fn.__dict__)',
-    '                        _patched.append(_qn)',
-    '                    except Exception as _e:',
-    '                        _dbg_log(f"Failed to patch {_qn} in {_mod_name}: {_e}")',
+    '                        _os.chmod(_result_tmp, 0o600)',
+    '                    except Exception:',
+    '                        pass',
+    '                    _os.replace(_result_tmp, _reload_result_file)',
+    '                finally:',
+    '                    try:',
+    '                        _os.unlink(_result_tmp)',
+    '                    except FileNotFoundError:',
+    '                        pass',
     '',
-    '                # Also pick up functions that appeared NEW since the first',
-    '                # reload (e.g. user added a new function) — register them',
-    '                # so subsequent reloads can patch them.',
-    '                for _qn, _new_fn in _new_fns.items():',
-    '                    _orig_map.setdefault(_qn, _new_fn)',
-    '',
-    '                return _patched',
+    '            def _clear_reload_claim():',
+    '                try:',
+    '                    _os.unlink(_reload_processing_file)',
+    '                except FileNotFoundError:',
+    '                    pass',
+    '                except Exception as _e:',
+    '                    _dbg_log(f"Could not clear reload claim: {_e}")',
     '',
     '            def _reload_watcher():',
+    '                # The experimental tracer installs threading.settrace().',
+    '                # Reload implementation details must not hit application',
+    '                # breakpoints or Raised filters on this internal thread.',
+    '                if _activated_engine == "experimental":',
+    '                    try:',
+    '                        _sys.settrace(None)',
+    '                    except Exception:',
+    '                        pass',
     '                while True:',
     '                    try:',
+    '                        _request_id = None',
+    '                        _claimed = False',
     '                        time.sleep(0.3)',
-    '                        if not _os.path.exists(_reload_file):',
+    '                        try:',
+    '                            _os.replace(_reload_file, _reload_processing_file)',
+    '                            _claimed = True',
+    '                        except FileNotFoundError:',
     '                            continue',
-    '                        with open(_reload_file) as _f:',
-    '                            _paths = [_p.strip() for _p in _f.read().strip().split("\\n") if _p.strip()]',
-    '                        _os.unlink(_reload_file)',
+    '                        with open(_reload_processing_file) as _f:',
+    '                            _raw_request = _f.read()',
+    '',
+    '                        try:',
+    '                            _request = json.loads(_raw_request)',
+    '                        except Exception:',
+    '                            if _raw_request.lstrip().startswith("{"):',
+    '                                raise',
+    '                            _request = None',
+    '                        if isinstance(_request, dict) and _request.get("version") == 2:',
+    '                            _request_id = _request.get("requestId")',
+    '                            _paths = _request.get("paths")',
+    '                            if not isinstance(_request_id, str) or not isinstance(_paths, list):',
+    '                                raise ValueError("Invalid hot reload v2 request")',
+    '                            if not all(isinstance(_p, str) for _p in _paths):',
+    '                                raise ValueError("Invalid hot reload path")',
+    '                            _paths = [_p for _p in _paths if _p]',
+    '                        else:',
+    '                            _paths = [',
+    '                                _p.strip()',
+    '                                for _p in _raw_request.strip().split("\\n")',
+    '                                if _p.strip()',
+    '                            ]',
     '                        if not _paths:',
+    '                            _publish_reload_result(_request_id, [])',
+    '                            _clear_reload_claim()',
+    '                            _claimed = False',
     '                            continue',
     '',
     '                        importlib.invalidate_caches()',
@@ -465,14 +642,22 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                                _dbg_log(f"No loaded module for: {_fpath}")',
     '                                _results.append(_msg)',
     '',
-    '                        try:',
-    '                            with open(_reload_result_file, "w") as _f:',
-    '                                _f.write("\\n".join(_results))',
-    '                        except Exception:',
-    '                            pass',
+    '                        _publish_reload_result(_request_id, _results)',
+    '                        _clear_reload_claim()',
+    '                        _claimed = False',
     '',
     '                    except Exception as _e:',
     '                        _dbg_log(f"Reload watcher error: {_e}")',
+    '                        try:',
+    '                            _publish_reload_result(',
+    '                                locals().get("_request_id"),',
+    '                                [f"ERR:protocol:{type(_e).__name__}:{_e}"],',
+    '                            )',
+    '                        except Exception:',
+    '                            pass',
+    '                        finally:',
+    '                            if locals().get("_claimed", False):',
+    '                                _clear_reload_claim()',
     '',
     '            _t = threading.Thread(target=_reload_watcher, daemon=True, name="django-debug-hot-reload")',
     '            _t.start()',
@@ -666,7 +851,7 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                _write_active_endpoint(_active_file, _engine, _host, _actual_port)',
     '                _engine_endpoints[_engine] = (_host, _actual_port)',
     '                _dbg_log(f"{_engine} listening on {_host}:{_actual_port}")',
-    '                if _engine == "debugpy" and not _hot_reload_watcher_started:',
+    '                if not _hot_reload_watcher_started:',
     '                    _start_hot_reload_watcher()',
     '                    _hot_reload_watcher_started = True',
     '            except RuntimeError as _e:',
@@ -769,30 +954,81 @@ export class DebugpyInjector {
 
   /**
    * Request hot reload of changed Python files in a running process.
-   * Writes file paths to the reload request file; the bootstrap's
-   * reload watcher thread picks them up and does importlib.reload().
+   * Atomically publishes a correlated v2 request; the bootstrap's reload
+   * watcher claims it and runs importlib.reload().
    */
-  async requestHotReload(pid: number, filePaths: string[]): Promise<void> {
-    if (filePaths.length === 0) { return; }
+  async requestHotReload(pid: number, filePaths: string[]): Promise<string | null> {
+    if (filePaths.length === 0) { return null; }
     await ensurePrivatePortFileDir();
-    await fs.writeFile(reloadFilePath(pid), filePaths.join('\n'), { encoding: 'utf-8', mode: 0o600 });
-    await fs.chmod(reloadFilePath(pid), 0o600);
-    log(`[Injector] Hot reload requested for PID=${pid}: ${filePaths.join(', ')}`);
+    const requestId = nextHotReloadRequestId(pid);
+    const requestFile = reloadFilePath(pid);
+    const temporaryFile = `${requestFile}.${requestId}.tmp`;
+    const payload = JSON.stringify({
+      version: 2,
+      requestId,
+      paths: filePaths,
+    });
+
+    try {
+      await fs.unlink(reloadResultFilePath(pid));
+    } catch (error) {
+      if (!isFsError(error, 'ENOENT')) { throw error; }
+    }
+
+    try {
+      await fs.writeFile(temporaryFile, payload, {
+        encoding: 'utf-8',
+        mode: 0o600,
+        flag: 'wx',
+      });
+      // Set permissions before publishing the fixed request filename. The
+      // Python watcher can consume that filename immediately after rename.
+      await fs.chmod(temporaryFile, 0o600);
+      await fs.rename(temporaryFile, requestFile);
+    } finally {
+      try {
+        await fs.unlink(temporaryFile);
+      } catch (error) {
+        if (!isFsError(error, 'ENOENT')) { throw error; }
+      }
+    }
+    log(
+      `[Injector] Hot reload requested for PID=${pid}, request=${requestId}: `
+      + filePaths.join(', '),
+    );
+    return requestId;
   }
 
   /**
    * Read the result of the last hot reload request.
-   * Returns an array of result lines (OK:module, ERR:module:reason, SKIP:path).
+   * Returns result rows (OK:module, ERR:module:reason, SKIP:path). When an
+   * expected id is provided, a stale result is left untouched.
    */
-  async readReloadResult(pid: number): Promise<string[] | null> {
+  async readReloadResult(
+    pid: number,
+    expectedRequestId?: string,
+  ): Promise<string[] | null> {
     const resultFile = reloadResultFilePath(pid);
+    let content: string;
     try {
-      const content = await fs.readFile(resultFile, 'utf-8');
-      await fs.unlink(resultFile).catch(() => {});
-      return content.trim().split('\n').filter(Boolean);
-    } catch {
+      content = await fs.readFile(resultFile, 'utf-8');
+    } catch (error) {
+      if (isFsError(error, 'ENOENT')) { return null; }
+      throw error;
+    }
+    const payload = parseHotReloadResult(content);
+    if (
+      expectedRequestId !== undefined
+      && payload.requestId !== expectedRequestId
+    ) {
       return null;
     }
+    try {
+      await fs.unlink(resultFile);
+    } catch (error) {
+      if (!isFsError(error, 'ENOENT')) { throw error; }
+    }
+    return payload.results;
   }
 
   /**
@@ -806,17 +1042,13 @@ export class DebugpyInjector {
     pid: number,
     timeoutMs: number,
     intervalMs: number = 20,
+    expectedRequestId?: string,
+    signal?: AbortSignal,
   ): Promise<string[] | null> {
-    const resultFile = reloadResultFilePath(pid);
     const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      try {
-        const content = await fs.readFile(resultFile, 'utf-8');
-        await fs.unlink(resultFile).catch(() => {});
-        return content.trim().split('\n').filter(Boolean);
-      } catch {
-        // not yet
-      }
+    while (Date.now() - start < timeoutMs && signal?.aborted !== true) {
+      const result = await this.readReloadResult(pid, expectedRequestId);
+      if (result !== null) { return result; }
       await new Promise((r) => setTimeout(r, intervalMs));
     }
     return null;
@@ -827,13 +1059,31 @@ export class DebugpyInjector {
    * i.e. the Python watcher hasn't consumed it yet. Used to distinguish
    * "Python-side didn't process" from "Python-side reported nothing".
    */
-  async isReloadPending(pid: number): Promise<boolean> {
-    try {
-      await fs.access(reloadFilePath(pid));
-      return true;
-    } catch {
-      return false;
+  async isReloadPending(pid: number, expectedRequestId?: string): Promise<boolean> {
+    for (const requestFile of [
+      reloadFilePath(pid),
+      reloadProcessingFilePath(pid),
+    ]) {
+      try {
+        if (expectedRequestId === undefined) {
+          await fs.access(requestFile);
+          return true;
+        }
+        const content = await fs.readFile(requestFile, 'utf-8');
+        try {
+          const parsed = JSON.parse(content) as Record<string, unknown>;
+          if (parsed.version === 2 && parsed.requestId === expectedRequestId) {
+            return true;
+          }
+        } catch {
+          // A legacy request has no correlation id. It is still pending for a
+          // legacy caller, but never claim it as this v2 request.
+        }
+      } catch (error) {
+        if (!isFsError(error, 'ENOENT')) { throw error; }
+      }
     }
+    return false;
   }
 
   /**

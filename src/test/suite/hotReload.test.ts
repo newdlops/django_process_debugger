@@ -18,26 +18,37 @@ describe('Feature: hot reload request/result protocol', function () {
   });
 
   after(async function () {
-    for (const name of [`${fakePid}.reload`, `${fakePid}.reload.result`]) {
+    for (const name of [
+      `${fakePid}.reload`,
+      `${fakePid}.reload.processing`,
+      `${fakePid}.reload.result`,
+    ]) {
       await fs.unlink(path.join(PORT_FILE_DIR, name)).catch(() => {});
     }
   });
 
-  it('requestHotReload writes file paths to the reload file', async function () {
+  it('requestHotReload atomically publishes a correlated v2 request', async function () {
     const files = ['/tmp/project/views.py', '/tmp/project/models.py'];
+    let requestId: string | null = null;
     await perf.measure('requestHotReload', async () => {
-      await injector.requestHotReload(fakePid, files);
+      requestId = await injector.requestHotReload(fakePid, files);
     }, { group: 'hotReload' });
 
     const content = await fs.readFile(path.join(PORT_FILE_DIR, `${fakePid}.reload`), 'utf-8');
-    assert.deepStrictEqual(content.trim().split('\n'), files);
+    assert.ok(requestId);
+    assert.deepStrictEqual(JSON.parse(content), {
+      version: 2,
+      requestId,
+      paths: files,
+    });
   });
 
   it('requestHotReload with empty list is a no-op', async function () {
     const before = Date.now();
-    await injector.requestHotReload(fakePid + 1, []);
+    const requestId = await injector.requestHotReload(fakePid + 1, []);
     const elapsed = Date.now() - before;
     assert.ok(elapsed < 50, `empty request should be instant, took ${elapsed}ms`);
+    assert.strictEqual(requestId, null);
     await assert.rejects(fs.access(path.join(PORT_FILE_DIR, `${fakePid + 1}.reload`)));
   });
 
@@ -61,6 +72,39 @@ describe('Feature: hot reload request/result protocol', function () {
   it('readReloadResult returns null when no result file exists', async function () {
     const results = await injector.readReloadResult(fakePid + 999);
     assert.strictEqual(results, null);
+  });
+
+  it('does not consume a result belonging to another request', async function () {
+    const resultFile = path.join(PORT_FILE_DIR, `${fakePid}.reload.result`);
+    await fs.writeFile(resultFile, JSON.stringify({
+      version: 2,
+      requestId: 'older-request',
+      results: ['OK:myapp.views'],
+    }), 'utf-8');
+
+    assert.strictEqual(
+      await injector.readReloadResult(fakePid, 'newer-request'),
+      null,
+    );
+    await fs.access(resultFile);
+    assert.deepStrictEqual(
+      await injector.readReloadResult(fakePid, 'older-request'),
+      ['OK:myapp.views'],
+    );
+    await assert.rejects(fs.access(resultFile));
+  });
+
+  it('treats an atomically claimed processing file as pending', async function () {
+    const requestId = await injector.requestHotReload(fakePid, ['/tmp/app.py']);
+    assert.ok(requestId);
+    await fs.rename(
+      path.join(PORT_FILE_DIR, `${fakePid}.reload`),
+      path.join(PORT_FILE_DIR, `${fakePid}.reload.processing`),
+    );
+    assert.strictEqual(
+      await injector.isReloadPending(fakePid, requestId ?? undefined),
+      true,
+    );
   });
 });
 

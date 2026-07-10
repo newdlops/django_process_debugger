@@ -18,6 +18,13 @@ import threading
 import time
 
 
+# The experimental hot-reload E2E test needs one workspace module to be loaded
+# before engine activation. Keep this opt-in so the general attach fixture stays
+# dependency-free and unchanged for every other test.
+if os.environ.get('DPD_EXPERIMENTAL_HOT_RELOAD_PROBE'):
+    import sampleapp.hot_reload_probe  # noqa: F401
+
+
 def main() -> int:
     if len(sys.argv) < 3 or sys.argv[1] != 'runserver':
         print('usage: manage.py runserver PORT', file=sys.stderr)

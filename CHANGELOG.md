@@ -5,16 +5,30 @@
 ### Added
 - Added `djangoProcessDebugger.engine` with stable `debugpy` as the default and an explicit `experimental` opt-in for the independent native tracer.
 - Added engine-aware attach configuration, status, PID lock metadata, and focused configuration tests.
-- Added a dependency-free experimental DAP tracer with line breakpoints, stack/scopes, read-only variables, stepping, pause, and safe protocol-log redaction.
+- Added a dependency-free experimental DAP tracer with line breakpoints, stack/scopes, variable inspection, stepping, pause, and safe protocol-log redaction.
+- Added conditional breakpoints and stopped-frame Python expression evaluation to the experimental tracer. Invalid conditions are rejected during breakpoint setup, and runtime condition errors are contained and surfaced as breakpoint descriptions.
+- Added process-wide hit-count breakpoints to the experimental tracer with `N`, comparison, and `% N` syntax, condition-aware counting, and source-replacement counter resets.
+- Added safe experimental logpoints with compiled `{expression}` placeholders, escaped braces, type-only evaluation errors, and bounded asynchronous DAP output.
+- Added experimental Set Variable support for existing locals/globals, string-keyed dictionary entries, list elements, and `__dict__`-backed instance attributes, including target-thread evaluation, CPython fast-local synchronization, and explicit failures for stale, immutable, or unsupported targets.
+- Added bounded reference-object previews from directly stored fields without invoking application properties, `__repr__`, or `__str__`.
+- Added opt-in lazy Variables rows for application-defined `repr()`, `str()`, `len()`, standard `@property`, `functools.cached_property`, and native slots. Lazy evaluation runs on the selected paused thread, contains `BaseException` failures, and leaves normal previews hook-free.
+- Added evaluatable names for safe nested variable paths, clipboard-context rendering for larger strings and bytes, and client-requested hexadecimal integer formatting.
+- Added Raised and Uncaught exception breakpoints plus DAP `exceptionInfo` details to the experimental tracer. Raised exceptions stop once at their first raise site, while uncaught process/thread exits provide post-mortem inspection, Evaluate, and Continue with hook-free, bounded `args` previews, chained exceptions, and Python 3.11+ exception-group children.
+- Added a `Django Request Exceptions` filter that stops with `userUnhandled` at Django's `got_request_exception` HTTP 500 boundary and exposes a Django request scope without automatically evaluating bodies, headers, or cookies. Selecting it with Raised exceptions provides raise-site and framework-boundary stops; Django-request post-mortem frames support inspection, Evaluate, and Continue but reject stepping and Set Variable, while asyncio-task and non-Django exception coverage remains unchanged.
+- Added hot reload support to the experimental tracer using the same bootstrap watcher as debugpy, with the internal reload thread excluded from native tracing.
 
 ### Fixed
 - Attach process picker now shows attachable Django server targets grouped by listener host and port, so parent/child/wrapper processes collapse only when they resolve to the same `host:port`.
 - Experimental tracer state is discarded safely in forked workers so inherited hooks, sockets, and locks cannot suspend a child without a DAP controller.
 - Experimental DAP handles are now stop-scoped and synchronized across threads, with variable paging and bounded message handling.
+- Experimental condition, Evaluate, and Set Variable failures, including `BaseException` subclasses, are contained by the debugger instead of escaping into the target application. DAP diagnostics redact both evaluated expressions and their results.
+- Process selection now shows CWD before long runtime details, surfaces the project folder beside the PID, supports CWD search, and falls back to a grouped sibling process when the representative has no CWD.
+- Variable expansion no longer executes a user-defined `__dict__` descriptor while probing object state.
 - PID debug-session claims are now atomic across VS Code windows and expire with their owning extension host, while Restart safely transfers the same claim.
+- Hot reload now patches every still-live function generation instead of only the objects present before the first reload, so URL-conf, class, and decorated references captured after earlier reloads continue updating. Request claiming and result publication are atomic and request-correlated, eliminating worker unlink/chmod races, partial results, stale-result mixups, and overlapping VS Code flushes.
 
 ### Changed
-- Bootstrap version bumped to `2026.07.10.4`. Existing runtimes auto-update on the next attach; restart running Django/Celery processes afterward so the new engine bootstrap is loaded.
+- Bootstrap version bumped to `2026.07.10.9`. Existing runtimes auto-update on the next attach; restart running Django/Celery processes afterward so the new tracer and hot-reload features are loaded.
 
 ## [0.2.7] - 2026-06-09
 

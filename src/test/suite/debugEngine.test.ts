@@ -23,8 +23,8 @@ describe('Feature: debug engine selection', function () {
     assert.strictEqual(debugEngineDisplayName('experimental'), 'Experimental Native Tracer');
   });
 
-  it('only advertises hot reload for the backend that currently starts its watcher', function () {
+  it('advertises hot reload for both debug engines', function () {
     assert.strictEqual(supportsHotReload('debugpy'), true);
-    assert.strictEqual(supportsHotReload('experimental'), false);
+    assert.strictEqual(supportsHotReload('experimental'), true);
   });
 });

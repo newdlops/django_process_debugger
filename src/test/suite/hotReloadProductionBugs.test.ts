@@ -285,6 +285,23 @@ describe('Feature: decorator-wrapped method reload via __wrapped__ chain (log.tx
     const afterWrapper = await harness.call('saved_wrapper()');
     assert.strictEqual(afterWrapper, "'top v2-via-closure'",
       'BEFORE the fix this returned "top v1" because the wrapper closure captured the old inner function. With closure walk, the inner is patched in place.');
+
+    // Capture the function generation installed by that reload, then reload a
+    // third generation. Both registry-held generations must advance; keeping
+    // only the first import generation was the source of this regression.
+    await harness.call('globals().__setitem__("saved_wrapper_v2", decorated.top_level)');
+    await fs.writeFile(
+      decoratedPath,
+      originalDecorated.replace("'top v1'", "'top v3-all-generations'"),
+      'utf-8',
+    );
+    await injector.requestHotReload(harness.pid, [decoratedPath]);
+    const thirdResults = await injector.pollReloadResult(harness.pid, 3_000);
+    assert.ok(thirdResults?.some((r) => r.startsWith('OK:sampleapp.decorated')));
+    assert.strictEqual(await harness.call('saved_wrapper()'), "'top v3-all-generations'",
+      'a wrapper captured after the baseline reload must remain patchable across later generations');
+    assert.strictEqual(await harness.call('saved_wrapper_v2()'), "'top v3-all-generations'",
+      'the most recently installed wrapper generation must be patched too');
   });
 
   it('decorated class method: reload propagates to externally held instance', async function () {

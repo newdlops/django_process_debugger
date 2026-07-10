@@ -15,7 +15,15 @@ export function projectRoot(): string {
 }
 
 export async function findSystemPython(): Promise<string | null> {
-  for (const bin of ['python3', '/opt/homebrew/bin/python3', '/usr/local/bin/python3', '/usr/bin/python3']) {
+  const configured = process.env.DPD_TEST_PYTHON?.trim();
+  const candidates = [
+    ...(configured ? [configured] : []),
+    'python3',
+    '/opt/homebrew/bin/python3',
+    '/usr/local/bin/python3',
+    '/usr/bin/python3',
+  ];
+  for (const bin of candidates) {
     try {
       const { stdout } = await execFileAsync(bin, ['-V'], { timeout: 5_000 });
       if (stdout.trim().length > 0) {
@@ -34,6 +42,66 @@ export interface SpawnedProcess {
   stop: () => Promise<void>;
 }
 
+const PROCESS_OUTPUT_LIMIT = 16 * 1024;
+
+function appendProcessOutput(current: string, chunk: Buffer | string): string {
+  const combined = current + chunk.toString();
+  return combined.length <= PROCESS_OUTPUT_LIMIT
+    ? combined
+    : combined.slice(combined.length - PROCESS_OUTPUT_LIMIT);
+}
+
+function hasChildExited(child: ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (hasChildExited(child) || child.pid === undefined) {
+    return Promise.resolve(true);
+  }
+
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const finish = (exited: boolean): void => {
+      if (settled) { return; }
+      settled = true;
+      if (timer) { clearTimeout(timer); }
+      child.removeListener('exit', onExit);
+      resolve(exited);
+    };
+    const onExit = (): void => finish(true);
+
+    child.once('exit', onExit);
+    timer = setTimeout(() => finish(hasChildExited(child)), timeoutMs);
+
+    // Avoid missing an exit that raced with listener registration.
+    if (hasChildExited(child)) {
+      finish(true);
+    }
+  });
+}
+
+async function terminateChild(child: ChildProcess): Promise<boolean> {
+  if (hasChildExited(child) || child.pid === undefined) {
+    return true;
+  }
+
+  try { child.kill('SIGTERM'); } catch { /* already gone */ }
+  if (await waitForChildExit(child, 1_000)) {
+    return true;
+  }
+
+  try { child.kill('SIGKILL'); } catch { /* already gone */ }
+  return waitForChildExit(child, 1_000);
+}
+
+function formatCapturedOutput(value: string): string {
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : '(empty)';
+}
+
 /**
  * Spawns the fake manage.py fixture so it appears in `ps aux` output.
  * Waits until the fake process prints "READY" on stdout.
@@ -41,53 +109,130 @@ export interface SpawnedProcess {
 export async function spawnFakeRunserver(
   pythonPath: string,
   port: number,
-  opts: { env?: NodeJS.ProcessEnv; cwd?: string; extraArgs?: string[] } = {},
+  opts: {
+    env?: NodeJS.ProcessEnv;
+    cwd?: string;
+    extraArgs?: string[];
+    readyTimeoutMs?: number;
+  } = {},
 ): Promise<SpawnedProcess> {
   const managePy = path.join(fixturesDir(), 'manage.py');
   const args = [managePy, 'runserver', String(port), ...(opts.extraArgs ?? [])];
+  const childEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    PORT_MANAGER_HOOK: '0',
+    PORT_MANAGER_HOOK_DISABLED: '1',
+    ...opts.env,
+  };
+  // A test process must bind the requested real loopback port. Inherited
+  // preload hooks can redirect or stall Python before manage.py reaches READY.
+  if (opts.env?.DYLD_INSERT_LIBRARIES === undefined) {
+    delete childEnv.DYLD_INSERT_LIBRARIES;
+  }
+  if (opts.env?.LD_PRELOAD === undefined) {
+    delete childEnv.LD_PRELOAD;
+  }
   const child = spawn(pythonPath, args, {
-    env: { ...process.env, ...opts.env },
+    env: childEnv,
     cwd: opts.cwd ?? fixturesDir(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
-  if (!child.pid) {
-    throw new Error(`Failed to spawn ${pythonPath}`);
-  }
+  let stdout = '';
+  let stderr = '';
+  let readyTimer: ReturnType<typeof setTimeout> | undefined;
+  let readySettled = false;
 
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('Timed out waiting for READY')), 10_000);
-    let buf = '';
-    child.stdout?.on('data', (chunk: Buffer) => {
-      buf += chunk.toString();
-      if (buf.includes('READY')) {
-        clearTimeout(timer);
-        resolve();
-      }
-    });
-    child.on('error', (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-    child.on('exit', (code, signal) => {
-      clearTimeout(timer);
-      reject(new Error(`process exited early (code=${code} signal=${signal})`));
-    });
-  });
+  const onStdout = (chunk: Buffer): void => {
+    stdout = appendProcessOutput(stdout, chunk);
+  };
+  const onStderr = (chunk: Buffer): void => {
+    stderr = appendProcessOutput(stderr, chunk);
+  };
+  child.stdout?.on('data', onStdout);
+  child.stderr?.on('data', onStderr);
 
-  const stop = async (): Promise<void> => {
-    if (child.exitCode !== null || child.signalCode) { return; }
-    child.kill('SIGTERM');
-    await new Promise<void>((resolve) => {
-      const t = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* ignore */ }
-        resolve();
-      }, 3_000);
-      child.on('exit', () => { clearTimeout(t); resolve(); });
-    });
+  let resolveReady: (() => void) | undefined;
+  let rejectReady: ((reason: Error) => void) | undefined;
+  const finishReady = (error?: Error): void => {
+    if (readySettled) { return; }
+    readySettled = true;
+    if (readyTimer) { clearTimeout(readyTimer); }
+    if (error) { rejectReady?.(error); }
+    else { resolveReady?.(); }
+  };
+  const detectReady = (): void => {
+    if (stdout.includes('READY')) {
+      finishReady();
+    }
+  };
+  const onError = (error: Error): void => finishReady(error);
+  const onEarlyExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+    finishReady(new Error(`process exited early (code=${code} signal=${signal})`));
+  };
+  child.stdout?.on('data', detectReady);
+  child.once('error', onError);
+  child.once('exit', onEarlyExit);
+
+  const cleanupReadyListeners = (): void => {
+    if (readyTimer) {
+      clearTimeout(readyTimer);
+      readyTimer = undefined;
+    }
+    child.stdout?.removeListener('data', onStdout);
+    child.stdout?.removeListener('data', detectReady);
+    child.stderr?.removeListener('data', onStderr);
+    child.removeListener('error', onError);
+    child.removeListener('exit', onEarlyExit);
   };
 
-  return { child, pid: child.pid, stop };
+  try {
+    await new Promise<void>((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+      readyTimer = setTimeout(
+        () => finishReady(new Error(`Timed out waiting for READY after ${opts.readyTimeoutMs ?? 10_000}ms`)),
+        opts.readyTimeoutMs ?? 10_000,
+      );
+      detectReady();
+    });
+  } catch (error) {
+    const reaped = await terminateChild(child);
+    cleanupReadyListeners();
+    child.stdout?.resume();
+    child.stderr?.resume();
+    const reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    throw new Error(
+      `Failed to start fake runserver with ${pythonPath} on port ${port}: ${reason}\n` +
+      `pid: ${child.pid ?? '(not spawned)'}\n` +
+      `stdout:\n${formatCapturedOutput(stdout)}\n` +
+      `stderr:\n${formatCapturedOutput(stderr)}\n` +
+      `cleanup: ${reaped ? 'child exited' : 'child did not exit after SIGKILL'}`,
+    );
+  }
+
+  cleanupReadyListeners();
+  child.stdout?.resume();
+  child.stderr?.resume();
+
+  const pid = child.pid;
+  if (pid === undefined) {
+    await terminateChild(child);
+    throw new Error(`Fake runserver reported READY without a process id (${pythonPath}, port ${port})`);
+  }
+
+  let stopPromise: Promise<void> | undefined;
+  const stop = (): Promise<void> => {
+    stopPromise ??= (async () => {
+      const reaped = await terminateChild(child);
+      if (!reaped) {
+        throw new Error(`Failed to stop fake runserver pid=${pid} after SIGKILL`);
+      }
+    })();
+    return stopPromise;
+  };
+
+  return { child, pid, stop };
 }
 
 /**

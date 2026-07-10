@@ -18,6 +18,11 @@ import { shouldIgnoreForHotReload } from './hotReloadFilter';
 import { TcpListeningEndpoint, formatEndpoint } from './listeningEndpoint';
 import { summarizeDapMessage } from './dapLogging';
 import {
+  processQuickPickDescription,
+  processQuickPickDetail,
+  selectGroupedDisplayCwd,
+} from './processQuickPickDisplay';
+import {
   DEBUG_SESSION_LOCK_TOKEN_KEY,
   DebugSessionLockGuard,
   DebugSessionLockTarget,
@@ -965,6 +970,17 @@ export function activate(context: vscode.ExtensionContext) {
 
       const items: AttachQuickPickItem[] = await Promise.all([...attachGroups.values()].map(async (group) => {
         const representative = group.find((candidate) => candidate.process.pid === candidate.resolvedPid) ?? group[0];
+        const displayCwd = selectGroupedDisplayCwd(
+          representative.resolvedPid,
+          representative.process.cwd,
+          group.map((candidate) => ({
+            resolvedPid: candidate.resolvedPid,
+            cwd: candidate.process.cwd,
+          })),
+        );
+        const displayProcess = displayCwd
+          ? { ...representative.process, cwd: displayCwd }
+          : representative.process;
         const isWorkerGroup = group.some((candidate) => candidate.isWorker);
         const icon = representative.process.type === 'celery' || isWorkerGroup ? '$(server-process)' : '$(globe)';
         const typeLabel = representative.process.type === 'celery'
@@ -996,19 +1012,18 @@ export function activate(context: vscode.ExtensionContext) {
           : groupedPids.length > 1
           ? `PIDs: ${groupedPids.join(', ')}`
           : `PID: ${groupedPids[0]}`;
-        const detailParts = [
-          portStatus,
+        const detail = processQuickPickDetail(displayCwd, [
           `Python: ${representative.process.pythonPath}`,
-          representative.process.cwd ? `CWD: ${representative.process.cwd}` : undefined,
+          portStatus,
           representative.process.processGroupId ? `PGID: ${representative.process.processGroupId}` : undefined,
           workerPids.length > 0 ? `Workers: ${workerPids.join(', ')}` : undefined,
-        ].filter((part): part is string => !!part);
+        ]);
 
         return {
           label: `${icon} [${typeLabel}] ${endpointLabel}`,
-          description: pidLabel,
-          detail: detailParts.join('  |  '),
-          process: representative.process,
+          description: processQuickPickDescription(displayCwd, pidLabel),
+          detail,
+          process: displayProcess,
           resolvedPid: representative.resolvedPid,
           endpoint: representative.endpoint,
           groupedPids,
@@ -1024,6 +1039,8 @@ export function activate(context: vscode.ExtensionContext) {
 
       const selected = await vscode.window.showQuickPick(items, {
         placeHolder: `Select a Django process to attach ${engineName}`,
+        matchOnDescription: true,
+        matchOnDetail: true,
       });
 
       if (!selected) {
@@ -1289,12 +1306,14 @@ export function activate(context: vscode.ExtensionContext) {
         const icon = p.type === 'celery' ? '$(server-process)' : '$(globe)';
         const typeLabel = p.type === 'celery' ? 'Celery Worker' : 'Django Server';
         const portLabel = p.port ? ` | Port: ${p.port}` : '';
-        const cwdLabel = p.cwd ? ` | CWD: ${p.cwd}` : '';
-        const workerLabel = p.workerPids?.length ? ` | Workers: ${p.workerPids.join(', ')}` : '';
+        const workerLabel = p.workerPids?.length ? `Workers: ${p.workerPids.join(', ')}` : undefined;
         return {
           label: `${icon} [${typeLabel}] PID: ${p.pid}${portLabel}`,
-          description: p.command,
-          detail: `Python: ${p.pythonPath}${cwdLabel}${workerLabel}`,
+          description: processQuickPickDescription(p.cwd, p.command),
+          detail: processQuickPickDetail(p.cwd, [
+            `Python: ${p.pythonPath}`,
+            workerLabel,
+          ]),
           process: p,
         };
       });
@@ -1302,6 +1321,8 @@ export function activate(context: vscode.ExtensionContext) {
       const selected = await vscode.window.showQuickPick(items, {
         placeHolder: 'Select a process to kill',
         canPickMany: true,
+        matchOnDescription: true,
+        matchOnDetail: true,
       });
 
       if (!selected || selected.length === 0) {
@@ -1747,16 +1768,20 @@ export function activate(context: vscode.ExtensionContext) {
   const effectiveSessionEngines = new Map<string, DebugEngine>();
   let hotReloadDebounceTimer: ReturnType<typeof setTimeout> | undefined;
   let hotReloadPendingFiles: Set<string> = new Set();
+  let hotReloadGeneration = 0;
+  let hotReloadAbortController: AbortController | undefined;
+  let hotReloadFlushChain: Promise<void> = Promise.resolve();
   const hotReloadStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
 
   function startHotReloadWatcher(pid: number, sessionId: string): void {
+    stopHotReloadWatcher();
     const hotReloadEnabled = vscode.workspace.getConfiguration('djangoProcessDebugger').get<boolean>('hotReload', true);
     if (!hotReloadEnabled) {
       log('[HotReload] Disabled by setting');
       return;
     }
 
-    stopHotReloadWatcher();
+    hotReloadAbortController = new AbortController();
     hotReloadPid = pid;
     hotReloadSessionId = sessionId;
 
@@ -1772,6 +1797,9 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   function stopHotReloadWatcher(): void {
+    hotReloadGeneration += 1;
+    hotReloadAbortController?.abort();
+    hotReloadAbortController = undefined;
     if (hotReloadDebounceTimer) {
       clearTimeout(hotReloadDebounceTimer);
       hotReloadDebounceTimer = undefined;
@@ -1802,79 +1830,127 @@ export function activate(context: vscode.ExtensionContext) {
       clearTimeout(hotReloadDebounceTimer);
     }
     hotReloadDebounceTimer = setTimeout(() => {
-      flushHotReload();
+      hotReloadDebounceTimer = undefined;
+      scheduleHotReloadFlush();
     }, 500);
   }
 
-  async function flushHotReload(): Promise<void> {
-    if (!hotReloadPid || hotReloadPendingFiles.size === 0) { return; }
+  function scheduleHotReloadFlush(): void {
+    const generation = hotReloadGeneration;
+    hotReloadFlushChain = hotReloadFlushChain
+      .catch((error) => {
+        logError('[HotReload] Previous reload batch failed', error);
+      })
+      .then(() => drainHotReload(generation));
+  }
 
-    const pid = hotReloadPid;
-    const files = [...hotReloadPendingFiles];
-    hotReloadPendingFiles.clear();
+  async function drainHotReload(generation: number): Promise<void> {
+    if (
+      generation === hotReloadGeneration
+      && hotReloadPid !== undefined
+      && hotReloadSessionId !== undefined
+      && hotReloadAbortController !== undefined
+      && hotReloadPendingFiles.size > 0
+    ) {
+      const pid = hotReloadPid;
+      const sessionId = hotReloadSessionId;
+      const abortController = hotReloadAbortController;
+      const files = [...hotReloadPendingFiles];
+      hotReloadPendingFiles.clear();
 
-    log(`[HotReload] Requesting reload for ${files.length} file(s): ${files.join(', ')}`);
-    hotReloadStatusItem.text = '$(sync~spin) Reloading...';
+      log(`[HotReload] Requesting reload for ${files.length} file(s): ${files.join(', ')}`);
+      hotReloadStatusItem.text = '$(sync~spin) Reloading...';
 
-    try {
-      await injector.requestHotReload(pid, files);
+      try {
+        const requestId = await injector.requestHotReload(pid, files);
+        if (requestId === null || abortController.signal.aborted) { return; }
 
-      // First, poll briefly (3s) assuming the watcher is running. This covers
-      // the common "not at a breakpoint" case without stalling the UI.
-      let results = await injector.pollReloadResult(pid, 3_000);
+        // The request id prevents an old/crashed watcher result from being
+        // consumed by a later batch. Only one batch per session is in flight.
+        let results = await injector.pollReloadResult(
+          pid,
+          3_000,
+          20,
+          requestId,
+          abortController.signal,
+        );
 
-      // If no result yet AND the request file is still on disk, the Python
-      // watcher hasn't processed it. Most common cause: debugpy paused all
-      // threads at a breakpoint (including django-debug-hot-reload). Switch
-      // status to "queued" and keep polling until the session resumes — or
-      // give up after 60s to avoid zombie UI state.
-      if (!results && await injector.isReloadPending(pid)) {
-        const atBreakpoint = pausedSessions.size > 0;
-        hotReloadStatusItem.text = atBreakpoint
-          ? '$(clock) Reload queued — continue to apply'
-          : '$(clock) Reload queued...';
-        hotReloadStatusItem.tooltip = atBreakpoint
-          ? `Hot reload is waiting because the process is paused at a breakpoint. ` +
-            `The Python watcher thread cannot run until you continue.`
-          : undefined;
-        log(`[HotReload] Result not ready after 3s — pending=${await injector.isReloadPending(pid)}, ` +
-          `paused=${atBreakpoint}. Extending timeout.`);
-        results = await injector.pollReloadResult(pid, 60_000);
-      }
-
-      if (results) {
-        const ok = results.filter((r) => r.startsWith('OK:'));
-        const err = results.filter((r) => r.startsWith('ERR:'));
-        const skip = results.filter((r) => r.startsWith('SKIP:'));
-
-        if (ok.length > 0) {
-          const moduleNames = ok.map((r) => r.replace('OK:', ''));
-          vscode.window.showInformationMessage(
-            `$(flame) Hot reloaded: ${moduleNames.join(', ')}`
+        let pending = false;
+        if (results === null && !abortController.signal.aborted) {
+          pending = await injector.isReloadPending(pid, requestId);
+          if (!pending) {
+            // The watcher publishes the result before clearing .processing.
+            // Re-read across that transition so a result created between the
+            // short poll and pending check cannot be missed.
+            results = await injector.readReloadResult(pid, requestId);
+          }
+        }
+        if (results === null && !abortController.signal.aborted && pending) {
+          const atBreakpoint = pausedSessions.has(sessionId);
+          if (generation === hotReloadGeneration) {
+            hotReloadStatusItem.text = atBreakpoint
+              ? '$(clock) Reload queued — continue to apply'
+              : '$(clock) Reload queued...';
+            hotReloadStatusItem.tooltip = atBreakpoint
+              ? `Hot reload is waiting because the process is paused at a breakpoint. ` +
+                `The Python watcher thread cannot run until you continue.`
+              : undefined;
+          }
+          log(
+            `[HotReload] Result not ready after 3s — request=${requestId}, `
+            + `pending=true, paused=${atBreakpoint}. Extending timeout.`,
+          );
+          results = await injector.pollReloadResult(
+            pid,
+            60_000,
+            20,
+            requestId,
+            abortController.signal,
           );
         }
-        if (err.length > 0) {
-          const details = err.map((r) => r.replace('ERR:', ''));
-          vscode.window.showWarningMessage(
-            `$(warning) Reload failed: ${details.join('; ')}`
-          );
-        }
-        if (skip.length > 0 && ok.length === 0 && err.length === 0) {
-          log(`[HotReload] All files skipped (not loaded as modules): ${skip.join(', ')}`);
-        }
 
-        log(`[HotReload] Results: ${ok.length} OK, ${err.length} ERR, ${skip.length} SKIP`);
-      } else {
-        log(`[HotReload] No result after extended wait — reload may have been lost`);
+        if (abortController.signal.aborted || generation !== hotReloadGeneration) {
+          return;
+        }
+        if (results !== null) {
+          const ok = results.filter((r) => r.startsWith('OK:'));
+          const err = results.filter((r) => r.startsWith('ERR:'));
+          const skip = results.filter((r) => r.startsWith('SKIP:'));
+
+          if (ok.length > 0) {
+            const moduleNames = ok.map((r) => r.replace('OK:', ''));
+            vscode.window.showInformationMessage(
+              `$(flame) Hot reloaded: ${moduleNames.join(', ')}`
+            );
+          }
+          if (err.length > 0) {
+            const details = err.map((r) => r.replace('ERR:', ''));
+            vscode.window.showWarningMessage(
+              `$(warning) Reload failed: ${details.join('; ')}`
+            );
+          }
+          if (skip.length > 0 && ok.length === 0 && err.length === 0) {
+            log(`[HotReload] All files skipped (not loaded as modules): ${skip.join(', ')}`);
+          }
+          log(
+            `[HotReload] Results for ${requestId}: `
+            + `${ok.length} OK, ${err.length} ERR, ${skip.length} SKIP`,
+          );
+        } else {
+          log(`[HotReload] No result for ${requestId} after extended wait`);
+        }
+      } catch (err) {
+        if (!abortController.signal.aborted) {
+          logError('[HotReload] Failed to request reload', err);
+        }
+      } finally {
+        if (generation === hotReloadGeneration) {
+          hotReloadStatusItem.text = '$(flame) Hot Reload';
+          hotReloadStatusItem.tooltip = `Hot reload active for PID ${pid}. ` +
+            `Changed .py files are reloaded without restarting.`;
+        }
       }
-    } catch (err) {
-      logError('[HotReload] Failed to request reload', err);
-    } finally {
-      hotReloadStatusItem.tooltip = `Hot reload active for PID ${pid}. ` +
-        `Changed .py files are reloaded without restarting.`;
     }
-
-    hotReloadStatusItem.text = '$(flame) Hot Reload';
   }
 
   // Debug session lifecycle logging
@@ -1941,7 +2017,7 @@ export function activate(context: vscode.ExtensionContext) {
         if (supportsHotReload(engine)) {
           startHotReloadWatcher(sessionPid, session.id);
         } else {
-          log(`[HotReload] Disabled for ${engine}; the experimental tracer does not start the reload watcher yet`);
+          log(`[HotReload] Disabled for ${engine}`);
         }
       }
       log(
