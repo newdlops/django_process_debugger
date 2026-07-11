@@ -1,18 +1,18 @@
 # Optimization Plan
 
-이 문서는 `django-process-debugger` v0.2.4 기준 정적 분석에서 도출된 성능·구조 개선 항목을 우선순위 순으로 정리한다.
+이 문서는 `django-process-debugger` v0.2.4 정적 분석에서 시작한 성능·구조 개선 이력을 현재 구현 상태와 함께 정리한다.
 E2E 테스트에 내장된 성능 리포터(`test-results/perf-report.md`)가 항목별 실측값을 제공하므로, 개선 전/후 수치를 여기에 함께 기록한다.
 
 ## 우선순위 매트릭스
 
 | 우선순위 | 항목 | 예상 체감 효과 | 난이도 |
 |---|---|---|---|
-| 🔴 HIGH | **[버그]** `resolvePythonForPid`가 venv 대신 base Python 반환 (macOS symlink) | venv 시나리오에서 attach 자체가 실패 | 중 |
+| 🔴 HIGH | **[버그]** `resolvePythonForPid`가 venv 대신 base Python 반환 (수정 완료) | target이 발행한 `sys.executable`을 우선 사용 | 중 |
 | 🔴 HIGH | **[버그]** gunicorn `-b :PORT` 포트 정규식 미스매치 (수정 완료) | Attach 선택창에 포트 표시 누락 | 하 |
 | 🔴 HIGH | **[버그]** breakpoint 중 hot reload 요청이 소실됨 (수정 완료 — 아래 "실전 log.txt 진단") | "hot reload 안 됨" 증상의 주범 | 중 |
 | 🔴 HIGH | **[버그]** decorator closure가 pre-reload 함수를 유지 (수정 완료) | GraphQL resolver / Django view 대부분 영향 | 중 |
 | 🔴 HIGH | Attach 플로우의 `ps`/`lsof`/`python` 중복 호출 제거 | Attach 클릭 → 첫 DAP 핸드셰이크까지 500ms~1s 감소 | 중 (리팩터링 필요) |
-| 🔴 HIGH | `Clean All` 탐색 범위·kill 범위 축소 | Clean All 30s+ → 3~5s | 중 |
+| ✅ DONE | `Clean All`을 워크스페이스 allow-list cleanup으로 교체 | 다른 프로젝트/언어 서버 종료 위험 제거 | 중 |
 | 🟡 MEDIUM | `FileSystemWatcher`에 exclude glob 적용 | hot reload 불필요 이벤트 90%+ 제거 | 하 |
 | 🟡 MEDIUM | Hot reload 결과 대기를 고정 1초 → 폴링 | 대부분 reload 50~150ms로 단축 | 하 |
 | 🟡 MEDIUM | DAP 메시지 trace 기본 OFF | 브레이크포인트 hit-heavy 세션 지연 감소 | 하 |
@@ -23,7 +23,7 @@ E2E 테스트에 내장된 성능 리포터(`test-results/perf-report.md`)가 �
 
 ---
 
-## 🔴 HIGH — `resolvePythonForPid` venv-symlink 버그 (macOS)
+## ✅ 완료 — `resolvePythonForPid` venv-symlink 버그 (macOS)
 
 ### 문제
 E2E 테스트 중 발견한 실버그. macOS 커널은 `execve()` 시 symlink를 resolve해서 프로세스의 실행 경로 테이블에 저장한다. 이 때문에 `ps -p PID -o command=`는 **symlink를 따라간 실제 경로**를 반환한다.
@@ -43,15 +43,12 @@ ps -p $PID -o command=
 - `injector.verifyBootstrapLoaded(basePython)` → base Python의 site-packages에 부트스트랩 없음 → `BootstrapNotInstalledError`
 - 실제로는 venv에 부트스트랩이 잘 설치되어 있는데도 attach 실패
 
-현재 production에서는 `uv run python ...` / `poetry run python ...` 시나리오가 process tree의 wrapper 덕분에 우회되지만, 순수 venv attach는 깨져 있을 가능성이 높다.
+수정 후 bootstrap runtime state가 대상 프로세스의 `sys.executable`, random runtime identity, PID-owned control socket을 직접 발행한다. Attach는 이 direct state의 Python을 우선 사용하므로 `ps`/`lsof`가 base interpreter를 보여도 venv bootstrap을 정확히 검증한다.
 
-### 제안
-1. **Process environment 기반 fallback**: `ps eww -p PID`로 `VIRTUAL_ENV` 환경변수 노출 가능. 있으면 `$VIRTUAL_ENV/bin/python`을 우선 사용.
-2. **Argv[0] 유지 탐색**: `/proc/PID/exe`는 macOS에 없지만, `lsof -p PID -Fn`의 `ftxt`도 커널 resolved 경로다. 반면 `sysctl kern.proc.args.PID` (macOS)는 원본 argv를 반환 → **argv[0]이 venv symlink면 그걸 사용**.
-3. **Fallback 체크**: base Python 반환 시, 해당 PID의 `/proc/PID/cwd`(리눅스) 또는 `lsof -p -Fn cwd` 결과에서 venv 상위 디렉터리(`pyvenv.cfg` 존재)를 찾아 venv python으로 정정.
+추가로 activation은 SIGUSR1/SIGUSR2 대신 private Unix control socket을 사용한다. stale state나 PID reuse는 socket 연결 실패로 끝나며 다른 프로세스에 종료 signal을 보내지 않는다. Fork child는 별도의 direct state와 runtime identity/socket을 다시 발행하고, ancestor state만으로는 attach하지 않는다.
 
 ### 회귀 방지
-`src/test/suite/attach.test.ts`에서 이 버그가 재발하면 `before()` 단계에서 진단 메시지와 함께 skip. 버그가 수정되면 자동으로 test가 다시 활성화된다.
+`src/test/suite/attach.test.ts`는 이제 Python/venv 자체가 없을 때만 skip한다. target이 발행한 Python에서 bootstrap import가 실패하면 suite가 실패하므로 macOS 회귀가 숨겨지지 않는다.
 
 ---
 
@@ -84,19 +81,17 @@ E2E 테스트의 `processFinder.findDjangoProcesses` 및 `fullAttachFlow` 타이
 
 ---
 
-## 🔴 HIGH — `Clean All`의 탐색 스톰프
+## ✅ 완료 — `Clean This Workspace` 안전화 (2026-07-11)
 
-### 문제
-`extension.ts:820` 근처의 정리 루틴:
-- `find <root> -maxdepth 8 \( -name django_process_debugger.pth -o -name _django_debug_bootstrap.py \)` 를 `~/.asdf`, `~/.pyenv/versions`, `~/Library/Caches/pypoetry/virtualenvs`, `/opt/homebrew/lib` 등 15곳 각각에 실행. 대형 사용자는 수십만 stat.
-- `ps aux` 라인 전수를 순회하며 **VS Code 제외 모든 Python 프로세스**를 `SIGKILL`. 언어 서버·Jedi·LSP·다른 프로젝트의 uvicorn까지 무차별.
-- `repairCodeSignature`가 바이너리 하나씩 순차로 `xattr` + `codesign` + verify → 10개 기준 30~60s.
+기존 구현은 홈/전역 Python 경로를 광범위하게 탐색하고, 다른 프로젝트와 언어 서버를 포함한 Python 프로세스를 종료하며, 관련 없는 캐시와 Python 바이너리까지 변경할 수 있었다.
 
-### 제안
-1. **탐색 깊이 제한**: site-packages 규칙은 `<venv>/lib/python*/site-packages`로 고정. `fs.readdir`로 3단계까지만 내려가도 충분.
-2. **Kill 범위 축소**: `.pth`가 설치된 venv 경로 집합을 먼저 모으고, `ps` 라인에 해당 경로가 포함된 프로세스에만 SIGTERM. Opt-in 플래그로 "모두 kill"은 별도 명령으로 분리.
-3. **Repair 병렬화**: `repairCodeSignature` 내부 루프를 `Promise.all`로. 또한 `check` 단계를 먼저 전부 모아서 "실제로 broken인 바이너리"만 repair.
-4. **Progress 세분화**: `vscode.window.withProgress`로 단계 표시 (현재는 silent에 가까움).
+현재 `src/cleanAll.ts`의 독립 코어와 `Clean This Workspace` 명령은 다음 경계를 강제한다.
+
+1. Setup이 저장한 정확한 `site-packages`의 bootstrap/tracer 파일만 후보로 만든다.
+2. 현재 창이 명시적으로 소유하며 이미 종료된 PID의 제한된 artifact만 정리한다.
+3. 실행 전 파일 유형·경로·소유 범위를 preflight하고 하나라도 이상하면 전체 작업을 차단한다.
+4. Python 프로세스 종료, 홈/전역 runtime 탐색, Jedi/parso 캐시 삭제, 공용 debugpy 삭제, 광범위한 `xattr`/`codesign`을 수행하지 않는다.
+5. dry-run·범위 격리·fail-closed·legacy lock·debugpy storage 경계를 단위 테스트한다.
 
 ---
 
@@ -283,9 +278,7 @@ E2E 성능 리포터는 `npm test` 실행 후 `test-results/perf-report.md`, `te
 | Hot reload cycle: ERR (harness) | 45 | — | — |
 | Hot reload cycle: batch 2 (harness) | 48 | — | — |
 | Hot reload cycle: e2e latency (production 대기 1000ms 포함 X) | 71 | — | — |
-| Full attach (bootstrap loaded) | skipped* | — | — |
-
-\* venv-symlink 버그로 attach E2E는 현재 자동 skip. 버그 수정 후 자동 활성화.
+| Full attach (bootstrap loaded) | 685.3 | — | — |
 
 ### 관찰 포인트
 
@@ -308,15 +301,15 @@ E2E 성능 리포터는 `npm test` 실행 후 `test-results/perf-report.md`, `te
 | `hotReloadCycle.test.ts` | Python harness 기반 full reload cycle (OK/ERR/SKIP, batch, e2e latency) + Django/ASGI 참조 시나리오 + 멀티워커 격리 | `hot reload cycle (OK/SKIP/ERR/batch 2/file unlink latency/e2e latency/class patch/worker A only)` |
 | `debugpyInjector.test.ts` | 부트스트랩 설치/업데이트/제거 수명주기 | `installBootstrap`, `isBootstrapUpToDate`, `resolveSitePackages`, `resolvePythonForPid (self)`, `python -m py_compile bootstrap` |
 | `bootstrapGating.test.ts` | 비-타겟 프로세스에서 부트스트랩이 no-op임을 보장 | `python -c pass (bootstrap installed)`, `python -c pass` 기준선 vs 설치본 |
-| `attach.test.ts` | 전체 attach E2E (venv-symlink 버그 시 자동 skip) | `installBootstrap (e2e venv)`, `spawn fake runserver`, `injector.activate*`, `resolveDebuggablePid (e2e)` |
+| `attach.test.ts` | 전체 attach E2E (target-published venv path, private control socket, 양쪽 engine) | `installBootstrap (e2e venv)`, `spawn fake runserver`, `injector.activate*`, `resolveDebuggablePid (e2e)` |
 
 모든 perf 항목은 `getPerf().measure(name, fn, { group })`를 통해 기록되며, `src/test/suite/index.ts`가 Mocha 실행 종료 후 `test-results/perf-report.{md,json}`에 덤프한다. 개선 PR마다 이 파일을 diff로 공유 가능.
 
 ### 현재 테스트가 닿지 않는 영역 (후속 테스트 후보)
 
-- **Debug adapter descriptor factory** (`django-process` 타입) — `vscode.debug.registerDebugAdapterDescriptorFactory` 호출 자체는 활성화 테스트에서 실행되지만, 실제 DAP 핸드셰이크를 거치는 경로는 attach E2E가 skip 중이라 공백.
+- **Debug adapter descriptor factory** (`django-process` 타입) — 설정/credential 주입은 단위 테스트되고 injector와 native DAP는 각각 E2E로 검증되지만, 실제 VS Code가 factory의 descriptor와 attach arguments를 함께 전달하는 UI 경로는 별도 smoke test 후보.
 - **`FileSystemWatcher` + `onPyFileChanged` 디바운스 경로** — exclusion 필터는 분리·테스트 완료 (`Feature: hot reload exclusion filter`). 나머지 디바운스 + pending-set 병합 로직은 여전히 `extension.ts` 내부의 클로저. 후속으로 extract 고려.
-- **`Clean All` 명령 전체 플로우** — 부작용이 크고(파일 삭제·프로세스 kill) 샌드박싱 필요. 개선 작업 시 테스트 fixture 설계 필요.
+- **`Clean This Workspace` VS Code UI 흐름** — allow-list cleanup 코어는 단위 테스트되지만 modal 확인과 SetupProfile 연동의 실제 UI smoke test는 후속 후보.
 - **`djangoProcessDebugger.reinstallDebugpy`**, **`.killProcess`** 등 UI 의존 명령은 현재 등록 여부만 검증.
 
 ---

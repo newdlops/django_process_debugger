@@ -11,7 +11,12 @@ import {
 } from '../../processFinder';
 import { parseLsofTcpListenLine } from '../../listeningEndpoint';
 import { getPerf } from './perfReporter';
-import { findSystemPython, spawnFakeRunserver, SpawnedProcess } from './testHelpers';
+import {
+  allocateLoopbackPort,
+  findSystemPython,
+  spawnFakeRunserver,
+  SpawnedProcess,
+} from './testHelpers';
 
 describe('Feature: process discovery', function () {
   const perf = getPerf();
@@ -552,7 +557,7 @@ describe('Feature: process discovery', function () {
 
   describe('live ps integration', function () {
     let fake: SpawnedProcess | null = null;
-    const port = 49871;
+    let port = 0;
     let pythonBin: string | null;
 
     before(async function () {
@@ -562,6 +567,7 @@ describe('Feature: process discovery', function () {
         this.skip();
         return;
       }
+      port = await allocateLoopbackPort();
       fake = await spawnFakeRunserver(pythonBin, port);
     });
 

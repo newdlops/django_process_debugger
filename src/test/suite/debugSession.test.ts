@@ -2,12 +2,15 @@ import * as assert from 'assert';
 import type * as vscode from 'vscode';
 import { describe, it } from 'mocha';
 import {
+  DEBUG_SESSION_AUTH_TOKEN_KEY,
   DEBUG_SESSION_LOCK_TOKEN_KEY,
   DebugSessionLockGuard,
   DjangoDebugSessionFactory,
   parseDebugSessionPid,
 } from '../../debugSession';
 import type { DebugpyInjector } from '../../debugpyInjector';
+
+const EXPERIMENTAL_AUTH_TOKEN = 'a'.repeat(64);
 
 describe('Feature: debug session configuration', function () {
   it('accepts an omitted or positive integer PID', function () {
@@ -53,7 +56,11 @@ describe('Feature: debug session configuration', function () {
     const injector = {
       async activateEndpoint(...args: unknown[]) {
         activation = args;
-        return { host: '127.0.0.2', port: 45678 };
+        return {
+          host: '127.0.0.2',
+          port: 45678,
+          authToken: EXPERIMENTAL_AUTH_TOKEN,
+        };
       },
     } as unknown as DebugpyInjector;
     const factory = new DjangoDebugSessionFactory(injector, () => 'experimental');
@@ -68,6 +75,10 @@ describe('Feature: debug session configuration', function () {
 
     assert.ok(descriptor);
     assert.deepStrictEqual(activation, [43210, 0, 'experimental']);
+    assert.strictEqual(
+      session.configuration[DEBUG_SESSION_AUTH_TOKEN_KEY],
+      EXPERIMENTAL_AUTH_TOKEN,
+    );
   });
 
   it('rejects a live PID lock before activating the engine', async function () {
@@ -102,7 +113,11 @@ describe('Feature: debug session configuration', function () {
     let guardedTarget: unknown;
     const injector = {
       async activateEndpoint() {
-        return { host: '127.0.0.2', port: 45678 };
+        return {
+          host: '127.0.0.2',
+          port: 45678,
+          authToken: EXPERIMENTAL_AUTH_TOKEN,
+        };
       },
     } as unknown as DebugpyInjector;
     const guard: DebugSessionLockGuard = {
@@ -135,6 +150,55 @@ describe('Feature: debug session configuration', function () {
     });
     assert.strictEqual(session.configuration.host, '127.0.0.2');
     assert.strictEqual(session.configuration.port, 45678);
+    assert.strictEqual(
+      session.configuration[DEBUG_SESSION_AUTH_TOKEN_KEY],
+      EXPERIMENTAL_AUTH_TOKEN,
+    );
+  });
+
+  it('rejects an experimental endpoint that omits DAP authentication', async function () {
+    const injector = {
+      async activateEndpoint() {
+        return { host: '127.0.0.2', port: 45678 };
+      },
+    } as unknown as DebugpyInjector;
+    const factory = new DjangoDebugSessionFactory(injector, () => 'experimental');
+    const session = {
+      id: 'missing-experimental-auth-test',
+      type: 'django-process',
+      name: 'Missing Auth',
+      configuration: { pid: 43210, port: 0 },
+    } as unknown as vscode.DebugSession;
+
+    assert.strictEqual(await factory.createDebugAdapterDescriptor(session), null);
+    assert.strictEqual(
+      session.configuration[DEBUG_SESSION_AUTH_TOKEN_KEY],
+      undefined,
+    );
+  });
+
+  it('removes internal DAP credentials from debugpy sessions', async function () {
+    const injector = {
+      async activateEndpoint() {
+        return { host: '127.0.0.2', port: 45678 };
+      },
+    } as unknown as DebugpyInjector;
+    const factory = new DjangoDebugSessionFactory(injector, () => 'debugpy');
+    const session = {
+      id: 'debugpy-auth-cleanup-test',
+      type: 'django-process',
+      name: 'Debugpy Auth Cleanup',
+      configuration: {
+        pid: 43210,
+        [DEBUG_SESSION_AUTH_TOKEN_KEY]: 'b'.repeat(64),
+      },
+    } as unknown as vscode.DebugSession;
+
+    assert.ok(await factory.createDebugAdapterDescriptor(session));
+    assert.strictEqual(
+      session.configuration[DEBUG_SESSION_AUTH_TOKEN_KEY],
+      undefined,
+    );
   });
 
   it('releases its PID-lock lease when engine activation fails', async function () {

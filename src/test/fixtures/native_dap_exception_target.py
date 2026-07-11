@@ -13,6 +13,7 @@ sys.path.insert(0, sys.argv[1])
 from django_process_debugger_tracer import start
 
 
+AUTH_TOKEN = "0123456789abcdef" * 4
 EXCEPTION_TEXT_HOOKS = []
 ORIGINAL_EXCEPTION_HOOKS = []
 
@@ -70,13 +71,14 @@ def quiet_thread_exception(_args):
 
 
 threading.excepthook = quiet_thread_exception
-endpoint = start("127.0.0.1", 0)
+endpoint = start("127.0.0.1", 0, auth_token=AUTH_TOKEN)
 print(
     json.dumps(
         {
             "pid": os.getpid(),
             "host": endpoint[0],
             "port": endpoint[1],
+            "authToken": AUTH_TOKEN,
             "source": __file__,
         }
     ),

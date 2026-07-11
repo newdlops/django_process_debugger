@@ -18,6 +18,8 @@ interface DapMessage {
   body?: Record<string, unknown>;
 }
 
+const DAP_AUTH_TOKEN_KEY = '__djangoProcessDebuggerAuthToken';
+
 class RawDapClient {
   private readonly socket: net.Socket;
   private buffer = Buffer.alloc(0);
@@ -244,6 +246,25 @@ describe('Feature: dependency-free experimental DAP tracer', function () {
     // The extension's liveness check uses a connect-and-close probe. It must
     // not consume the tracer's one real DAP session.
     await probeEndpoint(host, port);
+
+    const unauthorized = await RawDapClient.connect(host, port);
+    const unauthorizedInitialize = unauthorized.request('initialize', {
+      adapterID: 'django-process',
+    });
+    assert.strictEqual(
+      (await unauthorized.response(unauthorizedInitialize)).success,
+      true,
+    );
+    const unauthorizedAttach = unauthorized.request('attach', {
+      request: 'attach',
+      [DAP_AUTH_TOKEN_KEY]: 'f'.repeat(64),
+    });
+    const unauthorizedResponse = await unauthorized.response(unauthorizedAttach);
+    assert.strictEqual(unauthorizedResponse.success, false);
+    assert.strictEqual(unauthorizedResponse.message, 'Authentication failed');
+    unauthorized.close();
+    await sleep(30);
+
     client = await RawDapClient.connect(host, port);
 
     const initialize = client.request('initialize', {
@@ -270,7 +291,10 @@ describe('Feature: dependency-free experimental DAP tracer', function () {
     assert.strictEqual(initializeResponse.body?.supportsVariableType, undefined);
     assert.strictEqual(initializeResponse.body?.supportsEvaluateForHovers, undefined);
 
-    const attach = client.request('attach', { request: 'attach' });
+    const attach = client.request('attach', {
+      request: 'attach',
+      [DAP_AUTH_TOKEN_KEY]: String(info.authToken),
+    });
     await client.event('initialized');
     await sleep(30);
     assert.strictEqual(client.hasResponse(attach), false, 'attach must wait for configurationDone');
@@ -464,13 +488,53 @@ describe('Feature: dependency-free experimental DAP tracer', function () {
 
     const scopesRequest = client.request('scopes', { frameId });
     const scopes = (await client.response(scopesRequest)).body?.scopes as Array<Record<string, unknown>>;
-    const localsReference = Number(scopes[0].variablesReference);
-    const globalsReference = Number(scopes[1].variablesReference);
+    const localsScope = scopes.find((scope) => scope.name === 'Locals');
+    const requestScope = scopes.find((scope) => scope.name === 'Django Request');
+    const globalsScope = scopes.find((scope) => scope.name === 'Globals');
+    assert.ok(localsScope);
+    assert.ok(requestScope, 'ordinary request breakpoint must expose Django Request');
+    assert.ok(globalsScope);
+    const localsReference = Number(localsScope.variablesReference);
+    const requestReference = Number(requestScope.variablesReference);
+    const globalsReference = Number(globalsScope.variablesReference);
     const repeatedScopesRequest = client.request('scopes', { frameId });
     const repeatedScopes = (await client.response(repeatedScopesRequest)).body
       ?.scopes as Array<Record<string, unknown>>;
-    assert.strictEqual(Number(repeatedScopes[0].variablesReference), localsReference);
-    assert.strictEqual(Number(repeatedScopes[1].variablesReference), globalsReference);
+    assert.strictEqual(
+      Number(repeatedScopes.find((scope) => scope.name === 'Locals')?.variablesReference),
+      localsReference,
+    );
+    assert.strictEqual(
+      Number(repeatedScopes.find((scope) => scope.name === 'Django Request')?.variablesReference),
+      requestReference,
+    );
+    assert.strictEqual(
+      Number(repeatedScopes.find((scope) => scope.name === 'Globals')?.variablesReference),
+      globalsReference,
+    );
+
+    const requestVariablesRequest = client.request('variables', {
+      variablesReference: requestReference,
+    });
+    const requestVariables = (await client.response(requestVariablesRequest)).body
+      ?.variables as Array<Record<string, unknown>>;
+    const requestValues = new Map(requestVariables.map((variable) => [
+      String(variable.name),
+      String(variable.value),
+    ]));
+    assert.strictEqual(requestValues.get('request'), '<WSGIRequest>');
+    assert.strictEqual(requestValues.get('method'), "'GET'");
+    assert.strictEqual(requestValues.get('path'), "'/orders/42/'");
+    assert.strictEqual(requestValues.get('path_info'), "'/orders/42/'");
+    assert.strictEqual(requestValues.get('resolver_match'), "'orders:detail'");
+    const mutateRequestSnapshot = client.request('setVariable', {
+      variablesReference: requestReference,
+      name: 'method',
+      value: "'POST'",
+    });
+    const mutateRequestResponse = await client.response(mutateRequestSnapshot);
+    assert.strictEqual(mutateRequestResponse.success, false);
+    assert.match(String(mutateRequestResponse.message), /read.?only/i);
 
     const globalsVariablesRequest = client.request('variables', {
       variablesReference: globalsReference,
@@ -480,6 +544,11 @@ describe('Feature: dependency-free experimental DAP tracer', function () {
     const globalValue = globalsVariables.find((variable) => variable.name === 'GLOBAL_VALUE');
     const shadowedGlobal = globalsVariables.find(
       (variable) => variable.name === 'SHADOWED_VALUE',
+    );
+    assert.strictEqual(
+      globalsVariables.find((variable) => variable.name === 'REQUEST_HOOK_CALLS')?.value,
+      '[]',
+      'request scope discovery must not call repr, str, or properties',
     );
     assert.strictEqual(globalValue?.evaluateName, 'GLOBAL_VALUE');
     assert.strictEqual(shadowedGlobal?.evaluateName, undefined);
@@ -1235,7 +1304,10 @@ describe('Feature: dependency-free experimental DAP tracer', function () {
       [false, true, false],
     );
 
-    const attach = client.request('attach', { request: 'attach' });
+    const attach = client.request('attach', {
+      request: 'attach',
+      [DAP_AUTH_TOKEN_KEY]: String(info.authToken),
+    });
     await client.event('initialized');
     await setExceptionFilters([]);
     const configurationDone = client.request('configurationDone');
@@ -1672,7 +1744,10 @@ describe('Feature: dependency-free experimental DAP tracer', function () {
     assert.strictEqual(djangoFilter?.label, 'Django Request Exceptions');
     assert.strictEqual(djangoFilter?.default, false);
 
-    const attach = client.request('attach', { request: 'attach' });
+    const attach = client.request('attach', {
+      request: 'attach',
+      [DAP_AUTH_TOKEN_KEY]: String(info.authToken),
+    });
     await client.event('initialized');
     await setExceptionFilters([]);
     const configurationDone = client.request('configurationDone');

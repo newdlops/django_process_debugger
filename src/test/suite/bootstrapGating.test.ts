@@ -7,6 +7,7 @@ import * as path from 'path';
 import { DebugpyInjector } from '../../debugpyInjector';
 import { getPerf } from './perfReporter';
 import {
+  allocateLoopbackPort,
   createTempVenv,
   findSystemPython,
   fixturesDir,
@@ -101,7 +102,7 @@ describe('Feature: bootstrap gating on non-target processes', function () {
     // pattern, so _is_target_process() returns True and the bootstrap records a
     // "Bootstrap module loaded" line.
     let server: SpawnedProcess | null = null;
-    const gatingPort = 49_883;
+    const gatingPort = await allocateLoopbackPort();
     try {
       server = await spawnFakeRunserver(venv.python, gatingPort);
       // Give the bootstrap's _dbg_log a moment to flush.
@@ -117,12 +118,12 @@ describe('Feature: bootstrap gating on non-target processes', function () {
       `expected bootstrap log entry for target argv, got:\n${delta || '(empty)'}`,
     );
     assert.ok(
-      delta.includes('SIGUSR1+SIGUSR2 handlers installed'),
-      `expected signal handlers to be installed, got:\n${delta || '(empty)'}`,
+      delta.includes('Private activation control socket listening'),
+      `expected a private activation socket, got:\n${delta || '(empty)'}`,
     );
   });
 
-  it('live `manage.py shell` and `shell_plus` commands install the signal handlers', async function () {
+  it('live `manage.py shell` and `shell_plus` commands publish activation sockets', async function () {
     if (!venv) { this.skip(); return; }
     this.timeout(20_000);
 
@@ -145,8 +146,8 @@ describe('Feature: bootstrap gating on non-target processes', function () {
         `expected bootstrap log entry for "manage.py ${command}", got:\n${delta || '(empty)'}`,
       );
       assert.ok(
-        delta.includes('SIGUSR1+SIGUSR2 handlers installed'),
-        `expected signal handlers for "manage.py ${command}", got:\n${delta || '(empty)'}`,
+        delta.includes('Private activation control socket listening'),
+        `expected an activation socket for "manage.py ${command}", got:\n${delta || '(empty)'}`,
       );
     }
   });
@@ -177,8 +178,8 @@ describe('Feature: bootstrap gating on non-target processes', function () {
       `expected bootstrap log entry for "python -m celery worker", got:\n${delta || '(empty)'}`,
     );
     assert.ok(
-      delta.includes('SIGUSR1+SIGUSR2 handlers installed'),
-      `expected signal handlers to be installed for celery worker, got:\n${delta || '(empty)'}`,
+      delta.includes('Private activation control socket listening'),
+      `expected an activation socket for celery worker, got:\n${delta || '(empty)'}`,
     );
   });
 });

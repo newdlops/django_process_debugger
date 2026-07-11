@@ -5,7 +5,7 @@ Attach a debugger to a running Django or Celery process without modifying your c
 ## Features
 
 - Detect running Django and Celery processes with PID and port info
-- Attach debugpy at runtime via SIGUSR1/SIGUSR2 signal — no lldb, no code changes
+- Attach debugpy at runtime through a private PID-owned control socket — no lldb, process signal, or code changes
 - Opt in to a fully independent native tracer with conditional and hit-count breakpoints, logpoints, expression evaluation, and controlled value changes while keeping debugpy as the stable default
 - **Hot Reload** — edit Python files with either debug engine and see changes immediately without restarting Django or losing your debug session
 - Smart process tree resolution — select any process (uv wrapper, autoreloader, or child) and the debugger attaches to the right one
@@ -29,7 +29,7 @@ Pick the runtime that actually launches Django or Celery. The setup picker recom
 
 Before installing, the extension runs a preflight check for Python version, `site-packages`, writability, shared-runtime risk, and bundled `debugpy` availability. Successful setup is saved as a workspace profile so you can reuse it later.
 
-This installs a lightweight bootstrap into the target runtime's `site-packages` that registers a signal handler. Your project code is not modified.
+This installs a lightweight bootstrap into the target runtime's `site-packages` that publishes a private activation socket for supported long-running processes. Your project code is not modified.
 
 ### 2. Restart Django
 
@@ -63,7 +63,7 @@ Your debug session stays alive, breakpoints remain active, and the next request 
 | **Django Debugger: Attach to Django Process** | Attach debugger to a running Django/Celery process |
 | **Django Debugger: Kill Django/Celery Process** | Kill selected processes (multi-select supported) |
 | **Django Debugger: Reinstall debugpy** | Remove and reinstall the bundled debugpy |
-| **Django Debugger: Clean All** | Full reset: remove bootstrap files, kill stale processes, clear caches, repair Python binaries |
+| **Django Debugger: Clean This Workspace** | Remove debugger bootstrap files from this workspace's saved runtime after a safety preview. Does not stop Python processes or touch other runtimes/caches. |
 
 ## How It Works
 
@@ -77,7 +77,7 @@ Your debug session stays alive, breakpoints remain active, and the next request 
 }
 ```
 
-The experimental tracer currently supports line, conditional, hit-count, raised-exception, uncaught-exception, and Django-request-exception breakpoints, logpoints, hot reload, DAP exception details (`exceptionInfo`), stack frames, scopes, variable inspection, Python expression evaluation, Set Variable, continue, pause, step over, step in, and step out. Function breakpoints are not supported yet.
+The experimental tracer currently supports line, conditional, hit-count, raised-exception, uncaught-exception, and Django-request-exception breakpoints, logpoints, hot reload, DAP exception details (`exceptionInfo`), stack frames, scopes, Django request context at ordinary breakpoint stops, variable inspection, Python expression evaluation, Set Variable, continue, pause, step over, step in, and step out. Function breakpoints are not supported yet.
 
 Other VS Code extensions can consume the engine through the API returned by this extension's activation. The stable contract exposes the `django-process` debug type, supported engines, Setup/Status command IDs, and local-PID/hot-reload capabilities; consumers start a normal debug session so they cannot bypass PID locking or engine ownership.
 
@@ -86,6 +86,8 @@ Conditional breakpoints and Evaluate accept Python expressions in the selected f
 The `Raised Exceptions` filter stops at the exception's first raise site, including exceptions that application code catches later, without stopping again as the same exception propagates through callers. Generator/iterator control-flow exceptions (`StopIteration`, `StopAsyncIteration`, and `GeneratorExit`) are skipped. The `Uncaught Exceptions` filter stops post-mortem only when an exception escapes the main Python process entry point or a `threading.Thread.run()` entry point. Selecting both can therefore stop once at the raised phase and again if that exception is ultimately uncaught. Uncaught handling skips `SystemExit` and `KeyboardInterrupt`, and does not cover exceptions retained by asyncio tasks, `sys.unraisablehook` events, child-process failures, or native crashes. Exception details use bounded previews of directly stored `args`, include cause/context chains and Python 3.11+ exception-group children, and do not automatically call an application-defined `__str__` or `__repr__`.
 
 The `Django Request Exceptions` filter observes Django's `got_request_exception` boundary and stops with DAP break mode `userUnhandled` when Django is converting a request exception into an HTTP 500 response. It adds a `Django Request` scope for request context. Selecting it together with `Raised Exceptions` stops first at the raise site and again at the Django boundary. Request bodies, headers, and cookies are not evaluated automatically. Exceptions outside that boundary—including retained asyncio task exceptions, custom middleware that builds its own 500 response, and errors raised later while iterating a streaming response—remain governed by the existing Raised and Uncaught filters.
+
+At an ordinary breakpoint or step stop, the experimental tracer also exposes `Django Request` when an already-loaded `HttpRequest` is directly present in the bounded active stack. It never imports Django for discovery, follows object attributes, or evaluates request properties, `repr()`, or `str()`. The scope is a read-only snapshot of the stored request object, method, path, path info, and resolver match; detached asyncio tasks without a request in their active stack are intentionally not guessed from thread-global state.
 
 At an uncaught or Django-request post-mortem stop, the original frames have already unwound but remain available for stack, scope, variable, and expression inspection. Continue releases the stop; stepping and Set Variable are unavailable for those historical frames.
 
@@ -105,19 +107,23 @@ Conditional breakpoint, logpoint, Evaluate, Set Variable, and lazy-member expres
 
 Changing the setting affects new sessions only. Both engines retain process-level tracing state after a DAP session ends, so the first activated engine owns that PID until it restarts. Restart the target process before attaching it with the other engine.
 
+The experimental DAP listener requires a random 256-bit process credential in its `attach` request. The credential is carried only through private runtime files/session configuration, is compared using a fixed-size digest, and is omitted from debugger logs and the tracer status API. The stable debugpy protocol is unchanged.
+
 On Python 3.11 and earlier, pure `sys.settrace` cannot immediately install tracing into every already-running non-main thread. The experimental backend guarantees the current/main thread that handles activation and threads created after activation; broader existing-thread support is still under development. It also refuses activation when another coverage/debug/profiling trace hook is already installed instead of replacing that hook.
 
 ### Debug Attach
 
-1. **Setup** installs a `.pth` file and a small Python module into your target runtime's `site-packages`. The `.pth` file causes Python to auto-load the module at startup, which registers a SIGUSR1/SIGUSR2 signal handler. Long-running servers and interactive `manage.py shell`/`shell_plus` processes are supported; tools like pip, pytest, and language servers are explicitly excluded via a blocklist.
+1. **Setup** installs a `.pth` file and a small Python module into your target runtime's `site-packages`. The `.pth` file causes Python to auto-load the module at startup, which creates a private PID-owned Unix control socket and publishes the runtime's exact Python executable and random process identity. Long-running servers and interactive `manage.py shell`/`shell_plus` processes are supported; tools like pip, pytest, and language servers are explicitly excluded via a blocklist.
 
-2. **Attach** finds the target process, resolves the process tree to find the actual debuggable child process (handling `uv run`, `poetry run`, Django autoreloader, etc.), writes an engine activation request to a temp file, sends SIGUSR1 (or SIGUSR2 for Celery), and waits for the selected engine to start listening. The process picker shows CWD first, includes its final folder beside the PID, and lets you search by CWD. Then VS Code connects via DAP (Debug Adapter Protocol) over TCP.
+2. **Attach** finds the target process, resolves the process tree to find the actual debuggable child process (handling `uv run`, `poetry run`, Django autoreloader, etc.), verifies its direct runtime state, and sends an authenticated activation request over that private socket. No process signal is used, so stale PID state fails safely. The process picker shows CWD first, includes its final folder beside the PID, and lets you search by CWD. Then VS Code connects via DAP (Debug Adapter Protocol) over TCP.
 
 3. **debugpy** is shipped as a vendored bundle inside the extension and copied into private extension storage on first use, so your target runtime stays clean. If macOS blocks the Python binary (code signature issue), the extension still auto-repairs it with `codesign --force --deep --sign -` when pip fallback is needed.
 
 ### Hot Reload
 
-When either debug engine activates, a background watcher thread starts in the Django process. On the VS Code side, a `FileSystemWatcher` monitors `**/*.py` files. The experimental engine excludes this internal watcher thread from tracing so reload implementation details cannot trigger application breakpoints or Raised exception filters.
+Hot reload has its own lifecycle and does not start merely because a debug engine is listening. Each live debug session acquires a private, expiring lease for its target PID; only then does the target start its watcher and temporarily suppress Django's autoreloader. VS Code uses one `FileSystemWatcher` for `**/*.py` and independent per-PID reload queues, so simultaneous targets do not block one another. The experimental engine excludes the internal watcher thread from tracing so reload implementation details cannot trigger application breakpoints or Raised exception filters.
+
+The lease is renewed through an atomic `0600` file, which still works while debugger breakpoints suspend Python threads. Turning the setting off, ending the last session for a PID, or deactivating the extension releases the lease. If VS Code or its extension host crashes, the target expires it automatically after a short TTL. On the final release or expiry, the target disconnects only its own `file_changed` receiver and restores `trigger_reload()` only if that hook is still the one it installed, preserving later third-party patches.
 
 When you save a file:
 
@@ -129,6 +135,8 @@ When you save a file:
 6. Django's autoreloader is suppressed via two layers:
    - `file_changed` signal handler returning `True` (Django's built-in extension point)
    - `trigger_reload()` patched to prevent `sys.exit(3)`
+
+Both layers exist only while at least one valid hot-reload lease is live.
 
 This approach works with:
 - Function-based views and class-based views (CBV)
@@ -174,7 +182,7 @@ You can select **any** process in the tree — the extension walks down to the d
 
 - macOS (Apple Silicon supported)
 - Python 3.8+
-- pip (for initial debugpy bundling)
+- pip only when the vendored debugpy bundle is unavailable and fallback provisioning is required
 
 ## Settings
 
@@ -213,15 +221,15 @@ You can select **any** process in the tree — the extension walks down to the d
 
 ### Python killed after extension use
 
-If Python processes are being killed with `zsh: killed`, run **Django Debugger: Clean All**. This removes all bootstrap files, clears quarantine attributes, and re-signs Python binaries with an ad-hoc code signature.
+Run **Django Debugger: Clean This Workspace** to remove bootstrap files from the exact runtime saved by Setup. The cleanup previews its allow-listed scope first and never stops Python processes, scans other runtimes, clears language-server caches, or re-signs unrelated Python binaries. Restart a running Django/Celery process afterward to unload a bootstrap that was already imported.
 
 ### Language server crashes
 
-If Jedi or Pylance keeps crashing, run **Clean All** and reload the VS Code window when prompted. The bootstrap uses a strict blocklist to prevent interfering with language servers.
+If Jedi or Pylance keeps crashing after Setup, run **Clean This Workspace**, restart the affected Python tools, and inspect the extension logs. The bootstrap uses a strict blocklist to prevent interfering with language servers.
 
 ### debugpy installation fails with SIGKILL
 
-The extension automatically detects SIGKILL during pip install and attempts to repair the Python binary's macOS code signature before retrying. If it still fails, run **Clean All** first, then try again.
+The extension automatically detects SIGKILL during pip install and attempts a targeted repair of the selected Python runtime before retrying. If it still fails, use **Reinstall debugpy** or rerun **Setup** with a healthy runtime; workspace cleanup no longer performs broad binary re-signing.
 
 ### "Bootstrap not installed" after Setup
 

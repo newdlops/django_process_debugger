@@ -1,6 +1,8 @@
 import { execFile } from 'child_process';
+import { randomBytes } from 'crypto';
 import { promisify } from 'util';
 import * as fs from 'fs/promises';
+import * as net from 'net';
 import * as path from 'path';
 import { DEFAULT_DEBUG_ENGINE, isDebugEngine, type DebugEngine } from './debugEngine';
 import { log, logError } from './logger';
@@ -22,20 +24,43 @@ const TRACER_SOURCE_PATH = path.resolve(
   'python',
   'django_process_debugger_tracer.py',
 );
-export const BOOTSTRAP_VERSION = '2026.07.10.10';
-export type DebugpyEndpoint = TcpListeningEndpoint;
+export const BOOTSTRAP_VERSION = '2026.07.11.4';
+export type DebugpyEndpoint = TcpListeningEndpoint & { authToken?: string };
+const ACTIVE_ENDPOINT_RECORD_VERSION = 3;
 type BootstrapRuntimeState = {
   pid: number;
   version: string;
   engines?: DebugEngine[];
   activationVersion?: number;
+  pythonExecutable?: string;
+  runtimeId?: string;
+  controlSocket?: string;
+};
+type CurrentBootstrapControlState = BootstrapRuntimeState & {
+  runtimeId: string;
+  controlSocket: string;
 };
 type HotReloadResultPayload = {
   requestId?: string;
+  leaseId?: string;
   results: string[];
 };
 
 let hotReloadRequestSequence = 0;
+const EXPERIMENTAL_AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
+const HOT_RELOAD_LEASE_ID_PATTERN = /^[0-9a-f]{64}$/;
+const RUNTIME_ID_PATTERN = /^[0-9a-f]{64}$/i;
+
+export const HOT_RELOAD_LEASE_TTL_MS = 15_000;
+export const HOT_RELOAD_LEASE_HEARTBEAT_MS = 5_000;
+
+export function isValidExperimentalAuthToken(value: unknown): value is string {
+  return typeof value === 'string' && EXPERIMENTAL_AUTH_TOKEN_PATTERN.test(value);
+}
+
+export function isValidHotReloadLeaseId(value: unknown): value is string {
+  return typeof value === 'string' && HOT_RELOAD_LEASE_ID_PATTERN.test(value);
+}
 
 function pythonProbeEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
@@ -48,17 +73,15 @@ function pythonProbeEnv(): NodeJS.ProcessEnv {
 
 /**
  * Bootstrap script installed into the target venv's site-packages.
- * Installs a SIGUSR1/SIGUSR2 handler that starts the selected engine on demand.
+ * Installs a private per-process control socket that starts the selected engine
+ * on demand without sending a potentially fatal signal to the target PID.
  *
  * The generated bootstrap embeds the bundled debugpy path and imports the
  * installed native tracer companion when experimental mode is selected.
- */
-/**
- * Activation file path: the extension writes a versioned engine/port payload
- * here before sending a signal. The legacy .port filename and integer content
- * remain supported for debugpy compatibility.
- * Using a file avoids the problem of not being able to set env vars on
- * an already-running process.
+ *
+ * Runtime state, endpoint, and hot-reload coordination files live in a private
+ * per-user directory. Engine activation itself uses a PID-owned Unix socket so
+ * PID reuse can only produce a safe connection failure, never a fatal signal.
  */
 const PORT_FILE_DIR = '/tmp/django-process-debugger';
 
@@ -71,8 +94,8 @@ async function ensurePrivatePortFileDir(): Promise<void> {
     // file operation will surface a useful error if it is not writable.
   }
 }
-function portFilePath(pid: number): string {
-  return `${PORT_FILE_DIR}/${pid}.port`;
+function controlSocketPath(pid: number): string {
+  return `${PORT_FILE_DIR}/${pid}.control.sock`;
 }
 
 function activeFilePath(pid: number, engine: DebugEngine): string {
@@ -97,8 +120,20 @@ function reloadResultFilePath(pid: number): string {
   return `${PORT_FILE_DIR}/${pid}.reload.result`;
 }
 
+function hotReloadLeaseFilePath(pid: number, leaseId: string): string {
+  return `${PORT_FILE_DIR}/${pid}.hot-reload.${leaseId}.lease`;
+}
+
 function isFsError(error: unknown, code: string): boolean {
   return (error as NodeJS.ErrnoException | undefined)?.code === code;
+}
+
+async function unlinkIfExists(filePath: string): Promise<void> {
+  try {
+    await fs.unlink(filePath);
+  } catch (error) {
+    if (!isFsError(error, 'ENOENT')) { throw error; }
+  }
 }
 
 function nextHotReloadRequestId(pid: number): string {
@@ -112,13 +147,14 @@ function parseHotReloadResult(content: string): HotReloadResultPayload {
     if (typeof parsed === 'object' && parsed !== null) {
       const candidate = parsed as Record<string, unknown>;
       if (
-        candidate.version === 2
+        (candidate.version === 2 || candidate.version === 3)
         && typeof candidate.requestId === 'string'
         && Array.isArray(candidate.results)
         && candidate.results.every((entry) => typeof entry === 'string')
       ) {
         return {
           requestId: candidate.requestId,
+          ...(typeof candidate.leaseId === 'string' ? { leaseId: candidate.leaseId } : {}),
           results: candidate.results as string[],
         };
       }
@@ -134,15 +170,6 @@ function parseHotReloadResult(content: string): HotReloadResultPayload {
 
 function bootstrapStateFilePath(pid: number): string {
   return `${PORT_FILE_DIR}/${pid}.bootstrap.json`;
-}
-
-function isCeleryWorkerCommand(command: string): boolean {
-  return [
-    /(?:^|\s)(?:\S*\/)?celery(?:\s|$).*?\bworker\b/i,
-    /(?:^|\s)-m\s+celery(?:\s|$).*?\bworker\b/i,
-    /(?:^|\s)(?:\S*\/)?celery(?:\s|$).*?\bmulti\s+start\b/i,
-    /(?:^|\s)(?:\S*\/)?celeryd(?:\s|$)/i,
-  ].some((pattern) => pattern.test(command));
 }
 
 function makeBootstrapScript(bundledDebugpyPath: string): string {
@@ -217,11 +244,14 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '        return False',
     '',
     '    if _is_target_process():',
-    '        import signal as _signal',
     '        import traceback as _traceback',
     '',
     '        _PORT_FILE_DIR = ' + JSON.stringify(PORT_FILE_DIR),
     '        _LOG_FILE = _PORT_FILE_DIR + "/bootstrap.log"',
+    '        _bootstrap_pid = _os.getpid()',
+    '        _runtime_id = _os.urandom(32).hex()',
+    '        _control_socket_path = f"{_PORT_FILE_DIR}/{_bootstrap_pid}.control.sock"',
+    '        _control_server_socket = None',
     '',
     '        def _dbg_log(msg):',
     '            try:',
@@ -241,28 +271,83 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                _state_file = f"{_PORT_FILE_DIR}/{_os.getpid()}.bootstrap.json"',
     '                _state_tmp = _state_file + ".tmp"',
     '                with open(_state_tmp, "w") as _f:',
-    '                    _f.write(_json.dumps({"version": ' + JSON.stringify(BOOTSTRAP_VERSION) + ', "pid": _os.getpid(), "engines": ["debugpy", "experimental"], "activationVersion": 1}))',
+    '                    _f.write(_json.dumps({',
+    '                        "version": ' + JSON.stringify(BOOTSTRAP_VERSION) + ',',
+    '                        "pid": _os.getpid(),',
+    '                        "engines": ["debugpy", "experimental"],',
+    '                        "activationVersion": 2,',
+    '                        "pythonExecutable": _sys.executable,',
+    '                        "runtimeId": _runtime_id,',
+    '                        "controlSocket": _control_socket_path,',
+    '                    }))',
     '                _os.chmod(_state_tmp, 0o600)',
     '                _os.replace(_state_tmp, _state_file)',
     '            except Exception as _e:',
     '                _dbg_log(f"Failed to write bootstrap state: {_e}")',
     '',
-    '        _dbg_log("Bootstrap module loaded, installing signal handlers")',
-    '        _write_bootstrap_state()',
+    '        import threading as _threading',
+    '        import time as _time',
     '',
     '        _hot_reload_watcher_started = False',
+    '        _hot_reload_thread = None',
+    '        _hot_reload_leases = {}',
+    '        _hot_reload_lock = _threading.RLock()',
+    '        _hot_reload_wake_event = _threading.Event()',
+    '        _hot_reload_signal = None',
+    '        _hot_reload_receiver = None',
+    '        _hot_reload_dispatch_uid = None',
+    '        _hot_reload_autoreload_module = None',
+    '        _hot_reload_trigger_wrapper = None',
+    '        _hot_reload_original_trigger = None',
+    '        _hot_reload_inherited_signal = None',
+    '        _hot_reload_inherited_dispatch_uid = None',
     '        _engine_endpoints = {}',
     '        _activated_engine = None',
-    '        _bootstrap_pid = _os.getpid()',
     '',
     '        def _reset_bootstrap_after_fork():',
-    '            global _hot_reload_watcher_started, _engine_endpoints, _activated_engine, _bootstrap_pid',
-    '            # The child has no copy of parent daemon threads and must own',
-    '            # a fresh activation lifecycle. Never retain parent endpoints.',
+    '            global _hot_reload_watcher_started, _hot_reload_thread, _hot_reload_leases',
+    '            global _hot_reload_lock, _hot_reload_wake_event',
+    '            global _hot_reload_signal, _hot_reload_receiver, _hot_reload_dispatch_uid',
+    '            global _hot_reload_autoreload_module, _hot_reload_trigger_wrapper, _hot_reload_original_trigger',
+    '            global _hot_reload_inherited_signal, _hot_reload_inherited_dispatch_uid',
+    '            global _engine_endpoints, _activated_engine, _bootstrap_pid',
+    '            global _runtime_id, _control_socket_path, _control_server_socket',
+    '            # The child has no copy of parent daemon threads. Close the',
+    '            # inherited descriptor and publish a fresh PID-owned identity',
+    '            # and control socket before it can be attached.',
+    '            _inherited_server = _control_server_socket',
+    '            _control_server_socket = None',
+    '            if _inherited_server is not None:',
+    '                try:',
+    '                    _inherited_server.close()',
+    '                except Exception:',
+    '                    pass',
     '            _bootstrap_pid = _os.getpid()',
+    '            _runtime_id = _os.urandom(32).hex()',
+    '            _control_socket_path = f"{_PORT_FILE_DIR}/{_bootstrap_pid}.control.sock"',
     '            _engine_endpoints = {}',
     '            _activated_engine = None',
+    '            # Threads do not survive fork. Inherited suppression callbacks',
+    '            # remain structurally installed, so make them fail open by',
+    '            # clearing leases and changing the PID. A later child acquire',
+    '            # removes the inert inherited signal receiver at a safe point.',
+    '            _hot_reload_inherited_signal = _hot_reload_signal',
+    '            _hot_reload_inherited_dispatch_uid = _hot_reload_dispatch_uid',
     '            _hot_reload_watcher_started = False',
+    '            _hot_reload_thread = None',
+    '            _hot_reload_leases = {}',
+    '            _hot_reload_lock = _threading.RLock()',
+    '            _hot_reload_wake_event = _threading.Event()',
+    '            _hot_reload_signal = None',
+    '            _hot_reload_receiver = None',
+    '            _hot_reload_dispatch_uid = None',
+    '            _hot_reload_autoreload_module = None',
+    '            _hot_reload_trigger_wrapper = None',
+    '            _hot_reload_original_trigger = None',
+    '            try:',
+    '                _start_activation_control_server()',
+    '            except Exception as _e:',
+    '                _dbg_log(f"Failed to restart activation control server after fork: {_e}")',
     '',
     '        _register_at_fork = getattr(_os, "register_at_fork", None)',
     '        if _register_at_fork is not None:',
@@ -274,8 +359,187 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '        # Keyed by module name -> {function_key: WeakSet(function_object)}.',
     '        _original_mod_funcs = {}',
     '',
+    '        def _hot_reload_lease_path(_lease_id):',
+    '            return f"{_PORT_FILE_DIR}/{_os.getpid()}.hot-reload.{_lease_id}.lease"',
+    '',
+    '        def _prune_hot_reload_leases_locked():',
+    '            """Remove missing/expired leases. Caller must hold the RLock."""',
+    '            _now = _time.time()',
+    '            for _lease_id, _ttl_seconds in list(_hot_reload_leases.items()):',
+    '                _lease_file = _hot_reload_lease_path(_lease_id)',
+    '                _fresh = False',
+    '                try:',
+    '                    _lease_stat = _os.stat(_lease_file)',
+    '                    _fresh = (',
+    '                        _lease_stat.st_uid == _os.getuid()',
+    '                        and (_lease_stat.st_mode & 0o077) == 0',
+    '                        and _now - _lease_stat.st_mtime <= _ttl_seconds',
+    '                    )',
+    '                except (FileNotFoundError, OSError):',
+    '                    _fresh = False',
+    '                if _fresh:',
+    '                    continue',
+    '                _hot_reload_leases.pop(_lease_id, None)',
+    '                try:',
+    '                    _os.unlink(_lease_file)',
+    '                except FileNotFoundError:',
+    '                    pass',
+    '                except Exception as _e:',
+    '                    _dbg_log(f"Could not remove expired hot reload lease: {_e}")',
+    '                _dbg_log(f"Hot reload lease expired or released: {_lease_id[:12]}")',
+    '            return bool(_hot_reload_leases)',
+    '',
+    '        def _hot_reload_lease_is_live(_lease_id=None):',
+    '            if _os.getpid() != _bootstrap_pid:',
+    '                return False',
+    '            with _hot_reload_lock:',
+    '                _prune_hot_reload_leases_locked()',
+    '                if _lease_id is None:',
+    '                    return bool(_hot_reload_leases)',
+    '                return _lease_id in _hot_reload_leases',
+    '',
+    '        def _install_hot_reload_suppression_locked():',
+    '            """Install reversible Django autoreloader hooks for this PID."""',
+    '            global _hot_reload_signal, _hot_reload_receiver, _hot_reload_dispatch_uid',
+    '            global _hot_reload_autoreload_module, _hot_reload_trigger_wrapper, _hot_reload_original_trigger',
+    '            global _hot_reload_inherited_signal, _hot_reload_inherited_dispatch_uid',
+    '            if _hot_reload_trigger_wrapper is not None or _hot_reload_receiver is not None:',
+    '                return True',
+    '            try:',
+    '                import django.utils.autoreload as _autoreload_mod',
+    '                _file_changed_signal = _autoreload_mod.file_changed',
+    '            except ImportError:',
+    '                # Celery and other supported Python targets may not import',
+    '                # Django. Module hot reload remains useful without hooks.',
+    '                _dbg_log("Django autoreloader unavailable; no suppression needed")',
+    '                return True',
+    '            except Exception as _e:',
+    '                _dbg_log(f"Could not inspect Django autoreloader: {_e}")',
+    '                return False',
+    '',
+    '            # A fork child can inherit the parent Signal receiver even though',
+    '            # its thread and leases are gone. Remove that inert receiver now,',
+    '            # outside the at-fork callback where Django locks are unsafe.',
+    '            if _hot_reload_inherited_signal is not None and _hot_reload_inherited_dispatch_uid is not None:',
+    '                try:',
+    '                    _hot_reload_inherited_signal.disconnect(',
+    '                        dispatch_uid=_hot_reload_inherited_dispatch_uid,',
+    '                    )',
+    '                except Exception as _e:',
+    '                    _dbg_log(f"Could not remove inherited autoreload receiver: {_e}")',
+    '                _hot_reload_inherited_signal = None',
+    '                _hot_reload_inherited_dispatch_uid = None',
+    '',
+    '            _owner_pid = _os.getpid()',
+    '            _dispatch_uid = f"django-process-debugger-hot-reload-{_owner_pid}"',
+    '            _current_trigger = _autoreload_mod.trigger_reload',
+    '            _original_trigger = getattr(',
+    '                _current_trigger,',
+    '                "_django_process_debugger_original_trigger",',
+    '                _current_trigger,',
+    '            )',
+    '',
+    '            def _suppress_autoreload(sender=None, file_path=None, **kwargs):',
+    '                if _os.getpid() == _owner_pid and _hot_reload_lease_is_live():',
+    '                    _dbg_log(f"Autoreload suppressed (signal): {file_path}")',
+    '                    return True',
+    '                return None',
+    '',
+    '            def _suppressed_trigger_reload(filename):',
+    '                if _os.getpid() == _owner_pid and _hot_reload_lease_is_live():',
+    '                    _dbg_log(f"Autoreload suppressed (trigger_reload): {filename}")',
+    '                    return None',
+    '                return _original_trigger(filename)',
+    '',
+    '            _suppressed_trigger_reload._django_process_debugger_original_trigger = _original_trigger',
+    '            _suppressed_trigger_reload._django_process_debugger_owner_pid = _owner_pid',
+    '            _signal_connected = False',
+    '            try:',
+    '                _file_changed_signal.connect(',
+    '                    _suppress_autoreload,',
+    '                    weak=False,',
+    '                    dispatch_uid=_dispatch_uid,',
+    '                )',
+    '                _signal_connected = True',
+    '                _autoreload_mod.trigger_reload = _suppressed_trigger_reload',
+    '            except Exception as _e:',
+    '                if _signal_connected:',
+    '                    try:',
+    '                        _file_changed_signal.disconnect(dispatch_uid=_dispatch_uid)',
+    '                    except Exception:',
+    '                        pass',
+    '                if getattr(_autoreload_mod, "trigger_reload", None) is _suppressed_trigger_reload:',
+    '                    _autoreload_mod.trigger_reload = _original_trigger',
+    '                _dbg_log(f"Could not install Django autoreload suppression: {_e}")',
+    '                return False',
+    '',
+    '            _hot_reload_signal = _file_changed_signal',
+    '            _hot_reload_receiver = _suppress_autoreload',
+    '            _hot_reload_dispatch_uid = _dispatch_uid',
+    '            _hot_reload_autoreload_module = _autoreload_mod',
+    '            _hot_reload_trigger_wrapper = _suppressed_trigger_reload',
+    '            _hot_reload_original_trigger = _original_trigger',
+    '            _dbg_log("Django autoreloader suppression installed")',
+    '            return True',
+    '',
+    '        def _restore_hot_reload_suppression_locked():',
+    '            """Restore only hooks still owned by this bootstrap instance."""',
+    '            global _hot_reload_signal, _hot_reload_receiver, _hot_reload_dispatch_uid',
+    '            global _hot_reload_autoreload_module, _hot_reload_trigger_wrapper, _hot_reload_original_trigger',
+    '            if _hot_reload_signal is not None and _hot_reload_dispatch_uid is not None:',
+    '                try:',
+    '                    _hot_reload_signal.disconnect(dispatch_uid=_hot_reload_dispatch_uid)',
+    '                except Exception as _e:',
+    '                    _dbg_log(f"Could not disconnect autoreload receiver: {_e}")',
+    '            if (',
+    '                _hot_reload_autoreload_module is not None',
+    '                and getattr(_hot_reload_autoreload_module, "trigger_reload", None) is _hot_reload_trigger_wrapper',
+    '            ):',
+    '                try:',
+    '                    _hot_reload_autoreload_module.trigger_reload = _hot_reload_original_trigger',
+    '                except Exception as _e:',
+    '                    _dbg_log(f"Could not restore Django trigger_reload: {_e}")',
+    '            _hot_reload_signal = None',
+    '            _hot_reload_receiver = None',
+    '            _hot_reload_dispatch_uid = None',
+    '            _hot_reload_autoreload_module = None',
+    '            _hot_reload_trigger_wrapper = None',
+    '            _hot_reload_original_trigger = None',
+    '            _dbg_log("Django autoreloader suppression restored")',
+    '',
+    '        def _acquire_hot_reload_lease(_lease_id, _ttl_ms):',
+    '            if (',
+    '                not isinstance(_lease_id, str)',
+    '                or len(_lease_id) != 64',
+    '                or any(_char not in "0123456789abcdef" for _char in _lease_id)',
+    '            ):',
+    '                _dbg_log("Rejected invalid hot reload lease ID")',
+    '                return False',
+    '            try:',
+    '                _ttl_ms = int(_ttl_ms)',
+    '            except Exception:',
+    '                return False',
+    '            if _ttl_ms < 500 or _ttl_ms > 120000:',
+    '                _dbg_log(f"Rejected invalid hot reload TTL: {_ttl_ms}")',
+    '                return False',
+    '            with _hot_reload_lock:',
+    '                _hot_reload_leases[_lease_id] = _ttl_ms / 1000.0',
+    '                if not _hot_reload_lease_is_live(_lease_id):',
+    '                    _dbg_log("Rejected missing or stale hot reload lease file")',
+    '                    return False',
+    '            if not _start_hot_reload_watcher():',
+    '                with _hot_reload_lock:',
+    '                    _hot_reload_leases.pop(_lease_id, None)',
+    '                    if not _hot_reload_leases:',
+    '                        _restore_hot_reload_suppression_locked()',
+    '                return False',
+    '            _hot_reload_wake_event.set()',
+    '            _dbg_log(f"Hot reload lease acquired: {_lease_id[:12]} ttl={_ttl_ms}ms")',
+    '            return True',
+    '',
     '        def _start_hot_reload_watcher():',
     '            """Start a daemon thread that watches for module reload requests."""',
+    '            global _hot_reload_watcher_started, _hot_reload_thread',
     '            import threading',
     '            import importlib',
     '            import importlib.util',
@@ -287,43 +551,16 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '            _reload_processing_file = _reload_file + ".processing"',
     '            _reload_result_file = f"{_PORT_FILE_DIR}/{_pid}.reload.result"',
     '',
-    '            # ── Suppress Django autoreloader restarts (multi-layer) ──',
-    '            #',
-    '            # Django restart flow: StatReloader.tick() detects mtime change',
-    '            #   → notify_file_changed(path)',
-    '            #   → file_changed signal dispatch',
-    '            #   → trigger_reload(path)  (if no handler returns True)',
-    '            #   → sys.exit(3)',
-    '            #   → parent process restarts child',
-    '            #',
-    '            # We suppress at TWO layers for robustness:',
-    '            #   1. file_changed signal handler returning True (Django built-in extension point)',
-    '            #   2. Patch trigger_reload() as belt-and-suspenders',
-    '',
-    '            # Layer 1: file_changed signal — returning True prevents trigger_reload()',
-    '            try:',
-    '                from django.utils.autoreload import file_changed as _file_changed_signal',
-    '                def _suppress_autoreload(sender, file_path, **kwargs):',
-    '                    _dbg_log(f"Autoreload suppressed (signal): {file_path}")',
+    '            with _hot_reload_lock:',
+    '                if not _prune_hot_reload_leases_locked():',
+    '                    return False',
+    '                if _hot_reload_thread is not None and _hot_reload_thread.is_alive():',
+    '                    if not _install_hot_reload_suppression_locked():',
+    '                        return False',
     '                    return True',
-    '                _file_changed_signal.connect(',
-    '                    _suppress_autoreload,',
-    '                    weak=False,',
-    '                    dispatch_uid="django-process-debugger-hot-reload",',
-    '                )',
-    '                _dbg_log("Django file_changed signal handler registered")',
-    '            except Exception as _e:',
-    '                _dbg_log(f"Could not register file_changed handler: {_e}")',
-    '',
-    '            # Layer 2: patch trigger_reload() to prevent sys.exit(3)',
-    '            try:',
-    '                import django.utils.autoreload as _autoreload_mod',
-    '                def _suppressed_trigger_reload(filename):',
-    '                    _dbg_log(f"Autoreload suppressed (trigger_reload): {filename}")',
-    '                _autoreload_mod.trigger_reload = _suppressed_trigger_reload',
-    '                _dbg_log("Django trigger_reload patched")',
-    '            except Exception as _e:',
-    '                _dbg_log(f"Could not patch trigger_reload: {_e}")',
+    '                if not _install_hot_reload_suppression_locked():',
+    '                    return False',
+    '                _hot_reload_watcher_started = True',
     '',
     '            def _deep_reload_module(_mod):',
     '                """Reload _mod and swap __code__ on ALL function objects that',
@@ -530,7 +767,7 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                _remember_generation(_new_fns)',
     '                return sorted(_patched)',
     '',
-    '            def _publish_reload_result(_request_id, _results):',
+    '            def _publish_reload_result(_request_id, _results, _lease_id=None):',
     '                _result_tmp = (',
     '                    _reload_result_file',
     '                    + "."',
@@ -539,8 +776,9 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                )',
     '                _payload = (',
     '                    json.dumps({',
-    '                        "version": 2,',
+    '                        "version": 3 if _lease_id is not None else 2,',
     '                        "requestId": _request_id,',
+    '                        **({"leaseId": _lease_id} if _lease_id is not None else {}),',
     '                        "results": _results,',
     '                    })',
     '                    if _request_id is not None',
@@ -569,6 +807,7 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                    _dbg_log(f"Could not clear reload claim: {_e}")',
     '',
     '            def _reload_watcher():',
+    '                global _hot_reload_watcher_started, _hot_reload_thread',
     '                # The experimental tracer installs threading.settrace().',
     '                # Reload implementation details must not hit application',
     '                # breakpoints or Raised filters on this internal thread.',
@@ -577,121 +816,148 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                        _sys.settrace(None)',
     '                    except Exception:',
     '                        pass',
-    '                while True:',
-    '                    try:',
+    '                try:',
+    '                    while True:',
     '                        _request_id = None',
+    '                        _lease_id = None',
     '                        _claimed = False',
-    '                        time.sleep(0.3)',
+    '                        _hot_reload_wake_event.wait(0.3)',
+    '                        _hot_reload_wake_event.clear()',
+    '                        with _hot_reload_lock:',
+    '                            if not _prune_hot_reload_leases_locked():',
+    '                                break',
     '                        try:',
-    '                            _os.replace(_reload_file, _reload_processing_file)',
-    '                            _claimed = True',
-    '                        except FileNotFoundError:',
-    '                            continue',
-    '                        with open(_reload_processing_file) as _f:',
-    '                            _raw_request = _f.read()',
+    '                            try:',
+    '                                _os.replace(_reload_file, _reload_processing_file)',
+    '                                _claimed = True',
+    '                            except FileNotFoundError:',
+    '                                continue',
+    '                            with open(_reload_processing_file) as _f:',
+    '                                _raw_request = _f.read()',
     '',
-    '                        try:',
     '                            _request = json.loads(_raw_request)',
-    '                        except Exception:',
-    '                            if _raw_request.lstrip().startswith("{"):',
-    '                                raise',
-    '                            _request = None',
-    '                        if isinstance(_request, dict) and _request.get("version") == 2:',
-    '                            _request_id = _request.get("requestId")',
-    '                            _paths = _request.get("paths")',
-    '                            if not isinstance(_request_id, str) or not isinstance(_paths, list):',
-    '                                raise ValueError("Invalid hot reload v2 request")',
-    '                            if not all(isinstance(_p, str) for _p in _paths):',
-    '                                raise ValueError("Invalid hot reload path")',
-    '                            _paths = [_p for _p in _paths if _p]',
-    '                        else:',
-    '                            _paths = [',
-    '                                _p.strip()',
-    '                                for _p in _raw_request.strip().split("\\n")',
-    '                                if _p.strip()',
-    '                            ]',
-    '                        if not _paths:',
-    '                            _publish_reload_result(_request_id, [])',
+    '                            if isinstance(_request, dict) and _request.get("version") == 3:',
+    '                                _request_id = _request.get("requestId")',
+    '                                _lease_id = _request.get("leaseId")',
+    '                                _paths = _request.get("paths")',
+    '                                if (',
+    '                                    not isinstance(_request_id, str)',
+    '                                    or not isinstance(_lease_id, str)',
+    '                                    or not isinstance(_paths, list)',
+    '                                ):',
+    '                                    raise ValueError("Invalid hot reload v3 request")',
+    '                                if not all(isinstance(_p, str) for _p in _paths):',
+    '                                    raise ValueError("Invalid hot reload path")',
+    '                                if not _hot_reload_lease_is_live(_lease_id):',
+    '                                    raise ValueError("Inactive hot reload lease")',
+    '                                _paths = [_p for _p in _paths if _p]',
+    '                            else:',
+    '                                raise ValueError("Hot reload request requires an active v3 lease")',
+    '                            if not _paths:',
+    '                                _publish_reload_result(_request_id, [], _lease_id)',
+    '                                _clear_reload_claim()',
+    '                                _claimed = False',
+    '                                continue',
+    '',
+    '                            importlib.invalidate_caches()',
+    '                            _results = []',
+    '',
+    '                            for _fpath in _paths:',
+    '                                _found = False',
+    '                                _abs_fpath = _os.path.abspath(_fpath)',
+    '                                for _name, _mod in list(_sys.modules.items()):',
+    '                                    _mod_file = getattr(_mod, "__file__", None)',
+    '                                    if not _mod_file:',
+    '                                        continue',
+    '                                    _abs_mod = _os.path.abspath(_mod_file)',
+    '                                    if _abs_mod.endswith(".pyc"):',
+    '                                        _abs_mod = _abs_mod[:-1]',
+    '                                    if _abs_mod == _abs_fpath:',
+    '                                        try:',
+    '                                            _patched = _deep_reload_module(_mod)',
+    '                                            _patch_list = ", ".join(_patched) if _patched else ""',
+    '                                            _patch_info = f" (patched: {_patch_list})" if _patched else ""',
+    '                                            _msg = f"OK:{_name}{_patch_info}"',
+    '                                            _dbg_log(f"Hot reloaded: {_name}{_patch_info}")',
+    '                                            _results.append(_msg)',
+    '                                        except BaseException as _e:',
+    '                                            _msg = f"ERR:{_name}:{type(_e).__name__}:{_e}"',
+    '                                            _dbg_log(f"Reload failed: {_name}: {_e}")',
+    '                                            _results.append(_msg)',
+    '                                        _found = True',
+    '                                        break',
+    '                                if not _found:',
+    '                                    _msg = f"SKIP:{_fpath}"',
+    '                                    _dbg_log(f"No loaded module for: {_fpath}")',
+    '                                    _results.append(_msg)',
+    '',
+    '                            _publish_reload_result(_request_id, _results, _lease_id)',
     '                            _clear_reload_claim()',
     '                            _claimed = False',
-    '                            continue',
     '',
-    '                        importlib.invalidate_caches()',
-    '                        _results = []',
-    '',
-    '                        for _fpath in _paths:',
-    '                            _found = False',
-    '                            _abs_fpath = _os.path.abspath(_fpath)',
-    '                            for _name, _mod in list(_sys.modules.items()):',
-    '                                _mod_file = getattr(_mod, "__file__", None)',
-    '                                if not _mod_file:',
-    '                                    continue',
-    '                                _abs_mod = _os.path.abspath(_mod_file)',
-    '                                if _abs_mod.endswith(".pyc"):',
-    '                                    _abs_mod = _abs_mod[:-1]',
-    '                                if _abs_mod == _abs_fpath:',
-    '                                    try:',
-    '                                        _patched = _deep_reload_module(_mod)',
-    '                                        _patch_list = ", ".join(_patched) if _patched else ""',
-    '                                        _patch_info = f" (patched: {_patch_list})" if _patched else ""',
-    '                                        _msg = f"OK:{_name}{_patch_info}"',
-    '                                        _dbg_log(f"Hot reloaded: {_name}{_patch_info}")',
-    '                                        _results.append(_msg)',
-    '                                    except Exception as _e:',
-    '                                        _msg = f"ERR:{_name}:{_e}"',
-    '                                        _dbg_log(f"Reload failed: {_name}: {_e}")',
-    '                                        _results.append(_msg)',
-    '                                    _found = True',
-    '                                    break',
-    '                            if not _found:',
-    '                                _msg = f"SKIP:{_fpath}"',
-    '                                _dbg_log(f"No loaded module for: {_fpath}")',
-    '                                _results.append(_msg)',
-    '',
-    '                        _publish_reload_result(_request_id, _results)',
-    '                        _clear_reload_claim()',
-    '                        _claimed = False',
-    '',
-    '                    except Exception as _e:',
-    '                        _dbg_log(f"Reload watcher error: {_e}")',
-    '                        try:',
-    '                            _publish_reload_result(',
-    '                                locals().get("_request_id"),',
-    '                                [f"ERR:protocol:{type(_e).__name__}:{_e}"],',
-    '                            )',
-    '                        except Exception:',
-    '                            pass',
-    '                        finally:',
-    '                            if locals().get("_claimed", False):',
-    '                                _clear_reload_claim()',
+    '                        except BaseException as _e:',
+    '                            _dbg_log(f"Reload watcher error: {_e}")',
+    '                            try:',
+    '                                _publish_reload_result(',
+    '                                    _request_id,',
+    '                                    [f"ERR:protocol:{type(_e).__name__}:{_e}"],',
+    '                                    _lease_id,',
+    '                                )',
+    '                            except Exception:',
+    '                                pass',
+    '                            finally:',
+    '                                if _claimed:',
+    '                                    _clear_reload_claim()',
+    '                finally:',
+    '                    with _hot_reload_lock:',
+    '                        if _hot_reload_thread is threading.current_thread():',
+    '                            _hot_reload_thread = None',
+    '                        _hot_reload_watcher_started = False',
+    '                        _still_active = _prune_hot_reload_leases_locked()',
+    '                        if not _still_active:',
+    '                            try:',
+    '                                _os.unlink(_reload_file)',
+    '                            except FileNotFoundError:',
+    '                                pass',
+    '                            except Exception as _e:',
+    '                                _dbg_log(f"Could not remove inactive reload request: {_e}")',
+    '                            _restore_hot_reload_suppression_locked()',
+    '                    _dbg_log("Hot reload watcher stopped")',
+    '                    if _still_active:',
+    '                        _start_hot_reload_watcher()',
     '',
     '            _t = threading.Thread(target=_reload_watcher, daemon=True, name="django-debug-hot-reload")',
-    '            _t.start()',
+    '            # Keep debugger internals from tracing/suspending this lifecycle',
+    '            # worker. The filesystem lease remains the crash fallback.',
+    '            _t.pydev_do_not_trace = True',
+    '            _t.is_pydev_daemon_thread = True',
+    '            _t.django_debugger_do_not_trace = True',
+    '            with _hot_reload_lock:',
+    '                if not _prune_hot_reload_leases_locked():',
+    '                    _hot_reload_watcher_started = False',
+    '                    _restore_hot_reload_suppression_locked()',
+    '                    return False',
+    '                _hot_reload_thread = _t',
+    '                try:',
+    '                    _t.start()',
+    '                except Exception:',
+    '                    _hot_reload_thread = None',
+    '                    _hot_reload_watcher_started = False',
+    '                    _restore_hot_reload_suppression_locked()',
+    '                    raise',
     '            _dbg_log("Hot reload watcher started")',
+    '            return True',
     '',
-    '        def _django_debugger_signal_handler(signum, frame):',
-    '            global _hot_reload_watcher_started, _engine_endpoints, _activated_engine, _bootstrap_pid',
+    '        def _django_debugger_activation_handler(_request_content):',
+    '            global _engine_endpoints, _activated_engine, _bootstrap_pid',
     '            _current_pid = _os.getpid()',
     '            if _bootstrap_pid != _current_pid:',
-    '                # A forked child has its own lifecycle. Do not reuse the',
-    '                # parent engine ownership or endpoints; the experimental',
-    '                # tracer at-fork callback has also closed inherited sockets.',
-    '                _bootstrap_pid = _current_pid',
-    '                _engine_endpoints = {}',
-    '                _activated_engine = None',
-    '                _hot_reload_watcher_started = False',
-    '                _dbg_log("Fork detected; reset inherited engine ownership")',
-    '            _dbg_log(f"Signal {signum} received")',
+    '                # A child without a completed at-fork reset must fail closed.',
+    '                _dbg_log("Rejected activation on an uninitialized fork child")',
+    '                return False',
+    '            _dbg_log("Authenticated control request received from private socket")',
     '            _write_bootstrap_state()',
     '            _pid = _os.getpid()',
-    '            _port_file = f"{_PORT_FILE_DIR}/{_pid}.port"',
-    '            def _clear_pending_port_file():',
-    '                try:',
-    '                    _os.unlink(_port_file)',
-    '                except FileNotFoundError:',
-    '                    pass',
-    '                except Exception as _e:',
-    '                    _dbg_log(f"Failed to remove stale port file: {_e}")',
     '            def _active_file_for(_engine_name):',
     '                if _engine_name == "experimental":',
     '                    return f"{_PORT_FILE_DIR}/{_pid}.experimental.active"',
@@ -716,16 +982,36 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                        import json as _json',
     '                        _parsed = _json.loads(_content)',
     '                        if isinstance(_parsed, dict):',
+    '                            if _parsed.get("version") != ' + JSON.stringify(ACTIVE_ENDPOINT_RECORD_VERSION) + ':',
+    '                                return None',
     '                            _recorded_engine = _parsed.get("engine")',
-    '                            if _recorded_engine is not None and _recorded_engine != _expected_engine:',
+    '                            if _recorded_engine != _expected_engine:',
     '                                return None',
-    '                            if _expected_engine == "experimental" and _recorded_engine != "experimental":',
+    '                            if _parsed.get("pid") != _pid:',
     '                                return None',
-    '                            return (str(_parsed.get("host") or "127.0.0.1"), int(_parsed.get("port")))',
+    '                            if _parsed.get("runtimeId") != _runtime_id:',
+    '                                return None',
+    '                            if _parsed.get("bootstrapVersion") != ' + JSON.stringify(BOOTSTRAP_VERSION) + ':',
+    '                                return None',
+    '                            _recorded_host = _parsed.get("host")',
+    '                            _recorded_port = _parsed.get("port")',
+    '                            if not isinstance(_recorded_host, str) or not _recorded_host:',
+    '                                return None',
+    '                            if isinstance(_recorded_port, bool) or not isinstance(_recorded_port, int):',
+    '                                return None',
+    '                            if _recorded_port <= 0 or _recorded_port > 65535:',
+    '                                return None',
+    '                            _recorded_auth_token = _parsed.get("authToken")',
+    '                            if _expected_engine == "experimental":',
+    '                                if not isinstance(_recorded_auth_token, str) or len(_recorded_auth_token) != 64:',
+    '                                    return None',
+    '                                if any(_char not in "0123456789abcdef" for _char in _recorded_auth_token):',
+    '                                    return None',
+    '                            else:',
+    '                                _recorded_auth_token = None',
+    '                            return (_recorded_host, _recorded_port, _recorded_auth_token)',
     '                    except Exception:',
     '                        pass',
-    '                    if _expected_engine == "debugpy":',
-    '                        return ("127.0.0.1", int(_content))',
     '                    return None',
     '                except FileNotFoundError:',
     '                    return None',
@@ -739,46 +1025,66 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                    pass',
     '                except Exception as _e:',
     '                    _dbg_log(f"Failed to remove stale active file {_file_path}: {_e}")',
-    '            def _write_active_endpoint(_file_path, _engine_name, _host, _port_value):',
+    '            def _write_active_endpoint(_file_path, _engine_name, _host, _port_value, _auth_token=None):',
     '                import json as _json',
     '                _tmp_file = _file_path + ".tmp"',
+    '                _payload = {',
+    '                    "version": ' + JSON.stringify(ACTIVE_ENDPOINT_RECORD_VERSION) + ',',
+    '                    "engine": _engine_name,',
+    '                    "host": _host,',
+    '                    "port": _port_value,',
+    '                    "pid": _pid,',
+    '                    "runtimeId": _runtime_id,',
+    '                    "bootstrapVersion": ' + JSON.stringify(BOOTSTRAP_VERSION) + ',',
+    '                }',
+    '                if _engine_name == "experimental":',
+    '                    _payload["authToken"] = _auth_token',
     '                with open(_tmp_file, "w") as _f:',
-    '                    _f.write(_json.dumps({"version": 1, "engine": _engine_name, "host": _host, "port": _port_value}))',
+    '                    _f.write(_json.dumps(_payload))',
     '                _os.chmod(_tmp_file, 0o600)',
     '                _os.replace(_tmp_file, _file_path)',
     '',
-    '            # Read activation intent before inspecting endpoint markers. Older',
-    '            # extensions wrote a bare integer; that remains a debugpy request.',
+    '            # Parse and authenticate the versioned activation request. The',
+    '            # runtime ID changes on every process start and after every fork.',
     '            _engine = "debugpy"',
     '            _port = 5678',
+    '            _auth_token = None',
     '            try:',
-    '                with open(_port_file) as _f:',
-    '                    _request_content = _f.read().strip()',
     '                import json as _json',
-    '                try:',
-    '                    _request = _json.loads(_request_content)',
-    '                except Exception:',
-    '                    _request = int(_request_content)',
-    '                if isinstance(_request, dict):',
-    '                    if int(_request.get("version", 0)) != 1:',
-    '                        raise ValueError("unsupported activation request version")',
-    '                    _requested_engine = _request.get("engine", "debugpy")',
-    '                    if _requested_engine not in ("debugpy", "experimental"):',
-    '                        raise ValueError(f"unsupported debug engine: {_requested_engine}")',
-    '                    _engine = _requested_engine',
-    '                    _port = int(_request.get("port", 5678))',
-    '                else:',
-    '                    _port = int(_request)',
+    '                import hmac as _hmac',
+    '                _request = _json.loads(_request_content)',
+    '                if not isinstance(_request, dict):',
+    '                    raise ValueError("activation request must be an object")',
+    '                if int(_request.get("version", 0)) != 2:',
+    '                    raise ValueError("unsupported activation request version")',
+    '                _request_runtime_id = _request.get("runtimeId")',
+    '                if not isinstance(_request_runtime_id, str) or not _hmac.compare_digest(_request_runtime_id, _runtime_id):',
+    '                    raise ValueError("activation runtime identity mismatch")',
+    '                _action = _request.get("action", "activate")',
+    '                if _action == "hotReloadLease":',
+    '                    return _acquire_hot_reload_lease(',
+    '                        _request.get("leaseId"),',
+    '                        _request.get("ttlMs"),',
+    '                    )',
+    '                if _action != "activate":',
+    '                    raise ValueError(f"unsupported control action: {_action}")',
+    '                _requested_engine = _request.get("engine", "debugpy")',
+    '                if _requested_engine not in ("debugpy", "experimental"):',
+    '                    raise ValueError(f"unsupported debug engine: {_requested_engine}")',
+    '                _engine = _requested_engine',
+    '                _port = int(_request.get("port", 5678))',
     '                if _port < 0 or _port > 65535:',
     '                    raise ValueError(f"invalid debug port: {_port}")',
-    '                _clear_pending_port_file()',
+    '                if _engine == "experimental":',
+    '                    _auth_token = _request.get("authToken")',
+    '                    if not isinstance(_auth_token, str) or len(_auth_token) != 64:',
+    '                        raise ValueError("missing or invalid experimental DAP authentication")',
+    '                    if any(_char not in "0123456789abcdef" for _char in _auth_token):',
+    '                        raise ValueError("missing or invalid experimental DAP authentication")',
     '                _dbg_log(f"Read activation request engine={_engine} port={_port}")',
-    '            except FileNotFoundError:',
-    '                _dbg_log(f"Activation file not found, using defaults engine={_engine} port={_port}")',
     '            except Exception as _e:',
-    '                _clear_pending_port_file()',
     '                _dbg_log(f"Invalid activation request: {_e}")',
-    '                return',
+    '                return False',
     '',
     '            # A tracer owns interpreter-wide hooks that cannot be safely',
     '            # replaced in every existing thread on all supported Python',
@@ -790,7 +1096,7 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                _owned_endpoint = _engine_endpoints.get(_activated_engine)',
     '                if _owned_endpoint is not None and _endpoint_is_alive(_owned_endpoint[0], _owned_endpoint[1]):',
     '                    try:',
-    '                        _write_active_endpoint(_active_file_for(_engine), _engine, _owned_endpoint[0], _owned_endpoint[1])',
+    '                        _write_active_endpoint(_active_file_for(_engine), _engine, _owned_endpoint[0], _owned_endpoint[1], _owned_endpoint[2])',
     '                    except Exception as _e:',
     '                        _dbg_log(f"Failed to restore owned {_engine} endpoint: {_e}")',
     '                    return',
@@ -826,7 +1132,7 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                    _engine_endpoints.pop(_engine, None)',
     '                else:',
     '                    try:',
-    '                        _write_active_endpoint(_active_file, _engine, _stored_endpoint[0], _stored_endpoint[1])',
+    '                        _write_active_endpoint(_active_file, _engine, _stored_endpoint[0], _stored_endpoint[1], _stored_endpoint[2])',
     '                        _dbg_log(f"{_engine} endpoint restored in active file: {_stored_endpoint[0]}:{_stored_endpoint[1]}")',
     '                    except Exception as _e:',
     '                        _dbg_log(f"Failed to restore {_engine} active file: {_e}")',
@@ -848,18 +1154,15 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                else:',
     '                    import _django_debug_tracer as _experimental_tracer',
     '                    _dbg_log(f"experimental tracer imported from {_experimental_tracer.__file__}")',
-    '                    _listen_result = _experimental_tracer.start("127.0.0.1", _port)',
+    '                    _listen_result = _experimental_tracer.start("127.0.0.1", _port, auth_token=_auth_token)',
     '                _host = "127.0.0.1"',
     '                _actual_port = _port',
     '                if isinstance(_listen_result, (tuple, list)) and len(_listen_result) >= 2:',
     '                    _host = str(_listen_result[0])',
     '                    _actual_port = int(_listen_result[1])',
-    '                _write_active_endpoint(_active_file, _engine, _host, _actual_port)',
-    '                _engine_endpoints[_engine] = (_host, _actual_port)',
+    '                _write_active_endpoint(_active_file, _engine, _host, _actual_port, _auth_token)',
+    '                _engine_endpoints[_engine] = (_host, _actual_port, _auth_token)',
     '                _dbg_log(f"{_engine} listening on {_host}:{_actual_port}")',
-    '                if not _hot_reload_watcher_started:',
-    '                    _start_hot_reload_watcher()',
-    '                    _hot_reload_watcher_started = True',
     '            except RuntimeError as _e:',
     '                if "already" in str(_e).lower():',
     '                    _dbg_log(f"{_engine} already listening: {_e}")',
@@ -868,9 +1171,84 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '            except Exception as _e:',
     '                _dbg_log(f"{_engine} ERROR: {_e}\\n{_traceback.format_exc()}")',
     '',
-    '        _signal.signal(_signal.SIGUSR1, _django_debugger_signal_handler)',
-    '        _signal.signal(_signal.SIGUSR2, _django_debugger_signal_handler)',
-    '        _dbg_log("SIGUSR1+SIGUSR2 handlers installed")',
+    '        def _start_activation_control_server():',
+    '            global _control_server_socket',
+    '            import socket as _socket',
+    '            import threading as _threading',
+    '            _owner_pid = _os.getpid()',
+    '            try:',
+    '                _os.unlink(_control_socket_path)',
+    '            except FileNotFoundError:',
+    '                pass',
+    '            _server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)',
+    '            try:',
+    '                _server.bind(_control_socket_path)',
+    '                _os.chmod(_control_socket_path, 0o600)',
+    '                _server.listen(4)',
+    '            except Exception:',
+    '                _server.close()',
+    '                raise',
+    '            _control_server_socket = _server',
+    '            _write_bootstrap_state()',
+    '',
+    '            def _activation_control_loop():',
+    '                while _os.getpid() == _owner_pid and _control_server_socket is _server:',
+    '                    try:',
+    '                        _connection, _ = _server.accept()',
+    '                    except OSError:',
+    '                        break',
+    '                    try:',
+    '                        _connection.settimeout(2.0)',
+    '                        _request_bytes = b""',
+    '                        while len(_request_bytes) <= 65536:',
+    '                            _chunk = _connection.recv(4096)',
+    '                            if not _chunk:',
+    '                                break',
+    '                            _request_bytes += _chunk',
+    '                            if b"\\n" in _request_bytes:',
+    '                                _request_bytes = _request_bytes.split(b"\\n", 1)[0]',
+    '                                break',
+    '                        if not _request_bytes or len(_request_bytes) > 65536:',
+    '                            raise ValueError("empty or oversized activation request")',
+    '                        _request_text = _request_bytes.decode("utf-8")',
+    '                        _is_lease_request = False',
+    '                        try:',
+    '                            import json as _json',
+    '                            _request_preview = _json.loads(_request_text)',
+    '                            _is_lease_request = (',
+    '                                isinstance(_request_preview, dict)',
+    '                                and _request_preview.get("action") == "hotReloadLease"',
+    '                            )',
+    '                        except Exception:',
+    '                            pass',
+    '                        if _is_lease_request:',
+    '                            # Lease acquire must be acknowledged only after its',
+    '                            # runtime identity, lease file, TTL, and hooks are',
+    '                            # validated. Engine activation keeps its early ack',
+    '                            # because debugger startup can take several seconds.',
+    '                            _accepted = _django_debugger_activation_handler(_request_text)',
+    '                            _connection.sendall(b"accepted\\n" if _accepted else b"rejected\\n")',
+    '                        else:',
+    '                            _connection.sendall(b"accepted\\n")',
+    '                            _django_debugger_activation_handler(_request_text)',
+    '                    except Exception as _e:',
+    '                        _dbg_log(f"Control request failed: {_e}")',
+    '                    finally:',
+    '                        try:',
+    '                            _connection.close()',
+    '                        except Exception:',
+    '                            pass',
+    '',
+    '            _thread = _threading.Thread(',
+    '                target=_activation_control_loop,',
+    '                daemon=True,',
+    '                name="django-debug-activation",',
+    '            )',
+    '            _thread.start()',
+    '            _dbg_log(f"Private activation control socket listening: {_control_socket_path}")',
+    '',
+    '        _dbg_log("Bootstrap module loaded, starting private activation control socket")',
+    '        _start_activation_control_server()',
     '',
     'except Exception:',
     '    # NEVER let bootstrap errors propagate — this runs on every Python startup',
@@ -896,7 +1274,7 @@ export class DebugpyInjector {
 
   /**
    * Install the debug bootstrap into a venv's site-packages.
-   * This makes ALL Python processes using this venv load the SIGUSR1 handler.
+   * Long-running supported processes publish a private activation socket.
    * Requires restarting the Django server after installation.
    */
   async installBootstrap(venvSitePackages: string): Promise<void> {
@@ -960,18 +1338,27 @@ export class DebugpyInjector {
 
   /**
    * Request hot reload of changed Python files in a running process.
-   * Atomically publishes a correlated v2 request; the bootstrap's reload
-   * watcher claims it and runs importlib.reload().
+   * Production callers provide a live lease and publish a correlated v3
+   * request. Omitting the lease retains the v2 transport used by isolated
+   * reload harness tests; a production bootstrap rejects it.
    */
-  async requestHotReload(pid: number, filePaths: string[]): Promise<string | null> {
+  async requestHotReload(
+    pid: number,
+    filePaths: string[],
+    leaseId?: string,
+  ): Promise<string | null> {
     if (filePaths.length === 0) { return null; }
+    if (leaseId !== undefined && !isValidHotReloadLeaseId(leaseId)) {
+      throw new TypeError('Hot reload lease ID must be 64 lowercase hexadecimal characters');
+    }
     await ensurePrivatePortFileDir();
     const requestId = nextHotReloadRequestId(pid);
     const requestFile = reloadFilePath(pid);
     const temporaryFile = `${requestFile}.${requestId}.tmp`;
     const payload = JSON.stringify({
-      version: 2,
+      version: leaseId === undefined ? 2 : 3,
       requestId,
+      ...(leaseId === undefined ? {} : { leaseId }),
       paths: filePaths,
     });
 
@@ -991,18 +1378,97 @@ export class DebugpyInjector {
       // Python watcher can consume that filename immediately after rename.
       await fs.chmod(temporaryFile, 0o600);
       await fs.rename(temporaryFile, requestFile);
-    } finally {
+    } catch (error) {
       try {
-        await fs.unlink(temporaryFile);
-      } catch (error) {
-        if (!isFsError(error, 'ENOENT')) { throw error; }
+        await unlinkIfExists(temporaryFile);
+      } catch (cleanupError) {
+        logError(`[Injector] Failed to remove unpublished reload request ${temporaryFile}`, cleanupError);
       }
+      throw error;
     }
+    await unlinkIfExists(temporaryFile);
     log(
       `[Injector] Hot reload requested for PID=${pid}, request=${requestId}: `
       + filePaths.join(', '),
     );
     return requestId;
+  }
+
+  /**
+   * Register a target-side hot-reload lease after publishing its private lease
+   * file. The target installs Django suppression only after both the runtime
+   * identity and fresh lease file have been validated.
+   */
+  async acquireHotReloadLease(
+    pid: number,
+    leaseId: string,
+    ttlMs: number = HOT_RELOAD_LEASE_TTL_MS,
+  ): Promise<void> {
+    this.validateHotReloadLeaseArguments(pid, leaseId, ttlMs);
+    const state = await this.requireCurrentBootstrapControlState(pid);
+    await this.renewHotReloadLease(pid, leaseId, ttlMs);
+    try {
+      await this.sendControlRequest(state.controlSocket, {
+        version: 2,
+        runtimeId: state.runtimeId,
+        action: 'hotReloadLease',
+        leaseId,
+        ttlMs,
+      }, pid);
+    } catch (error) {
+      await this.releaseHotReloadLease(pid, leaseId);
+      throw error;
+    }
+  }
+
+  /**
+   * Renew a lease using only an atomic private-file replacement. This stays
+   * operational even when a debugger has suspended every Python thread.
+   */
+  async renewHotReloadLease(
+    pid: number,
+    leaseId: string,
+    ttlMs: number = HOT_RELOAD_LEASE_TTL_MS,
+  ): Promise<void> {
+    this.validateHotReloadLeaseArguments(pid, leaseId, ttlMs);
+    await ensurePrivatePortFileDir();
+    const leaseFile = hotReloadLeaseFilePath(pid, leaseId);
+    const temporaryFile = leaseFile + '.' + process.pid + '.'
+      + randomBytes(8).toString('hex') + '.tmp';
+    const payload = JSON.stringify({
+      version: 1,
+      pid,
+      leaseId,
+      ttlMs,
+      renewedAt: Date.now(),
+    });
+    try {
+      await fs.writeFile(temporaryFile, payload, {
+        encoding: 'utf-8',
+        mode: 0o600,
+        flag: 'wx',
+      });
+      await fs.chmod(temporaryFile, 0o600);
+      await fs.rename(temporaryFile, leaseFile);
+    } catch (error) {
+      try {
+        await unlinkIfExists(temporaryFile);
+      } catch (cleanupError) {
+        logError(`[Injector] Failed to remove unpublished hot-reload lease ${temporaryFile}`, cleanupError);
+      }
+      throw error;
+    }
+    await unlinkIfExists(temporaryFile);
+  }
+
+  /** Release is filesystem-only; TTL remains the crash fallback. */
+  async releaseHotReloadLease(pid: number, leaseId: string): Promise<void> {
+    this.validateHotReloadLeaseArguments(pid, leaseId, HOT_RELOAD_LEASE_TTL_MS);
+    try {
+      await fs.unlink(hotReloadLeaseFilePath(pid, leaseId));
+    } catch (error) {
+      if (!isFsError(error, 'ENOENT')) { throw error; }
+    }
   }
 
   /**
@@ -1013,6 +1479,7 @@ export class DebugpyInjector {
   async readReloadResult(
     pid: number,
     expectedRequestId?: string,
+    expectedLeaseId?: string,
   ): Promise<string[] | null> {
     const resultFile = reloadResultFilePath(pid);
     let content: string;
@@ -1026,6 +1493,12 @@ export class DebugpyInjector {
     if (
       expectedRequestId !== undefined
       && payload.requestId !== expectedRequestId
+    ) {
+      return null;
+    }
+    if (
+      expectedLeaseId !== undefined
+      && payload.leaseId !== expectedLeaseId
     ) {
       return null;
     }
@@ -1050,10 +1523,15 @@ export class DebugpyInjector {
     intervalMs: number = 20,
     expectedRequestId?: string,
     signal?: AbortSignal,
+    expectedLeaseId?: string,
   ): Promise<string[] | null> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs && signal?.aborted !== true) {
-      const result = await this.readReloadResult(pid, expectedRequestId);
+      const result = await this.readReloadResult(
+        pid,
+        expectedRequestId,
+        expectedLeaseId,
+      );
       if (result !== null) { return result; }
       await new Promise((r) => setTimeout(r, intervalMs));
     }
@@ -1065,7 +1543,11 @@ export class DebugpyInjector {
    * i.e. the Python watcher hasn't consumed it yet. Used to distinguish
    * "Python-side didn't process" from "Python-side reported nothing".
    */
-  async isReloadPending(pid: number, expectedRequestId?: string): Promise<boolean> {
+  async isReloadPending(
+    pid: number,
+    expectedRequestId?: string,
+    expectedLeaseId?: string,
+  ): Promise<boolean> {
     for (const requestFile of [
       reloadFilePath(pid),
       reloadProcessingFilePath(pid),
@@ -1078,7 +1560,14 @@ export class DebugpyInjector {
         const content = await fs.readFile(requestFile, 'utf-8');
         try {
           const parsed = JSON.parse(content) as Record<string, unknown>;
-          if (parsed.version === 2 && parsed.requestId === expectedRequestId) {
+          if (
+            (parsed.version === 2 || parsed.version === 3)
+            && parsed.requestId === expectedRequestId
+            && (
+              expectedLeaseId === undefined
+              || parsed.leaseId === expectedLeaseId
+            )
+          ) {
             return true;
           }
         } catch {
@@ -1173,6 +1662,15 @@ export class DebugpyInjector {
    * Handles uv, poetry run, etc. where the wrapper is not python itself.
    */
   async resolvePythonForPid(pid: number): Promise<string> {
+    const runtimeState = await this.readBootstrapState(pid);
+    if (runtimeState?.pythonExecutable) {
+      log(
+        `[Injector] Using Python executable published by target PID=${pid}: ` +
+        runtimeState.pythonExecutable
+      );
+      return runtimeState.pythonExecutable;
+    }
+
     try {
       const { stdout: fullCmd } = await execFileAsync('ps', [
         '-p', String(pid), '-o', 'command=',
@@ -1251,11 +1749,7 @@ export class DebugpyInjector {
     }
   }
 
-  /**
-   * Verify the bootstrap is loaded in the target process by checking
-   * if the module is importable from the process's python.
-   * This prevents sending SIGUSR1 to an unprotected process (which would kill it).
-   */
+  /** Verify that the target runtime's exact Python can import the bootstrap. */
   async verifyBootstrapLoaded(pythonPath: string): Promise<boolean> {
     try {
       await execFileAsync(pythonPath, [
@@ -1284,8 +1778,21 @@ export class DebugpyInjector {
     }
 
     try {
+      const runtimeState = await this.getLoadedBootstrapState(pid);
+      if (
+        !runtimeState
+        || runtimeState.version !== BOOTSTRAP_VERSION
+        || runtimeState.activationVersion !== 2
+        || typeof runtimeState.runtimeId !== 'string'
+        || !RUNTIME_ID_PATTERN.test(runtimeState.runtimeId)
+        || runtimeState.controlSocket !== controlSocketPath(pid)
+      ) {
+        await fs.unlink(activeFile).catch(() => {});
+        return null;
+      }
+
       const content = await fs.readFile(activeFile, 'utf-8');
-      const recorded = this.parseActiveFile(content, engine);
+      const recorded = this.parseActiveFile(content, engine, pid, runtimeState.runtimeId);
       if (recorded) {
         // The experimental server lives inside the target process, so require
         // PID ownership. debugpy listens from its adapter child process and
@@ -1295,16 +1802,32 @@ export class DebugpyInjector {
           : recorded.host
             ? await this.findListeningEndpoint(recorded.port, undefined, recorded.host)
             : await this.findListeningEndpoint(recorded.port);
-        if (endpoint) {
-          return endpoint;
-        }
-        const pidOwnedEndpoint = await this.findListeningEndpoint(recorded.port, pid);
-        if (pidOwnedEndpoint) {
+        const pidOwnedEndpoint = endpoint
+          ? null
+          : await this.findListeningEndpoint(recorded.port, pid);
+        if (!endpoint && pidOwnedEndpoint) {
           log(
             `[Injector] ${engine} endpoint host ${recorded.host ?? 'unknown'} for PID=${pid} ` +
             `resolved through PID-owned listener ${formatEndpoint(pidOwnedEndpoint)}`
           );
-          return pidOwnedEndpoint;
+        }
+        const resolvedEndpoint = endpoint ?? pidOwnedEndpoint;
+        if (resolvedEndpoint) {
+          // Resolving a listener can take long enough for a PID to exit and be
+          // reused. Re-read the identity immediately before returning it.
+          const currentState = await this.getLoadedBootstrapState(pid);
+          if (
+            currentState?.version !== BOOTSTRAP_VERSION
+            || currentState.activationVersion !== 2
+            || currentState.runtimeId !== runtimeState.runtimeId
+            || currentState.controlSocket !== controlSocketPath(pid)
+          ) {
+            await fs.unlink(activeFile).catch(() => {});
+            return null;
+          }
+          return recorded.authToken
+            ? { ...resolvedEndpoint, authToken: recorded.authToken }
+            : resolvedEndpoint;
         }
       }
       // Stale or incompatible active file — the selected engine is not listening.
@@ -1329,42 +1852,61 @@ export class DebugpyInjector {
 
   private parseActiveFile(
     content: string,
-    expectedEngine: DebugEngine = DEFAULT_DEBUG_ENGINE,
-  ): { host?: string; port: number } | null {
-    const trimmed = content.trim();
+    expectedEngine: DebugEngine,
+    expectedPid: number,
+    expectedRuntimeId: string,
+  ): { host?: string; port: number; authToken?: string } | null {
     try {
-      const parsed = JSON.parse(trimmed) as { engine?: unknown; host?: unknown; port?: unknown };
-      const recordedEngine = typeof parsed.engine === 'string' ? parsed.engine : undefined;
-      if (recordedEngine !== undefined && recordedEngine !== expectedEngine) {
+      const parsed = JSON.parse(content.trim()) as {
+        version?: unknown;
+        engine?: unknown;
+        host?: unknown;
+        port?: unknown;
+        pid?: unknown;
+        runtimeId?: unknown;
+        bootstrapVersion?: unknown;
+        authToken?: unknown;
+      };
+      if (
+        parsed.version !== ACTIVE_ENDPOINT_RECORD_VERSION
+        || parsed.engine !== expectedEngine
+        || parsed.pid !== expectedPid
+        || parsed.runtimeId !== expectedRuntimeId
+        || parsed.bootstrapVersion !== BOOTSTRAP_VERSION
+        || typeof parsed.host !== 'string'
+        || parsed.host.length === 0
+        || typeof parsed.port !== 'number'
+        || !Number.isInteger(parsed.port)
+        || parsed.port <= 0
+        || parsed.port > 65_535
+      ) {
         return null;
       }
-      if (expectedEngine === 'experimental' && recordedEngine !== 'experimental') {
+      if (
+        expectedEngine === 'experimental'
+        && !isValidExperimentalAuthToken(parsed.authToken)
+      ) {
         return null;
       }
-      if (typeof parsed.port === 'number' && Number.isInteger(parsed.port)) {
-        return {
-          host: typeof parsed.host === 'string' ? parsed.host : undefined,
-          port: parsed.port,
-        };
-      }
+      return {
+        host: parsed.host,
+        port: parsed.port,
+        ...(expectedEngine === 'experimental'
+          ? { authToken: parsed.authToken as string }
+          : {}),
+      };
     } catch {
-      // Legacy active files contain only the port.
-    }
-
-    if (expectedEngine !== DEFAULT_DEBUG_ENGINE) {
       return null;
     }
-    const port = parseInt(trimmed, 10);
-    return Number.isInteger(port) ? { port } : null;
   }
 
   /**
-   * Activate a debug engine in a running Django process by sending SIGUSR1.
-   * Returns the endpoint the selected engine is listening on.
-   *
+   * Activate a debug engine through the target's private Unix control socket.
    * If that engine is already active, returns the existing endpoint.
-   * SAFETY: Will NOT send SIGUSR1 unless the bootstrap module is confirmed
-   * importable, because Python's default SIGUSR1 handler terminates the process.
+   *
+   * The direct PID state, per-runtime random identity, and live socket are all
+   * required. A stale state file or PID reuse therefore fails without sending
+   * any process signal.
    */
   async activateEndpoint(
     pid: number,
@@ -1393,15 +1935,6 @@ export class DebugpyInjector {
       throw new DebugEngineConflictError(pid, engine, conflictingEngine, conflictingEndpoint);
     }
 
-    // SAFETY: Verify bootstrap is installed before sending SIGUSR1
-    const pythonPath = await this.resolvePythonForPid(pid);
-    const bootstrapReady = await this.verifyBootstrapLoaded(pythonPath);
-    if (!bootstrapReady) {
-      log(`[Injector] Bootstrap module not importable from ${pythonPath}`);
-      throw new BootstrapNotInstalledError(pid);
-    }
-    log(`[Injector] Bootstrap module verified as importable`);
-
     const loadedBootstrapState = await this.getLoadedBootstrapState(pid);
     const loadedBootstrapVersion = loadedBootstrapState?.version ?? null;
     if (!loadedBootstrapState || loadedBootstrapVersion !== BOOTSTRAP_VERSION) {
@@ -1411,52 +1944,55 @@ export class DebugpyInjector {
       );
       throw new BootstrapRuntimeVersionError(pid, loadedBootstrapVersion, BOOTSTRAP_VERSION);
     }
-    if (loadedBootstrapState.pid === pid) {
-      log(`[Injector] Target PID=${pid} loaded bootstrap version ${loadedBootstrapVersion}`);
-    } else {
-      log(
-        `[Injector] Target PID=${pid} inherited bootstrap version ${loadedBootstrapVersion} ` +
-        `from ancestor PID=${loadedBootstrapState.pid}`
-      );
+    if (
+      loadedBootstrapState.activationVersion !== 2
+      || !loadedBootstrapState.pythonExecutable
+      || !path.isAbsolute(loadedBootstrapState.pythonExecutable)
+      || !loadedBootstrapState.runtimeId
+      || !/^[0-9a-f]{64}$/i.test(loadedBootstrapState.runtimeId)
+      || loadedBootstrapState.controlSocket !== controlSocketPath(pid)
+    ) {
+      throw new BootstrapRuntimeIdentityError(pid);
     }
+    log(`[Injector] Target PID=${pid} published a current private activation identity`);
 
-    // Keep the legacy .port filename, but use a versioned payload. The new
-    // bootstrap also accepts the old bare-integer format as a debugpy request.
-    await ensurePrivatePortFileDir();
-    const activationRequest = { version: 1, engine, port };
-    await fs.writeFile(portFilePath(pid), JSON.stringify(activationRequest), {
-      encoding: 'utf-8',
-      mode: 0o600,
-    });
-    await fs.chmod(portFilePath(pid), 0o600);
-    log(`[Injector] Wrote activation request: ${portFilePath(pid)} = ${JSON.stringify(activationRequest)}`);
-
-    // Determine which signal to send: celery overrides SIGUSR1 for log reopen,
-    // so we use SIGUSR2 for celery workers and SIGUSR1 for everything else.
-    const command = await this.getProcessCommand(pid);
-    const isCelery = isCeleryWorkerCommand(command);
-    const signal = isCelery ? 'SIGUSR2' : 'SIGUSR1';
-
-    log(`[Injector] Sending ${signal} to PID=${pid} (${isCelery ? 'celery' : 'django'})`);
-    try {
-      process.kill(pid, signal);
-    } catch (err) {
-      await fs.unlink(portFilePath(pid)).catch(() => {});
-      logError(`[Injector] Failed to send ${signal} to PID=${pid}`, err);
-      throw new SignalError(pid, err instanceof Error ? err : new Error(String(err)), signal);
+    // Verify the exact interpreter published by the live target. In particular,
+    // sys.executable retains a venv path on macOS even when ps/lsof show the
+    // kernel-resolved base interpreter.
+    const pythonPath = loadedBootstrapState.pythonExecutable;
+    const bootstrapReady = await this.verifyBootstrapLoaded(pythonPath);
+    if (!bootstrapReady) {
+      log(`[Injector] Bootstrap module not importable from target runtime ${pythonPath}`);
+      throw new BootstrapNotInstalledError(pid);
     }
+    log(`[Injector] Bootstrap module verified using target runtime ${pythonPath}`);
+
+    const authToken = engine === 'experimental'
+      ? randomBytes(32).toString('hex')
+      : undefined;
+    const activationRequest = {
+      version: 2 as const,
+      runtimeId: loadedBootstrapState.runtimeId,
+      engine,
+      port,
+      ...(authToken ? { authToken } : {}),
+    };
+    log(
+      `[Injector] Sending authenticated ${engine} activation over ` +
+      `${loadedBootstrapState.controlSocket}`
+    );
+    await this.sendControlRequest(loadedBootstrapState.controlSocket, activationRequest, pid);
 
     // Wait for the target process to publish a live active endpoint.
     log(`[Injector] Waiting for ${engine} active endpoint on port ${port}...`);
     const endpoint = await this.waitForActiveEndpoint(pid, port, 5000, engine);
     if (!endpoint) {
-      await fs.unlink(portFilePath(pid)).catch(() => {});
       const racedConflict = await this.getActiveEndpoint(pid, conflictingEngine);
       if (racedConflict !== null) {
         throw new DebugEngineConflictError(pid, engine, conflictingEngine, racedConflict);
       }
-      log(`[Injector] ${engine} endpoint for PID=${pid} port=${port} not available after ${signal}`);
-      throw new BootstrapNotLoadedError(pid, port, signal, engine);
+      log(`[Injector] ${engine} endpoint for PID=${pid} port=${port} not available after activation`);
+      throw new BootstrapNotLoadedError(pid, port, engine);
     }
     log(`[Injector] ${engine} is listening on ${formatEndpoint(endpoint)}`);
     return endpoint;
@@ -1474,29 +2010,46 @@ export class DebugpyInjector {
     return endpoint.port;
   }
 
-  private async getProcessCommand(pid: number): Promise<string> {
-    try {
-      const { stdout } = await execFileAsync('ps', ['-p', String(pid), '-o', 'command=']);
-      return stdout.trim();
-    } catch {
-      return '';
+  private validateHotReloadLeaseArguments(
+    pid: number,
+    leaseId: string,
+    ttlMs: number,
+  ): void {
+    if (!Number.isInteger(pid) || pid <= 0) {
+      throw new RangeError('Hot reload PID must be a positive integer');
+    }
+    if (!isValidHotReloadLeaseId(leaseId)) {
+      throw new TypeError('Hot reload lease ID must be 64 lowercase hexadecimal characters');
+    }
+    if (!Number.isInteger(ttlMs) || ttlMs < 500 || ttlMs > 120_000) {
+      throw new RangeError('Hot reload lease TTL must be between 500 and 120000ms');
     }
   }
 
+  private async requireCurrentBootstrapControlState(
+    pid: number,
+  ): Promise<CurrentBootstrapControlState> {
+    this.verifyProcessAlive(pid);
+    const state = await this.getLoadedBootstrapState(pid);
+    if (!state || state.version !== BOOTSTRAP_VERSION) {
+      throw new BootstrapRuntimeVersionError(pid, state?.version ?? null, BOOTSTRAP_VERSION);
+    }
+    if (
+      state.activationVersion !== 2
+      || typeof state.runtimeId !== 'string'
+      || !/^[0-9a-f]{64}$/i.test(state.runtimeId)
+      || state.controlSocket !== controlSocketPath(pid)
+    ) {
+      throw new BootstrapRuntimeIdentityError(pid);
+    }
+    return state as CurrentBootstrapControlState;
+  }
+
   private async getLoadedBootstrapState(pid: number): Promise<BootstrapRuntimeState | null> {
-    const directState = await this.readBootstrapState(pid);
-    if (directState) {
-      return directState;
-    }
-
-    for (const ancestorPid of await this.getAncestorPids(pid)) {
-      const ancestorState = await this.readBootstrapState(ancestorPid);
-      if (ancestorState) {
-        return ancestorState;
-      }
-    }
-
-    return null;
+    // An ancestor state is not proof that a child retained Python handlers: the
+    // child may have exec'd an unrelated program. Fork-aware bootstraps publish
+    // a fresh direct state and control socket for every child instead.
+    return this.readBootstrapState(pid);
   }
 
   private async readBootstrapState(pid: number): Promise<BootstrapRuntimeState | null> {
@@ -1508,6 +2061,9 @@ export class DebugpyInjector {
         version?: unknown;
         engines?: unknown;
         activationVersion?: unknown;
+        pythonExecutable?: unknown;
+        runtimeId?: unknown;
+        controlSocket?: unknown;
       };
       if (parsed.pid !== pid || typeof parsed.version !== 'string') {
         return null;
@@ -1519,37 +2075,70 @@ export class DebugpyInjector {
       if (typeof parsed.activationVersion === 'number' && Number.isInteger(parsed.activationVersion)) {
         state.activationVersion = parsed.activationVersion;
       }
+      if (typeof parsed.pythonExecutable === 'string' && parsed.pythonExecutable.length > 0) {
+        state.pythonExecutable = parsed.pythonExecutable;
+      }
+      if (typeof parsed.runtimeId === 'string' && parsed.runtimeId.length > 0) {
+        state.runtimeId = parsed.runtimeId;
+      }
+      if (typeof parsed.controlSocket === 'string' && parsed.controlSocket.length > 0) {
+        state.controlSocket = parsed.controlSocket;
+      }
       return state;
     } catch {
       return null;
     }
   }
 
-  private async getAncestorPids(pid: number): Promise<number[]> {
-    const ancestors: number[] = [];
-    const seen = new Set<number>([pid]);
-    let currentPid = pid;
+  private async sendControlRequest(
+    socketPath: string,
+    request: Record<string, unknown>,
+    pid: number,
+  ): Promise<void> {
+    const payload = `${JSON.stringify(request)}\n`;
 
-    for (let depth = 0; depth < 16; depth += 1) {
-      const parentPid = await this.getParentPid(currentPid);
-      if (!parentPid || parentPid <= 1 || seen.has(parentPid)) {
-        break;
-      }
-      ancestors.push(parentPid);
-      seen.add(parentPid);
-      currentPid = parentPid;
-    }
-
-    return ancestors;
-  }
-
-  private async getParentPid(pid: number): Promise<number | null> {
     try {
-      const { stdout } = await execFileAsync('ps', ['-p', String(pid), '-o', 'ppid=']);
-      const parentPid = Number.parseInt(stdout.trim(), 10);
-      return Number.isInteger(parentPid) && parentPid > 0 ? parentPid : null;
-    } catch {
-      return null;
+      await new Promise<void>((resolve, reject) => {
+        const socket = net.createConnection({ path: socketPath });
+        let response = '';
+        let settled = false;
+        const timer = setTimeout(() => {
+          finish(new Error('timed out waiting for control acknowledgement'));
+        }, 3_000);
+
+        const finish = (error?: Error): void => {
+          if (settled) { return; }
+          settled = true;
+          clearTimeout(timer);
+          socket.destroy();
+          if (error) { reject(error); }
+          else { resolve(); }
+        };
+
+        socket.setEncoding('utf-8');
+        socket.once('connect', () => socket.write(payload));
+        socket.on('data', (chunk: string) => {
+          response += chunk;
+          if (response.includes('\n')) {
+            if (response.split('\n', 1)[0] === 'accepted') {
+              finish();
+            } else {
+              finish(new Error('target rejected the control request'));
+            }
+          }
+        });
+        socket.once('error', (error) => finish(error));
+        socket.once('close', () => {
+          if (!settled) {
+            finish(new Error('control socket closed before acknowledgement'));
+          }
+        });
+      });
+    } catch (error) {
+      throw new BootstrapControlChannelError(
+        pid,
+        error instanceof Error ? error : new Error(String(error)),
+      );
     }
   }
 
@@ -1635,7 +2224,6 @@ export class DebugpyInjector {
             `[Injector] Reusing existing ${engine} endpoint ${formatEndpoint(endpoint)} ` +
             `for PID=${pid}; requested port was ${expectedPort}`
           );
-          await fs.unlink(portFilePath(pid)).catch(() => {});
         }
         return endpoint;
       }
@@ -1652,29 +2240,21 @@ export class ProcessNotFoundError extends Error {
   }
 }
 
-export class SignalError extends Error {
-  constructor(
-    public readonly pid: number,
-    public readonly cause: Error,
-    public readonly signal: NodeJS.Signals = 'SIGUSR1',
-  ) {
-    super(`Failed to send ${signal} to PID ${pid}: ${cause.message}`);
-    this.name = 'SignalError';
-  }
-}
-
 export class DebugEngineConflictError extends Error {
+  public readonly activeEndpoint: DebugpyEndpoint;
+
   constructor(
     public readonly pid: number,
     public readonly requestedEngine: DebugEngine,
     public readonly activeEngine: DebugEngine,
-    public readonly activeEndpoint: DebugpyEndpoint,
+    activeEndpoint: DebugpyEndpoint,
   ) {
     super(
       `Cannot activate ${requestedEngine} for PID ${pid} because ${activeEngine} is already active ` +
       `on ${formatEndpoint(activeEndpoint)}. Restart the target process before switching debug engines.`
     );
     this.name = 'DebugEngineConflictError';
+    this.activeEndpoint = { host: activeEndpoint.host, port: activeEndpoint.port };
   }
 }
 
@@ -1703,16 +2283,38 @@ export class BootstrapRuntimeVersionError extends Error {
   }
 }
 
+export class BootstrapRuntimeIdentityError extends Error {
+  constructor(public readonly pid: number) {
+    super(
+      `Target PID ${pid} did not publish a valid private activation identity. ` +
+      `Restart the target process after running setup with the current extension.`
+    );
+    this.name = 'BootstrapRuntimeIdentityError';
+  }
+}
+
+export class BootstrapControlChannelError extends Error {
+  constructor(
+    public readonly pid: number,
+    public readonly cause: Error,
+  ) {
+    super(
+      `Could not reach the private activation channel for target PID ${pid}: ${cause.message}. ` +
+      `The PID may have exited or been reused; no process signal was sent.`
+    );
+    this.name = 'BootstrapControlChannelError';
+  }
+}
+
 export class BootstrapNotLoadedError extends Error {
   constructor(
     public readonly pid: number,
     public readonly port: number,
-    public readonly signal: NodeJS.Signals = 'SIGUSR1',
     public readonly engine: DebugEngine = DEFAULT_DEBUG_ENGINE,
   ) {
     super(
-      `Sent ${signal} to PID ${pid} but ${engine} did not start listening on port ${port}. ` +
-      `The Django process was likely not started with the debug bootstrap loaded.`
+      `Target PID ${pid} accepted the private activation request, but ${engine} did not start ` +
+      `listening on port ${port}. Check the bootstrap log for the engine startup error.`
     );
     this.name = 'BootstrapNotLoadedError';
   }

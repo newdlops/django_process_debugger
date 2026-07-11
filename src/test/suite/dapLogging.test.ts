@@ -45,12 +45,22 @@ describe('Feature: safe DAP protocol logging', function () {
         breakpoints: [{ line: 10, logMessage: 'token={application_secret}' }],
       },
     });
+    const attachToken = 'c'.repeat(64);
+    const attachRequest = summarizeDapMessage({
+      type: 'request',
+      seq: 12,
+      command: 'attach',
+      arguments: {
+        __djangoProcessDebuggerAuthToken: attachToken,
+      },
+    });
 
     assert.match(request, /setVariable/);
     assert.match(response, /variables/);
     assert.match(evaluateRequest, /evaluate/);
     assert.match(evaluateResponse, /evaluate/);
     assert.match(logpointRequest, /setBreakpoints/);
+    assert.match(attachRequest, /attach/);
     assert.ok(!request.includes('super-secret'));
     assert.ok(!response.includes('secret-token'));
     assert.ok(!evaluateRequest.includes('application_secrets'));
@@ -58,6 +68,8 @@ describe('Feature: safe DAP protocol logging', function () {
     assert.ok(!evaluateResponse.includes('secret-evaluation-result'));
     assert.ok(!logpointRequest.includes('application_secret'));
     assert.ok(!logpointRequest.includes('token='));
+    assert.ok(!attachRequest.includes(attachToken));
+    assert.ok(!attachRequest.includes('__djangoProcessDebuggerAuthToken'));
   });
 
   it('records output metadata without recording program output', function () {

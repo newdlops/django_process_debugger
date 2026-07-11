@@ -12,6 +12,8 @@ describe('Feature: hot reload request/result protocol', function () {
   const perf = getPerf();
   const injector = new DebugpyInjector();
   const fakePid = 1_000_000 + Math.floor(Math.random() * 100_000);
+  const requestLeaseId = 'a'.repeat(64);
+  const renewableLeaseId = 'b'.repeat(64);
 
   before(async function () {
     await fs.mkdir(PORT_FILE_DIR, { recursive: true });
@@ -22,6 +24,8 @@ describe('Feature: hot reload request/result protocol', function () {
       `${fakePid}.reload`,
       `${fakePid}.reload.processing`,
       `${fakePid}.reload.result`,
+      `${fakePid}.hot-reload.${requestLeaseId}.lease`,
+      `${fakePid}.hot-reload.${renewableLeaseId}.lease`,
     ]) {
       await fs.unlink(path.join(PORT_FILE_DIR, name)).catch(() => {});
     }
@@ -41,6 +45,95 @@ describe('Feature: hot reload request/result protocol', function () {
       requestId,
       paths: files,
     });
+  });
+
+  it('requestHotReload publishes a private correlated v3 request when leased', async function () {
+    const files = ['/tmp/project/leased.py'];
+    const requestId = await injector.requestHotReload(fakePid, files, requestLeaseId);
+    const requestFile = path.join(PORT_FILE_DIR, `${fakePid}.reload`);
+    const [content, stat] = await Promise.all([
+      fs.readFile(requestFile, 'utf-8'),
+      fs.stat(requestFile),
+    ]);
+
+    assert.ok(requestId);
+    assert.deepStrictEqual(JSON.parse(content), {
+      version: 3,
+      requestId,
+      leaseId: requestLeaseId,
+      paths: files,
+    });
+    assert.strictEqual(stat.mode & 0o777, 0o600);
+  });
+
+  it('rejects malformed lease IDs and out-of-range lease TTLs', async function () {
+    await assert.rejects(
+      injector.requestHotReload(fakePid, ['/tmp/project/views.py'], 'A'.repeat(64)),
+      (error: unknown) => error instanceof TypeError
+        && error.message.includes('64 lowercase hexadecimal'),
+    );
+    await assert.rejects(
+      injector.renewHotReloadLease(fakePid, 'not-a-lease'),
+      (error: unknown) => error instanceof TypeError
+        && error.message.includes('64 lowercase hexadecimal'),
+    );
+
+    for (const ttlMs of [499, 120_001, 1_000.5]) {
+      await assert.rejects(
+        injector.renewHotReloadLease(fakePid, renewableLeaseId, ttlMs),
+        (error: unknown) => error instanceof RangeError
+          && error.message.includes('between 500 and 120000ms'),
+      );
+    }
+  });
+
+  it('atomically creates and renews a private lease file, then releases it', async function () {
+    const leaseFile = path.join(
+      PORT_FILE_DIR,
+      `${fakePid}.hot-reload.${renewableLeaseId}.lease`,
+    );
+
+    await injector.renewHotReloadLease(fakePid, renewableLeaseId, 1_000);
+    const firstContent = JSON.parse(await fs.readFile(leaseFile, 'utf-8')) as {
+      version: number;
+      pid: number;
+      leaseId: string;
+      ttlMs: number;
+      renewedAt: number;
+    };
+    const firstStat = await fs.stat(leaseFile);
+    assert.deepStrictEqual(firstContent, {
+      version: 1,
+      pid: fakePid,
+      leaseId: renewableLeaseId,
+      ttlMs: 1_000,
+      renewedAt: firstContent.renewedAt,
+    });
+    assert.ok(Number.isFinite(firstContent.renewedAt));
+    assert.strictEqual(firstStat.mode & 0o777, 0o600);
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await injector.renewHotReloadLease(fakePid, renewableLeaseId, 2_000);
+    const secondContent = JSON.parse(await fs.readFile(leaseFile, 'utf-8')) as {
+      ttlMs: number;
+      renewedAt: number;
+    };
+    const secondStat = await fs.stat(leaseFile);
+    assert.strictEqual(secondContent.ttlMs, 2_000);
+    assert.ok(secondContent.renewedAt > firstContent.renewedAt);
+    assert.notStrictEqual(secondStat.ino, firstStat.ino, 'renewal should replace the lease atomically');
+
+    const temporaryPrefix = `${fakePid}.hot-reload.${renewableLeaseId}.lease.`;
+    const temporaryFiles = (await fs.readdir(PORT_FILE_DIR)).filter(
+      (name) => name.startsWith(temporaryPrefix) && name.endsWith('.tmp'),
+    );
+    assert.deepStrictEqual(temporaryFiles, []);
+
+    await injector.releaseHotReloadLease(fakePid, renewableLeaseId);
+    await assert.rejects(
+      fs.access(leaseFile),
+      (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT',
+    );
   });
 
   it('requestHotReload with empty list is a no-op', async function () {

@@ -5,9 +5,14 @@ import { promisify } from 'util';
 import * as path from 'path';
 import * as net from 'net';
 import * as fs from 'fs/promises';
-import { DebugEngineConflictError, DebugpyInjector } from '../../debugpyInjector';
+import {
+  BOOTSTRAP_VERSION,
+  DebugEngineConflictError,
+  DebugpyInjector,
+} from '../../debugpyInjector';
 import { getPerf } from './perfReporter';
 import {
+  allocateLoopbackPort,
   findSystemPython,
   createTempVenv,
   spawnFakeRunserver,
@@ -24,8 +29,8 @@ const execFileAsync = promisify(execFile);
  *   2. Install the bootstrap there via DebugpyInjector.installBootstrap().
  *   3. Spawn the fake manage.py through that venv's python so the bootstrap
  *      loads automatically via the .pth file on startup.
- *   4. Call injector.activate(pid, port) — this should send SIGUSR1 and
- *      make debugpy listen on `port`.
+ *   4. Call injector.activate(pid, port) through the PID-owned private control
+ *      socket and make debugpy listen on `port`.
  *   5. Verify the TCP listener is up.
  *
  * Skipped gracefully if no system python3 is available.
@@ -36,10 +41,10 @@ describe('Feature: end-to-end attach flow', function () {
   let venv: Awaited<ReturnType<typeof createTempVenv>> = null;
   let server: SpawnedProcess | null = null;
   let experimentalServer: SpawnedProcess | null = null;
-  const serverPort = 49_872;
-  const debugPort = 49_873;
-  const experimentalServerPort = 49_874;
-  const experimentalDebugPort = 49_875;
+  let serverPort = 0;
+  let debugPort = 0;
+  let experimentalServerPort = 0;
+  let experimentalDebugPort = 0;
 
   before(async function () {
     this.timeout(60_000);
@@ -64,29 +69,27 @@ describe('Feature: end-to-end attach flow', function () {
       return;
     }
 
+    [serverPort, experimentalServerPort] = await Promise.all([
+      allocateLoopbackPort(),
+      allocateLoopbackPort(),
+    ]);
     server = await perf.measure('spawn fake runserver', async () =>
       spawnFakeRunserver(venv!.python, serverPort),
     { group: 'attach-e2e' });
     experimentalServer = await spawnFakeRunserver(venv.python, experimentalServerPort);
 
-    // Give the bootstrap's signal handler a moment to register.
+    // Give the bootstrap's private activation socket a moment to publish.
     await sleep(200);
 
-    // macOS quirk: `ps -p PID -o command=` reports the kernel-resolved path for
-    // execve(), which resolves venv symlinks to the base interpreter. As a result
-    // `resolvePythonForPid` returns the base Python (no bootstrap installed there)
-    // and `verifyBootstrapLoaded` fails. This is documented in optimization.md
-    // as a production bug to fix. For the E2E test, detect the mismatch and skip.
+    // The live bootstrap publishes sys.executable, so macOS ps/lsof resolving a
+    // venv symlink to its base interpreter must no longer skip attach coverage.
     const resolved = await injector.resolvePythonForPid(server.pid);
     const resolvable = await canImportBootstrap(resolved);
-    if (!resolvable) {
-      console.warn(
-        `[attach-e2e] resolvePythonForPid returned "${resolved}" for pid ${server.pid},\n` +
-        `  but venv python is "${venv.python}" — bootstrap is not loadable from the resolved path.\n` +
-        `  Skipping activate() tests. See optimization.md "resolvePythonForPid venv-symlink bug".`,
-      );
-      this.skip();
-    }
+    assert.strictEqual(
+      resolvable,
+      true,
+      `target-published Python "${resolved}" must import the installed bootstrap`,
+    );
   });
 
   after(async function () {
@@ -106,6 +109,7 @@ describe('Feature: end-to-end attach flow', function () {
     if (!server || !venv) { this.skip(); return; }
     this.timeout(20_000);
 
+    debugPort = await allocateLoopbackPort();
     const actualPort = await perf.measure('injector.activate (full)', async () =>
       injector.activate(server!.pid, debugPort),
     { group: 'attach-e2e', meta: { pid: server.pid, requested: debugPort } });
@@ -115,6 +119,7 @@ describe('Feature: end-to-end attach flow', function () {
     const endpoint = await injector.getActiveEndpoint(server.pid);
     assert.ok(endpoint, 'debugpy active endpoint should be discoverable');
     assert.strictEqual(endpoint.port, debugPort);
+    assert.strictEqual(endpoint.authToken, undefined);
 
     const listening = await isPortListening(endpoint.port, endpoint.host);
     assert.strictEqual(listening, true, `debugpy should be listening on ${endpoint.host}:${debugPort}`);
@@ -124,11 +129,13 @@ describe('Feature: end-to-end attach flow', function () {
     if (!experimentalServer || !venv) { this.skip(); return; }
     this.timeout(20_000);
 
+    experimentalDebugPort = await allocateLoopbackPort();
     const endpoint = await perf.measure('injector.activate (experimental)', async () =>
       injector.activateEndpoint(experimentalServer!.pid, experimentalDebugPort, 'experimental'),
     { group: 'attach-e2e', meta: { pid: experimentalServer.pid, requested: experimentalDebugPort } });
 
     assert.strictEqual(endpoint.port, experimentalDebugPort);
+    assert.match(endpoint.authToken ?? '', /^[0-9a-f]{64}$/);
     assert.strictEqual(
       await injector.getActiveEndpoint(experimentalServer.pid, 'debugpy'),
       null,
@@ -137,14 +144,30 @@ describe('Feature: end-to-end attach flow', function () {
     const active = await injector.getActiveEndpoint(experimentalServer.pid, 'experimental');
     assert.ok(active, 'experimental endpoint should be discoverable by its own engine');
     assert.strictEqual(active.port, experimentalDebugPort);
+    assert.strictEqual(active.authToken, endpoint.authToken);
+    const activePath = path.join(
+      '/tmp/django-process-debugger',
+      `${experimentalServer.pid}.experimental.active`,
+    );
+    assert.strictEqual((await fs.stat(activePath)).mode & 0o777, 0o600);
+
+    const alternatePort = await allocateLoopbackPort();
+    const reused = await injector.activateEndpoint(
+      experimentalServer.pid,
+      alternatePort,
+      'experimental',
+    );
+    assert.strictEqual(reused.port, endpoint.port);
+    assert.strictEqual(reused.authToken, endpoint.authToken);
   });
 
   it('does not switch an experimental PID to debugpy without a target restart', async function () {
     if (!experimentalServer || !venv) { this.skip(); return; }
     this.timeout(10_000);
 
+    const alternatePort = await allocateLoopbackPort();
     await assert.rejects(
-      injector.activateEndpoint(experimentalServer.pid, experimentalDebugPort + 100, 'debugpy'),
+      injector.activateEndpoint(experimentalServer.pid, alternatePort, 'debugpy'),
       (error: unknown) => error instanceof DebugEngineConflictError
         && error.activeEngine === 'experimental'
         && error.requestedEngine === 'debugpy',
@@ -155,8 +178,9 @@ describe('Feature: end-to-end attach flow', function () {
     if (!server) { this.skip(); return; }
     this.timeout(10_000);
 
+    const alternatePort = await allocateLoopbackPort();
     const secondPort = await perf.measure('injector.activate (idempotent)', async () =>
-      injector.activate(server!.pid, debugPort + 100),
+      injector.activate(server!.pid, alternatePort),
     { group: 'attach-e2e' });
 
     assert.strictEqual(secondPort, debugPort,
@@ -190,17 +214,18 @@ describe('Feature: end-to-end attach flow', function () {
 
   it('does not reuse an active file when a different PID has that port open on another host', async function () {
     const child = await startChildTcpListener();
-    const activeFile = path.join('/tmp/django-process-debugger', `${process.pid}.active`);
+    const synthetic = await publishSyntheticActiveRecord(
+      process.pid,
+      '127.250.250.250',
+      child.port,
+    );
 
     try {
-      await fs.mkdir(path.dirname(activeFile), { recursive: true });
-      await fs.writeFile(activeFile, JSON.stringify({ host: '127.250.250.250', port: child.port }), 'utf-8');
-
       const endpoint = await injector.getActiveEndpoint(process.pid);
       assert.strictEqual(endpoint, null);
-      await assert.rejects(fs.access(activeFile));
+      await assert.rejects(fs.access(synthetic.activeFile));
     } finally {
-      await fs.unlink(activeFile).catch(() => {});
+      await synthetic.cleanup();
       child.stop();
     }
   });
@@ -214,22 +239,60 @@ describe('Feature: end-to-end attach flow', function () {
 
     const address = listener.address();
     assert.ok(address && typeof address === 'object');
-    const activeFile = path.join('/tmp/django-process-debugger', `${process.pid}.active`);
+    const synthetic = await publishSyntheticActiveRecord(
+      process.pid,
+      '127.250.250.250',
+      address.port,
+    );
 
     try {
-      await fs.mkdir(path.dirname(activeFile), { recursive: true });
-      await fs.writeFile(activeFile, JSON.stringify({ host: '127.250.250.250', port: address.port }), 'utf-8');
-
       const endpoint = await injector.getActiveEndpoint(process.pid);
       assert.ok(endpoint);
       assert.strictEqual(endpoint.port, address.port);
       assert.strictEqual(endpoint.host, '127.0.0.1');
     } finally {
-      await fs.unlink(activeFile).catch(() => {});
+      await synthetic.cleanup();
       await new Promise<void>((resolve) => listener.close(() => resolve()));
     }
   });
 });
+
+async function publishSyntheticActiveRecord(
+  pid: number,
+  recordedHost: string,
+  port: number,
+): Promise<{ activeFile: string; cleanup(): Promise<void> }> {
+  const artifactDirectory = '/tmp/django-process-debugger';
+  const runtimeId = 'a1'.repeat(32);
+  const activeFile = path.join(artifactDirectory, `${pid}.active`);
+  const bootstrapStateFile = path.join(artifactDirectory, `${pid}.bootstrap.json`);
+  await fs.mkdir(artifactDirectory, { recursive: true, mode: 0o700 });
+  await fs.writeFile(bootstrapStateFile, JSON.stringify({
+    pid,
+    version: BOOTSTRAP_VERSION,
+    activationVersion: 2,
+    runtimeId,
+    controlSocket: path.join(artifactDirectory, `${pid}.control.sock`),
+  }), { encoding: 'utf-8', mode: 0o600 });
+  await fs.writeFile(activeFile, JSON.stringify({
+    version: 3,
+    engine: 'debugpy',
+    host: recordedHost,
+    port,
+    pid,
+    runtimeId,
+    bootstrapVersion: BOOTSTRAP_VERSION,
+  }), { encoding: 'utf-8', mode: 0o600 });
+  return {
+    activeFile,
+    cleanup: async () => {
+      await Promise.all([
+        fs.unlink(activeFile).catch(() => {}),
+        fs.unlink(bootstrapStateFile).catch(() => {}),
+      ]);
+    },
+  };
+}
 
 async function startChildTcpListener(): Promise<{ port: number; stop(): void }> {
   const script = [

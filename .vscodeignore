@@ -1,5 +1,6 @@
 .vscode/**
 .vscode-test/**
+.github/**
 .claude/**
 .codex/**
 .codeidx/**
@@ -14,6 +15,7 @@ node_modules/**
 .git/**
 .gitignore
 tsconfig.json
+package-lock.json
 **/*.ts
 **/*.map
 **/*.pyc

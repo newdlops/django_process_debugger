@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.910] - 2026-07-11
 
 ### Added
 - Added `djangoProcessDebugger.engine` with stable `debugpy` as the default and an explicit `experimental` opt-in for the independent native tracer.
@@ -18,6 +18,9 @@
 - Added hot reload support to the experimental tracer using the same bootstrap watcher as debugpy, with the internal reload thread excluded from native tracing.
 - Added a declarative extension API v1 for sibling extensions. Consumers start the public `django-process` debug type and retain PID locking, engine ownership, bootstrap validation, and hot reload instead of invoking internal activation helpers.
 - Added `manage.py shell` and `shell_plus` to the bootstrap target gate so the debugger can attach directly to live interactive Django shell processes.
+- Added a private authenticated activation control socket with per-process runtime identities, replacing process signals for engine activation.
+- Added authenticated experimental-DAP attach credentials and PID-scoped, expiring hot-reload leases with independent multi-target queues.
+- Added **Clean This Workspace**, a fail-closed cleanup flow that previews an allow-listed scope and removes only the saved runtime's bootstrap plus explicitly owned stale PID artifacts.
 
 ### Fixed
 - Attach process picker now shows attachable Django server targets grouped by listener host and port, so parent/child/wrapper processes collapse only when they resolve to the same `host:port`.
@@ -30,9 +33,16 @@
 - Hot reload now patches every still-live function generation instead of only the objects present before the first reload, so URL-conf, class, and decorated references captured after earlier reloads continue updating. Request claiming and result publication are atomic and request-correlated, eliminating worker unlink/chmod races, partial results, stale-result mixups, and overlapping VS Code flushes.
 - Experimental host integrations can opt individual user-code threads into tracing while keeping backend service workers exempt; canonical and legacy tracer imports now share one process-wide singleton.
 - Generated `.django-shell` analysis and console-cell files are excluded from hot reload requests.
+- Active endpoint records now bind the engine listener to the current target PID, runtime identity, and bootstrap version. Legacy or mismatched records are rejected before listener reuse and identity is checked again after listener discovery to close PID-reuse races.
+- Extension tests now allocate ephemeral loopback ports instead of sharing fixed ports across concurrent runs and port-manager environments.
+
+### Security
+- Removed the tracked runtime `log.txt`, which could contain debugger variable payloads, and added CI protection against adding it again.
+- Experimental DAP credentials, activation identities, and hot-reload capabilities are stored in private `0600` records and omitted from protocol logs and public status APIs.
 
 ### Changed
-- Bootstrap version bumped to `2026.07.10.10`. Existing runtimes auto-update on the next attach; restart running Django/Celery/shell processes afterward so the host-integration contract is loaded.
+- Replaced the destructive global `Clean All` behavior. Cleanup no longer scans home/global Python installs, stops Python or language-server processes, clears unrelated caches, removes shared debugpy storage, or broadly re-signs Python binaries.
+- Bootstrap/tracer version bumped to `2026.07.11.4`. Existing runtimes auto-update on the next attach; restart running Django/Celery/shell processes afterward so the host-integration contract is loaded.
 
 ## [0.2.7] - 2026-06-09
 

@@ -11,6 +11,8 @@ import builtins
 import collections
 import dis
 import functools
+import hashlib
+import hmac
 import itertools
 import json
 import keyword
@@ -26,8 +28,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 
-TRACER_API_VERSION = 1
-TRACER_VERSION = "2026.07.10.10"
+TRACER_API_VERSION = 2
+TRACER_VERSION = "2026.07.11.4"
 EXEMPT_THREAD_ATTRIBUTE = "django_debugger_do_not_trace"
 
 _CANONICAL_MODULE_NAME = "django_process_debugger_tracer"
@@ -53,6 +55,9 @@ _MAX_EXCEPTION_STACK_FRAMES = 64
 _MAX_EXCEPTION_STACK_LINE_CHARS = 2048
 _MAX_EXCEPTION_TRACEBACK_SCAN = 64 * 1024
 _MAX_DJANGO_HANDLER_FRAME_SCAN = 128
+_MAX_DJANGO_REQUEST_STACK_SCAN = 128
+_MAX_DJANGO_REQUEST_LOCALS_PER_FRAME = 256
+_MAX_DJANGO_REQUEST_LOCALS_SCAN = 4096
 _MAX_DJANGO_REQUEST_FIELD_SCAN = 4096
 _MAX_INNER_EXCEPTION_DEPTH = 8
 _MAX_INNER_EXCEPTION_CHILDREN = 32
@@ -86,6 +91,17 @@ _BASE_EXCEPTION_GROUP_EXCEPTIONS_DESCRIPTOR = (
 )
 _LOG_QUEUE_STOP = object()
 _HIT_CONDITION_PATTERN = re.compile(r"\s*(==|>=|<=|>|<|%)?\s*([0-9]+)\s*\Z")
+_AUTH_TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_DAP_AUTH_TOKEN_ARGUMENT = "__djangoProcessDebuggerAuthToken"
+
+
+def _is_valid_auth_token(value: Any) -> bool:
+    return type(value) is str and _AUTH_TOKEN_PATTERN.fullmatch(value) is not None
+
+
+def _auth_digest(value: Any) -> bytes:
+    normalized = value if _is_valid_auth_token(value) else ""
+    return hashlib.sha256(normalized.encode("ascii")).digest()
 
 if getattr(sys.implementation, "name", "") == "cpython":
     try:
@@ -409,6 +425,8 @@ class StopContext:
     exception_info: Optional["ExceptionStopInfo"] = None
     paused: bool = True
     pending_operation: Optional[PendingOperation] = None
+    django_request_scope: Optional[Dict[str, Any]] = None
+    django_request_scope_resolved: bool = False
 
 
 @dataclass(frozen=True)
@@ -502,8 +520,10 @@ class SetVariableError(Exception):
 
 
 class NativeDapTracer:
-    def __init__(self) -> None:
+    def __init__(self, auth_token: Optional[str] = None) -> None:
         self.owner_pid = os.getpid()
+        self._auth_token_valid = _is_valid_auth_token(auth_token)
+        self._auth_token_digest = _auth_digest(auth_token)
         self.breakpoints: Dict[str, Dict[int, Tuple[BreakpointSpec, ...]]] = {}
         self.call_breakpoint_locations: Dict[
             int,
@@ -570,6 +590,8 @@ class NativeDapTracer:
         self.sys_hook_installed = False
 
     def start(self, host: str = "127.0.0.1", port: int = 0) -> Tuple[str, int]:
+        if not self._auth_token_valid:
+            raise ValueError("Experimental DAP authentication is required")
         if sys.gettrace() is not None or _existing_thread_trace_hook() is not None:
             raise RuntimeError(
                 "Experimental tracer will not replace an existing sys/threading trace hook"
@@ -611,6 +633,13 @@ class NativeDapTracer:
             caller.f_trace = self.trace
             caller = caller.f_back
         return self.endpoint
+
+    def _matches_auth_token(self, candidate: Any) -> bool:
+        candidate_digest = _auth_digest(candidate)
+        return self._auth_token_valid and hmac.compare_digest(
+            self._auth_token_digest,
+            candidate_digest,
+        )
 
     def _install_uncaught_exception_hooks_locked(self) -> None:
         if self.sys_exception_hook is not None:
@@ -1126,6 +1155,154 @@ class NativeDapTracer:
         except BaseException:
             pass
         return result
+
+    @classmethod
+    def _loaded_django_http_request_type(cls) -> Optional[type]:
+        """Return Django's already-loaded HttpRequest class without importing it."""
+        namespace = cls._loaded_module_namespace("django.http.request")
+        if namespace is None:
+            return None
+        try:
+            candidate = namespace.get("HttpRequest")
+        except BaseException:
+            return None
+        # Django's built-in HttpRequest uses the normal ``type`` metaclass.
+        # Reject substituted objects or classes with application metaclasses so
+        # discovery never needs their instance/subclass hooks.
+        return candidate if type(candidate) is type else None
+
+    @classmethod
+    def _loaded_django_request_handler_codes(cls) -> Set[types.CodeType]:
+        """Resolve stable Django request-handler code identities without imports."""
+        result = set()  # type: Set[types.CodeType]
+        targets = (
+            (
+                "django.core.handlers.base",
+                "BaseHandler",
+                (
+                    "get_response",
+                    "get_response_async",
+                    "_get_response",
+                    "_get_response_async",
+                ),
+            ),
+            ("django.core.handlers.wsgi", "WSGIHandler", ("__call__",)),
+            ("django.core.handlers.asgi", "ASGIHandler", ("__call__", "handle")),
+        )
+        for module_name, class_name, member_names in targets:
+            namespace = cls._loaded_module_namespace(module_name)
+            if namespace is None:
+                continue
+            try:
+                handler_type = namespace.get(class_name)
+            except BaseException:
+                continue
+            if type(handler_type) is not type:
+                continue
+            for member_name in member_names:
+                _owner, member = _resolve_type_member(handler_type, member_name)
+                if type(member) is not types.FunctionType:
+                    continue
+                try:
+                    code = object.__getattribute__(member, "__code__")
+                except BaseException:
+                    continue
+                if type(code) is types.CodeType:
+                    result.add(code)
+        return result
+
+    @classmethod
+    def _django_request_scope_from_stack(
+        cls,
+        frame: types.FrameType,
+    ) -> Optional[Dict[str, Any]]:
+        """Find a direct HttpRequest local in a bounded live stack scan.
+
+        Only interpreter-owned frame/local storage and exact type identities are
+        inspected. No request attribute, descriptor, ``repr``, ``str``, or
+        application-defined metaclass hook is invoked.
+        """
+        http_request_type = cls._loaded_django_http_request_type()
+        if http_request_type is None:
+            return None
+        handler_codes = cls._loaded_django_request_handler_codes()
+        current = frame  # type: Optional[types.FrameType]
+        fallback_request = None
+        traversed = 0
+        locals_scanned = 0
+        try:
+            while (
+                current is not None
+                and traversed < _MAX_DJANGO_REQUEST_STACK_SCAN
+                and locals_scanned < _MAX_DJANGO_REQUEST_LOCALS_SCAN
+            ):
+                frame_request = None
+                named_request = None
+                try:
+                    local_values = current.f_locals
+                    items = itertools.islice(
+                        local_values.items(),
+                        _MAX_DJANGO_REQUEST_LOCALS_PER_FRAME,
+                    )
+                    for name, value in items:
+                        if locals_scanned >= _MAX_DJANGO_REQUEST_LOCALS_SCAN:
+                            break
+                        locals_scanned += 1
+                        if not _type_mro_contains(
+                            type(value),
+                            (http_request_type,),
+                        ):
+                            continue
+                        if frame_request is None:
+                            frame_request = value
+                            if fallback_request is None:
+                                fallback_request = value
+                        if type(name) is str and name == "request":
+                            named_request = value
+                            break
+                except BaseException:
+                    frame_request = None
+                    named_request = None
+
+                # The nearest conventional request local is the strongest live
+                # stack evidence and naturally selects an inner nested request.
+                if named_request is not None:
+                    return cls._django_request_scope(named_request)
+                # A known handler frame outranks an arbitrary alias found in a
+                # closer helper frame, while still avoiding name assumptions.
+                if frame_request is not None and current.f_code in handler_codes:
+                    return cls._django_request_scope(frame_request)
+
+                current = current.f_back
+                traversed += 1
+        except BaseException:
+            return None
+        finally:
+            current = None
+
+        if fallback_request is None:
+            return None
+        return cls._django_request_scope(fallback_request)
+
+    def _django_request_scope_for_context(
+        self,
+        context: StopContext,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve and cache a positive or negative request scope for one stop."""
+        if context.django_request_scope_resolved:
+            return context.django_request_scope
+
+        exception_info = context.exception_info
+        if exception_info is not None and exception_info.request_scope is not None:
+            scope = exception_info.request_scope
+        else:
+            try:
+                scope = self._django_request_scope_from_stack(context.frame)
+            except BaseException:
+                scope = None
+        context.django_request_scope = scope
+        context.django_request_scope_resolved = True
+        return scope
 
     def _handle_django_request_exception(
         self,
@@ -2401,9 +2578,10 @@ class NativeDapTracer:
             self.client = client
             self.sequence = 1
             self.disconnect_requested = False
-            client.settimeout(5.0)
+            client.settimeout(2.0)
             stream = client.makefile("rb")
             first_message = True
+            client_authenticated = False
             try:
                 while self.enabled and not self.disconnect_requested:
                     request = self._read_message(stream)
@@ -2415,6 +2593,15 @@ class NativeDapTracer:
                         if request.get("command") != "initialize":
                             raise ValueError("The first DAP request must be initialize")
                         first_message = False
+                    elif not client_authenticated:
+                        authenticated_request = self._authenticated_attach_request(request)
+                        if authenticated_request is None:
+                            break
+                        request = authenticated_request
+                        client_authenticated = True
+                        # Authentication is complete; allow the normal attach
+                        # configuration handshake a little longer to finish.
+                        client.settimeout(5.0)
                     try:
                         self._request(request)
                     except Exception:
@@ -2439,6 +2626,29 @@ class NativeDapTracer:
                 except OSError:
                     pass
                 self._drop_client(client)
+
+    def _authenticated_attach_request(
+        self,
+        request: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        raw_args = request.get("arguments")
+        args = raw_args if type(raw_args) is dict else {}
+        if (
+            request.get("command") != "attach"
+            or not self._matches_auth_token(args.get(_DAP_AUTH_TOKEN_ARGUMENT))
+        ):
+            self._response(
+                request,
+                success=False,
+                message="Authentication failed",
+            )
+            return None
+
+        sanitized_args = dict(args)
+        sanitized_args.pop(_DAP_AUTH_TOKEN_ARGUMENT, None)
+        sanitized_request = dict(request)
+        sanitized_request["arguments"] = sanitized_args
+        return sanitized_request
 
     @staticmethod
     def _read_message(stream) -> Optional[Dict[str, Any]]:
@@ -3373,11 +3583,11 @@ class NativeDapTracer:
             context = self.stops.get(entry[0]) if entry is not None else None
             active = context is not None and context.paused
             request_scope = (
-                context.exception_info.request_scope
-                if context is not None
-                and context.exception_info is not None
+                self._django_request_scope_for_context(context)
+                if active and context is not None
                 else None
             )
+            request_scope_frame = context.frame if context is not None else None
         if not active or entry is None:
             self._response(request, success=False, message="Unknown or expired frame")
             return
@@ -3400,7 +3610,7 @@ class NativeDapTracer:
             request_ref = self._handle_value(
                 native_id,
                 request_scope,
-                frame,
+                request_scope_frame,
                 "django_request",
             )
             scopes.append(
@@ -3914,7 +4124,10 @@ class NativeDapTracer:
                             item,
                             frame,
                             reference,
-                            read_only=type(key) is not str,
+                            read_only=(
+                                entry.kind == "django_request"
+                                or type(key) is not str
+                            ),
                             evaluate_name=evaluate_name,
                             format_options=format_options,
                             value_preview=(
@@ -4205,6 +4418,8 @@ class NativeDapTracer:
         frame = entry.frame
         if entry.kind.startswith("lazy_"):
             raise SetVariableError("Lazy values are read-only")
+        if entry.kind == "django_request":
+            raise SetVariableError("Django Request scope is read-only")
         if entry.kind == "locals":
             if frame is None:
                 raise SetVariableError("The local scope frame has expired")
@@ -4325,6 +4540,13 @@ class NativeDapTracer:
                 message=(
                     "Variables cannot be changed in a historical exception stop"
                 ),
+            )
+            return
+        if entry.kind == "django_request":
+            self._response(
+                request,
+                success=False,
+                message="Django Request scope is read-only",
             )
             return
         if entry.kind.startswith("lazy_"):
@@ -4694,6 +4916,8 @@ class NativeDapTracer:
         self.sequence = 1
         self.disconnect_requested = False
         self.client_supports_variable_type = False
+        self._auth_token_valid = False
+        self._auth_token_digest = _auth_digest(None)
 
         # Never reuse synchronization primitives that may have been owned by a
         # thread which no longer exists in the child.
@@ -4702,14 +4926,25 @@ class NativeDapTracer:
         self.send_lock = threading.Lock()
 
 
-def start(host: str = "127.0.0.1", port: int = 0) -> Tuple[str, int]:
+def start(
+    host: str = "127.0.0.1",
+    port: int = 0,
+    *,
+    auth_token: Optional[str] = None,
+) -> Tuple[str, int]:
     """Start (or reuse) the in-process DAP server and return its endpoint."""
+    if not _is_valid_auth_token(auth_token):
+        raise ValueError("Experimental DAP authentication is required")
     global _ACTIVE_TRACER
     with _ACTIVE_LOCK:
         tracer = _ACTIVE_TRACER
         if tracer is not None and tracer.enabled and tracer.endpoint is not None:
+            if not tracer._matches_auth_token(auth_token):
+                raise RuntimeError(
+                    "Experimental tracer is already active with different credentials"
+                )
             return tracer.endpoint
-        tracer = NativeDapTracer()
+        tracer = NativeDapTracer(auth_token)
         # Publish before opening the listener/installing hooks so an unrelated
         # application thread that forks during activation can still find and
         # discard this partially-started tracer in its at-fork callback.

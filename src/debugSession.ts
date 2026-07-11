@@ -1,10 +1,11 @@
 import * as vscode from 'vscode';
-import { DebugpyInjector } from './debugpyInjector';
+import { DebugpyInjector, isValidExperimentalAuthToken } from './debugpyInjector';
 import { DebugEngine, DEFAULT_DEBUG_ENGINE, normalizeDebugEngine } from './debugEngine';
 import { log, logError, getLogger } from './logger';
 import { formatEndpoint } from './listeningEndpoint';
 
 export const DEBUG_SESSION_LOCK_TOKEN_KEY = '__djangoProcessDebuggerLockToken';
+export const DEBUG_SESSION_AUTH_TOKEN_KEY = '__djangoProcessDebuggerAuthToken';
 
 export interface DebugSessionLockTarget {
   pid: number;
@@ -49,7 +50,8 @@ export function parseDebugSessionPid(value: unknown): number | undefined {
 /**
  * Bridges between our "django-process" debug type and the underlying
  * selected debug adapter. When VS Code starts a "django-process" attach
- * session, this factory activates the configured engine via signal first,
+ * session, this factory activates the configured engine through its private
+ * process control channel first,
  * then delegates to its DAP server over TCP.
  */
 export class DjangoDebugSessionFactory
@@ -113,6 +115,17 @@ export class DjangoDebugSessionFactory
         // dynamically allocated port, rather than the pre-activation request.
         config.host = host;
         config.port = port;
+        if (engine === 'experimental') {
+          if (!isValidExperimentalAuthToken(endpoint.authToken)) {
+            throw new Error(
+              'Experimental tracer did not publish a valid DAP authentication credential. ' +
+              'Restart the target process after updating the bootstrap.'
+            );
+          }
+          config[DEBUG_SESSION_AUTH_TOKEN_KEY] = endpoint.authToken;
+        } else {
+          delete config[DEBUG_SESSION_AUTH_TOKEN_KEY];
+        }
         log(`[DebugSession] Activation succeeded, connecting to ${formatEndpoint(endpoint)}`);
       } catch (err) {
         try {
@@ -127,6 +140,19 @@ export class DjangoDebugSessionFactory
         });
         return null;
       }
+    }
+
+    if (
+      engine === 'experimental'
+      && !isValidExperimentalAuthToken(config[DEBUG_SESSION_AUTH_TOKEN_KEY])
+    ) {
+      void vscode.window.showErrorMessage(
+        'Cannot attach to the experimental tracer without its private DAP authentication credential.'
+      );
+      return null;
+    }
+    if (engine === 'debugpy') {
+      delete config[DEBUG_SESSION_AUTH_TOKEN_KEY];
     }
 
     return new vscode.DebugAdapterServer(port, host);

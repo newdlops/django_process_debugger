@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import time
+import types
 
 
 sys.path.insert(0, sys.argv[1])
@@ -13,8 +14,44 @@ sys.path.insert(0, sys.argv[1])
 from django_process_debugger_tracer import start
 
 
+AUTH_TOKEN = "0123456789abcdef" * 4
 GLOBAL_VALUE = 5
 SHADOWED_VALUE = "global"
+REQUEST_HOOK_CALLS = []
+
+
+class HttpRequest:
+    pass
+
+
+class WSGIRequest(HttpRequest):
+    def __init__(self):
+        self.method = "GET"
+        self.path = "/orders/42/"
+        self.path_info = "/orders/42/"
+        self.resolver_match = "orders:detail"
+
+    def __repr__(self):
+        REQUEST_HOOK_CALLS.append("repr")
+        raise RuntimeError("request repr must stay lazy")
+
+    def __str__(self):
+        REQUEST_HOOK_CALLS.append("str")
+        raise RuntimeError("request str must stay lazy")
+
+    @property
+    def body(self):
+        REQUEST_HOOK_CALLS.append("body")
+        raise RuntimeError("request body must not be evaluated")
+
+
+django_module = types.ModuleType("django")
+django_http_module = types.ModuleType("django.http")
+django_request_module = types.ModuleType("django.http.request")
+django_request_module.HttpRequest = HttpRequest
+sys.modules["django"] = django_module
+sys.modules["django.http"] = django_http_module
+sys.modules["django.http.request"] = django_request_module
 
 
 class DangerousValue:
@@ -82,14 +119,19 @@ def calculate(seed):
     return result
 
 
-endpoint = start("127.0.0.1", 0)
-same_endpoint = start("127.0.0.1", endpoint[1] + 1)
+endpoint = start("127.0.0.1", 0, auth_token=AUTH_TOKEN)
+same_endpoint = start(
+    "127.0.0.1",
+    endpoint[1] + 1,
+    auth_token=AUTH_TOKEN,
+)
 print(
     json.dumps(
         {
             "pid": os.getpid(),
             "host": endpoint[0],
             "port": endpoint[1],
+            "authToken": AUTH_TOKEN,
             "idempotent": endpoint == same_endpoint,
             "source": __file__,
             "debugpy_loaded": any(
@@ -109,6 +151,7 @@ print(
 def request_worker():
     if sys.stdin.readline().strip() != "GO":
         return
+    request = WSGIRequest()
     print("RESULT={}".format(calculate(20)), flush=True)
 
 

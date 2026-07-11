@@ -2,7 +2,12 @@ import * as assert from 'assert';
 import { describe, it, before, after } from 'mocha';
 import { DjangoProcessFinder } from '../../processFinder';
 import { getPerf } from './perfReporter';
-import { findSystemPython, spawnFakeRunserver, SpawnedProcess } from './testHelpers';
+import {
+  allocateLoopbackPort,
+  findSystemPython,
+  spawnFakeRunserver,
+  SpawnedProcess,
+} from './testHelpers';
 
 /**
  * Verifies that findDjangoProcesses handles more than one running server
@@ -15,8 +20,8 @@ import { findSystemPython, spawnFakeRunserver, SpawnedProcess } from './testHelp
 describe('Feature: multi-process discovery', function () {
   const perf = getPerf();
   const finder = new DjangoProcessFinder();
-  const portA = 49_881;
-  const portB = 49_882;
+  let portA = 0;
+  let portB = 0;
   let pythonBin: string | null;
   let serverA: SpawnedProcess | null = null;
   let serverB: SpawnedProcess | null = null;
@@ -26,6 +31,10 @@ describe('Feature: multi-process discovery', function () {
     pythonBin = await findSystemPython();
     if (!pythonBin) { this.skip(); return; }
 
+    [portA, portB] = await Promise.all([
+      allocateLoopbackPort(),
+      allocateLoopbackPort(),
+    ]);
     serverA = await spawnFakeRunserver(pythonBin, portA);
     serverB = await spawnFakeRunserver(pythonBin, portB);
   });

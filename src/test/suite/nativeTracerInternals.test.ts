@@ -309,6 +309,403 @@ print("SAFE_PREVIEW")
     assert.match(stdout, /SAFE_PREVIEW/);
   });
 
+  it('discovers and caches Django request scopes without importing Django or invoking hooks', async function () {
+    const python = await findSystemPython();
+    if (!python) {
+      this.skip();
+      return;
+    }
+
+    const script = String.raw`
+import sys
+import threading
+import types
+
+sys.path.insert(0, sys.argv[1])
+from django_process_debugger_tracer import (
+    ExceptionStopInfo,
+    NativeDapTracer,
+    StopContext,
+    _MAX_DJANGO_REQUEST_LOCALS_PER_FRAME,
+    _MAX_DJANGO_REQUEST_STACK_SCAN,
+)
+
+
+def capture_responses(tracer):
+    responses = []
+
+    def capture(request, body=None, success=True, message=None, **_kwargs):
+        responses.append({
+            "body": body,
+            "success": success,
+            "message": message,
+        })
+        return True
+
+    tracer._response = capture
+    return responses
+
+
+module_names = (
+    "django.http.request",
+    "django.core.handlers.base",
+    "django.core.handlers.wsgi",
+    "django.core.handlers.asgi",
+)
+missing = object()
+original_modules = {
+    name: sys.modules.get(name, missing)
+    for name in module_names
+}
+for name in module_names:
+    sys.modules.pop(name, None)
+
+try:
+    # A request-shaped object is not sufficient, and discovery must not import
+    # Django or touch any of its application-defined properties.
+    duck_hooks = []
+
+    class RequestDuck:
+        @property
+        def method(self):
+            duck_hooks.append("method")
+            raise AssertionError("duck method property ran")
+
+        @property
+        def path(self):
+            duck_hooks.append("path")
+            raise AssertionError("duck path property ran")
+
+    def scan_duck():
+        duck = RequestDuck()
+        return NativeDapTracer._django_request_scope_from_stack(
+            sys._getframe()
+        )
+
+    assert scan_duck() is None
+    assert not duck_hooks, duck_hooks
+    assert "django.http.request" not in sys.modules
+
+    request_module = types.ModuleType("django.http.request")
+
+    class HttpRequest:
+        pass
+
+    request_module.HttpRequest = HttpRequest
+    sys.modules["django.http.request"] = request_module
+
+    handler_module = types.ModuleType("django.core.handlers.base")
+
+    class BaseHandler:
+        # Deliberately use a non-standard argument name. Exact handler code
+        # identity, not a local-name guess, must select this active request.
+        def _get_response(self, active, callback):
+            return callback()
+
+    handler_module.BaseHandler = BaseHandler
+    sys.modules["django.core.handlers.base"] = handler_module
+
+    hooks = []
+
+    class RequestMeta(type):
+        instance_checks = 0
+        subclass_checks = 0
+        equality_checks = 0
+        mro_reads = 0
+
+        def __instancecheck__(cls, instance):
+            RequestMeta.instance_checks += 1
+            raise AssertionError("metaclass __instancecheck__ ran")
+
+        def __subclasscheck__(cls, subclass):
+            RequestMeta.subclass_checks += 1
+            raise AssertionError("metaclass __subclasscheck__ ran")
+
+        def __eq__(cls, other):
+            RequestMeta.equality_checks += 1
+            return False
+
+        __hash__ = type.__hash__
+
+        @property
+        def __mro__(cls):
+            RequestMeta.mro_reads += 1
+            raise AssertionError("metaclass __mro__ ran")
+
+    class EvilRequest(HttpRequest, metaclass=RequestMeta):
+        def __init__(self, method, path):
+            object.__setattr__(self, "method", method)
+            object.__setattr__(self, "path", path)
+            object.__setattr__(self, "path_info", path + "info/")
+            object.__setattr__(self, "resolver_match", {"route": path})
+
+        def __getattribute__(self, name):
+            hooks.append(("getattribute", name))
+            raise AssertionError("request __getattribute__ ran")
+
+        def __repr__(self):
+            hooks.append(("repr", None))
+            raise AssertionError("request __repr__ ran")
+
+        def __str__(self):
+            hooks.append(("str", None))
+            raise AssertionError("request __str__ ran")
+
+        @property
+        def body(self):
+            hooks.append(("body", None))
+            raise AssertionError("request body property ran")
+
+        @property
+        def user(self):
+            hooks.append(("user", None))
+            raise AssertionError("request user property ran")
+
+    active = EvilRequest("GET", "/active/")
+    inner = EvilRequest("POST", "/inner/")
+    decoy = EvilRequest("DELETE", "/decoy/")
+    RequestMeta.instance_checks = 0
+    RequestMeta.subclass_checks = 0
+    RequestMeta.equality_checks = 0
+    RequestMeta.mro_reads = 0
+
+    def inspect_named(request):
+        return NativeDapTracer._django_request_scope_from_stack(
+            sys._getframe()
+        )
+
+    def inspect_alias(alias):
+        return NativeDapTracer._django_request_scope_from_stack(
+            sys._getframe()
+        )
+
+    handler = BaseHandler()
+    named_scope = handler._get_response(
+        active,
+        lambda: inspect_named(inner),
+    )
+    assert named_scope["request"] is inner
+    assert named_scope["method"] == "POST"
+    assert named_scope["path"] == "/inner/"
+    assert named_scope["path_info"] == "/inner/info/"
+
+    # A closer arbitrary alias is weaker evidence than a known handler frame.
+    handler_scope = handler._get_response(
+        active,
+        lambda: inspect_alias(decoy),
+    )
+    assert handler_scope["request"] is active
+    assert handler_scope["resolver_match"] == {"route": "/active/"}
+
+    fallback_scope = inspect_alias(decoy)
+    assert fallback_scope["request"] is decoy
+    assert not hooks, hooks
+    assert RequestMeta.instance_checks == 0
+    assert RequestMeta.subclass_checks == 0
+    assert RequestMeta.equality_checks == 0
+    assert RequestMeta.mro_reads == 0
+
+    # The scan stops before a request frame outside its stack bound.
+    def bounded_outer(alias, depth):
+        def descend(remaining):
+            if remaining:
+                return descend(remaining - 1)
+            return NativeDapTracer._django_request_scope_from_stack(
+                sys._getframe()
+            )
+
+        return descend(depth)
+
+    assert bounded_outer(active, 8)["request"] is active
+    assert bounded_outer(
+        active,
+        _MAX_DJANGO_REQUEST_STACK_SCAN + 8,
+    ) is None
+
+    # A request local beyond the per-frame scan bound is not inspected. Keep
+    # the only live request behind a class attribute so outer frames cannot
+    # provide an accidental fallback candidate.
+    class RequestHolder:
+        value = active
+
+    saved_requests = (active, inner, decoy)
+    active = None
+    inner = None
+    decoy = None
+    many_locals_source = ["def many_locals():"]
+    many_locals_source.extend(
+        "    local_{} = {}".format(index, index)
+        for index in range(_MAX_DJANGO_REQUEST_LOCALS_PER_FRAME + 16)
+    )
+    many_locals_source.extend((
+        "    late_alias = RequestHolder.value",
+        "    return NativeDapTracer._django_request_scope_from_stack(sys._getframe())",
+    ))
+    many_locals_namespace = {
+        "NativeDapTracer": NativeDapTracer,
+        "RequestHolder": RequestHolder,
+        "sys": sys,
+    }
+    exec("\n".join(many_locals_source), many_locals_namespace)
+    assert many_locals_namespace["many_locals"]() is None
+    active, inner, decoy = saved_requests
+
+    def exercise_cached_scope(request):
+        tracer = NativeDapTracer()
+        responses = capture_responses(tracer)
+        native_id = threading.get_ident()
+        frame = sys._getframe()
+        context = StopContext(native_id, 1, frame, "breakpoint")
+        tracer.stops[native_id] = context
+        frame_id = tracer._handle_frame(native_id, frame)
+        parent_frame_id = tracer._handle_frame(native_id, frame.f_back)
+
+        scans = []
+        original_scan = tracer._django_request_scope_from_stack
+
+        def counted_scan(candidate_frame):
+            scans.append(candidate_frame)
+            return original_scan(candidate_frame)
+
+        tracer._django_request_scope_from_stack = counted_scan
+        tracer._scopes({"seq": 1}, {"frameId": frame_id})
+        tracer._scopes({"seq": 2}, {"frameId": frame_id})
+        tracer._scopes({"seq": 3}, {"frameId": parent_frame_id})
+        assert len(scans) == 1, scans
+        request_scopes = [
+            next(
+                scope
+                for scope in response["body"]["scopes"]
+                if scope["name"] == "Django Request"
+            )
+            for response in responses[:3]
+        ]
+        references = {
+            scope["variablesReference"]
+            for scope in request_scopes
+        }
+        assert len(references) == 1, references
+        request_reference = references.pop()
+
+        tracer._variables(
+            {"seq": 4},
+            {"variablesReference": request_reference},
+        )
+        rows = responses[-1]["body"]["variables"]
+        request_row = next(row for row in rows if row["name"] == "request")
+        assert request_row["value"] == "<EvilRequest>"
+        assert request_row["variablesReference"] > 0
+        assert all(
+            "readOnly" in row.get("presentationHint", {}).get("attributes", [])
+            for row in rows
+        ), rows
+        assert not hooks, hooks
+
+        tracer._set_variable(
+            {"seq": 5},
+            {
+                "variablesReference": request_reference,
+                "name": "method",
+                "value": "hooks.append(('set-expression', None)) or 'PATCH'",
+            },
+        )
+        assert responses[-1]["success"] is False
+        assert responses[-1]["message"] == "Django Request scope is read-only"
+        assert not hooks, hooks
+        return request_reference
+
+    cached_reference = exercise_cached_scope(active)
+    assert cached_reference > 0
+
+    def exercise_negative_cache(request):
+        tracer = NativeDapTracer()
+        responses = capture_responses(tracer)
+        native_id = threading.get_ident()
+        frame = sys._getframe()
+        context = StopContext(native_id, 1, frame, "breakpoint")
+        tracer.stops[native_id] = context
+        frame_id = tracer._handle_frame(native_id, frame)
+        saved_module = sys.modules.pop("django.http.request")
+        try:
+            tracer._scopes({"seq": 6}, {"frameId": frame_id})
+            assert context.django_request_scope_resolved is True
+            assert context.django_request_scope is None
+            assert all(
+                scope["name"] != "Django Request"
+                for scope in responses[-1]["body"]["scopes"]
+            )
+
+            # A negative result remains deterministic for this stop even if
+            # another thread/module action makes Django visible meanwhile.
+            sys.modules["django.http.request"] = saved_module
+            tracer._scopes({"seq": 7}, {"frameId": frame_id})
+            assert all(
+                scope["name"] != "Django Request"
+                for scope in responses[-1]["body"]["scopes"]
+            )
+
+            tracer._expire_handles(native_id)
+            next_context = StopContext(native_id, 1, frame, "step")
+            tracer.stops[native_id] = next_context
+            next_frame_id = tracer._handle_frame(native_id, frame)
+            tracer._scopes({"seq": 8}, {"frameId": next_frame_id})
+            assert next_context.django_request_scope_resolved is True
+            assert next_context.django_request_scope["request"] is request
+            assert any(
+                scope["name"] == "Django Request"
+                for scope in responses[-1]["body"]["scopes"]
+            )
+        finally:
+            sys.modules["django.http.request"] = saved_module
+
+    exercise_negative_cache(active)
+
+    # Signal-supplied post-mortem request context is authoritative even if a
+    # different live HttpRequest is visible in the stopped frame.
+    authoritative = object()
+
+    def exception_scope_precedence(request):
+        tracer = NativeDapTracer()
+        context = StopContext(
+            threading.get_ident(),
+            1,
+            sys._getframe(),
+            "exception",
+            exception_info=ExceptionStopInfo(
+                RuntimeError("boom"),
+                None,
+                "userUnhandled",
+                "djangoRequestUnhandled",
+                1,
+                request_scope={"request": authoritative, "path": "/signal/"},
+            ),
+        )
+        tracer._django_request_scope_from_stack = lambda _frame: (_ for _ in ()).throw(
+            AssertionError("authoritative exception scope performed a stack scan")
+        )
+        return tracer._django_request_scope_for_context(context)
+
+    authoritative_scope = exception_scope_precedence(active)
+    assert authoritative_scope["request"] is authoritative
+    assert authoritative_scope["path"] == "/signal/"
+    assert not hooks, hooks
+finally:
+    for name, module in original_modules.items():
+        if module is missing:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
+
+print("DJANGO_REQUEST_SCOPE_SAFE")
+`;
+    const { stdout } = await execFileAsync(
+      python,
+      ['-c', script, path.join(projectRoot(), 'python')],
+      { env: cleanPythonEnv(), timeout: 15_000 },
+    );
+    assert.match(stdout, /DJANGO_REQUEST_SCOPE_SAFE/);
+  });
+
   it('refuses to replace an existing Python trace hook', async function () {
     const python = await findSystemPython();
     if (!python) {
@@ -328,7 +725,7 @@ def existing(frame, event, arg):
 sys.settrace(existing)
 threading.settrace(existing)
 try:
-    tracer.start()
+    tracer.start(auth_token="0123456789abcdef" * 4)
 except RuntimeError as exc:
     assert "will not replace" in str(exc), str(exc)
     assert sys.gettrace() is existing, "current-thread hook was erased"

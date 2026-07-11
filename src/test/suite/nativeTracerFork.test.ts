@@ -31,6 +31,8 @@ import types
 sys.path.insert(0, sys.argv[1])
 import django_process_debugger_tracer as tracer_module
 
+PARENT_AUTH_TOKEN = "0123456789abcdef" * 4
+CHILD_AUTH_TOKEN = "fedcba9876543210" * 4
 
 class ForkSignal:
     def __init__(self):
@@ -62,7 +64,7 @@ handler_module.response_for_exception = response_for_exception
 sys.modules["django.core.signals"] = signals_module
 sys.modules["django.core.handlers.exception"] = handler_module
 
-endpoint = tracer_module.start("127.0.0.1", 0)
+endpoint = tracer_module.start("127.0.0.1", 0, auth_token=PARENT_AUTH_TOKEN)
 inherited = tracer_module._ACTIVE_TRACER
 inherited.configured = True
 inherited.breakpoints = {"inherited.py": {10}}
@@ -138,8 +140,13 @@ if child_pid == 0:
             "send_lock_replaced": inherited.send_lock is not old_send_lock,
             "breakpoints_cleared": inherited.breakpoints == {},
             "steps_cleared": inherited.steps == {},
+            "inherited_auth_cleared": inherited._auth_token_valid is False,
         })
-        child_endpoint = tracer_module.start("127.0.0.1", 0)
+        child_endpoint = tracer_module.start(
+            "127.0.0.1",
+            0,
+            auth_token=CHILD_AUTH_TOKEN,
+        )
         result.update({
             "child_reactivated": tracer_module._ACTIVE_TRACER is not inherited,
             "child_listener_distinct": child_endpoint != endpoint,

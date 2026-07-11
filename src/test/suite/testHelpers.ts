@@ -1,10 +1,47 @@
 import { execFile, spawn, ChildProcess } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs/promises';
+import * as net from 'net';
 import * as path from 'path';
 import * as os from 'os';
 
 const execFileAsync = promisify(execFile);
+const allocatedLoopbackPorts = new Set<number>();
+
+/**
+ * Ask the OS for an unused IPv4 loopback port instead of sharing a fixed test
+ * range with concurrent extension runs or the Port Manager integration.
+ */
+export async function allocateLoopbackPort(): Promise<number> {
+  for (;;) {
+    const server = net.createServer();
+    server.unref();
+
+    const port = await new Promise<number>((resolve, reject) => {
+      const onError = (error: Error): void => reject(error);
+      server.once('error', onError);
+      server.listen({ host: '127.0.0.1', port: 0, exclusive: true }, () => {
+        server.removeListener('error', onError);
+        const address = server.address();
+        if (!address || typeof address === 'string') {
+          reject(new Error('Failed to allocate an IPv4 loopback test port'));
+          return;
+        }
+        resolve(address.port);
+      });
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+    });
+
+    // Avoid immediate reuse within one test host after the reservation closes.
+    if (!allocatedLoopbackPorts.has(port)) {
+      allocatedLoopbackPorts.add(port);
+      return port;
+    }
+  }
+}
 
 export function fixturesDir(): string {
   return path.resolve(__dirname, '../../../src/test/fixtures');
@@ -62,19 +99,19 @@ function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boole
 
   return new Promise<boolean>((resolve) => {
     let settled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timer: { handle?: ReturnType<typeof setTimeout> } = {};
 
     const finish = (exited: boolean): void => {
       if (settled) { return; }
       settled = true;
-      if (timer) { clearTimeout(timer); }
+      if (timer.handle) { clearTimeout(timer.handle); }
       child.removeListener('exit', onExit);
       resolve(exited);
     };
     const onExit = (): void => finish(true);
 
     child.once('exit', onExit);
-    timer = setTimeout(() => finish(hasChildExited(child)), timeoutMs);
+    timer.handle = setTimeout(() => finish(hasChildExited(child)), timeoutMs);
 
     // Avoid missing an exit that raced with listener registration.
     if (hasChildExited(child)) {

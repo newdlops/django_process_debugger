@@ -1,9 +1,8 @@
 import * as vscode from 'vscode';
 import * as net from 'net';
 import * as fs from 'fs';
-import * as fsPromises from 'fs/promises';
 import * as path from 'path';
-import * as os from 'os';
+import { preflightCleanAll, runCleanAll, type CleanAllScope } from './cleanAll';
 import { DjangoProcess, DjangoProcessFinder } from './processFinder';
 import {
   DebugpyInjector,
@@ -11,10 +10,15 @@ import {
   BootstrapNotInstalledError,
   BootstrapRuntimeVersionError,
   BOOTSTRAP_VERSION,
+  HOT_RELOAD_LEASE_HEARTBEAT_MS,
+  HOT_RELOAD_LEASE_TTL_MS,
+  isValidExperimentalAuthToken,
+  type DebugpyEndpoint,
 } from './debugpyInjector';
 import { DebugpyManager, DebugpyProvisioningInfo } from './debugpyManager';
 import { log, logError, getLogger } from './logger';
 import { shouldIgnoreForHotReload } from './hotReloadFilter';
+import { HotReloadLeaseManager } from './hotReloadLeaseManager';
 import { TcpListeningEndpoint, formatEndpoint } from './listeningEndpoint';
 import { summarizeDapMessage } from './dapLogging';
 import {
@@ -23,6 +27,7 @@ import {
   selectGroupedDisplayCwd,
 } from './processQuickPickDisplay';
 import {
+  DEBUG_SESSION_AUTH_TOKEN_KEY,
   DEBUG_SESSION_LOCK_TOKEN_KEY,
   DebugSessionLockGuard,
   DebugSessionLockTarget,
@@ -59,6 +64,7 @@ import {
 const LOCK_DIR = '/tmp/django-process-debugger';
 const LEGACY_LOCK_FILE = path.join(LOCK_DIR, 'debug-session.lock');
 const PENDING_LOCK_TTL_MS = 30_000;
+let activeHotReloadShutdown: (() => Promise<void>) | undefined;
 
 interface LockInfo {
   pid: number;
@@ -148,24 +154,12 @@ function createLockExclusive(info: LockInfo): boolean {
   }
 }
 
-function removeLock(pid?: number): void {
-  if (typeof pid === 'number') {
-    try { fs.unlinkSync(lockFileForPid(pid)); } catch { /* ignore */ }
-    const legacyLock = readLockFile(LEGACY_LOCK_FILE);
-    if (legacyLock?.pid === pid) {
-      try { fs.unlinkSync(LEGACY_LOCK_FILE); } catch { /* ignore */ }
-    }
-    return;
+function removeLock(pid: number): void {
+  try { fs.unlinkSync(lockFileForPid(pid)); } catch { /* ignore */ }
+  const legacyLock = readLockFile(LEGACY_LOCK_FILE);
+  if (legacyLock?.pid === pid) {
+    try { fs.unlinkSync(LEGACY_LOCK_FILE); } catch { /* ignore */ }
   }
-
-  try { fs.unlinkSync(LEGACY_LOCK_FILE); } catch { /* ignore */ }
-  try {
-    for (const entry of fs.readdirSync(LOCK_DIR)) {
-      if (/^debug-session\.\d+\.(?:lock|claim)$/.test(entry)) {
-        try { fs.unlinkSync(path.join(LOCK_DIR, entry)); } catch { /* ignore */ }
-      }
-    }
-  } catch { /* ignore */ }
 }
 
 function getWorkspaceId(): string {
@@ -212,6 +206,43 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
   const processFinder = new DjangoProcessFinder();
   const injector = new DebugpyInjector();
   const debugpyManager = new DebugpyManager(context);
+  const hotReloadLifecycleTokens = new Map<string, symbol>();
+  const hotReloadTokenBySession = new WeakMap<vscode.DebugSession, symbol>();
+  const hotReloadReleasesBySession = new Map<
+    string,
+    { lifecycleToken?: symbol; promise: Promise<void> }
+  >();
+  const hotReloadLeaseManager = new HotReloadLeaseManager({
+    acquireLease: (pid, leaseId, ttlMs) =>
+      injector.acquireHotReloadLease(pid, leaseId, ttlMs),
+    renewLease: (pid, leaseId, ttlMs) =>
+      injector.renewHotReloadLease(pid, leaseId, ttlMs),
+    releaseLease: (pid, leaseId) =>
+      injector.releaseHotReloadLease(pid, leaseId),
+  }, {
+    enabled: vscode.workspace
+      .getConfiguration('djangoProcessDebugger')
+      .get<boolean>('hotReload', true),
+    ttlMs: HOT_RELOAD_LEASE_TTL_MS,
+    heartbeatMs: HOT_RELOAD_LEASE_HEARTBEAT_MS,
+    onError: (error, operation, pid) => {
+      logError('[HotReload] Lease ' + operation + ' failed for PID=' + pid, error);
+      queueMicrotask(() => reconcileHotReloadState());
+    },
+    onStateChange: () => {
+      queueMicrotask(() => reconcileHotReloadState());
+    },
+  });
+
+  function ensureHotReloadLifecycleToken(session: vscode.DebugSession): symbol {
+    let token = hotReloadTokenBySession.get(session);
+    if (!token) {
+      token = Symbol(session.id);
+      hotReloadTokenBySession.set(session, token);
+    }
+    hotReloadLifecycleTokens.set(session.id, token);
+    return token;
+  }
 
   interface InMemorySessionClaim {
     sessionId: string;
@@ -538,9 +569,8 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
     new DjangoDebugSessionFactory(injector, getConfiguredDebugEngine, sessionLockGuard),
   );
 
-  // Sessions currently paused at a breakpoint (all threads stopped).
-  // The Python-side hot-reload watcher thread is frozen during this period,
-  // so reload requests are queued until the user resumes execution.
+  // Sessions currently paused at a breakpoint. Some adapters report a
+  // thread-local stop while others suspend every Python thread.
   const pausedSessions = new Set<string>();
   interface DapEvent { type?: string; event?: string; body?: { allThreadsStopped?: boolean } }
 
@@ -549,6 +579,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
     'django-process',
     {
       createDebugAdapterTracker(session: vscode.DebugSession) {
+        const hotReloadLifecycleToken = ensureHotReloadLifecycleToken(session);
         return {
           onWillStartSession() {
             log(`[DAP] Session starting`);
@@ -559,14 +590,16 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
           onDidSendMessage(message: unknown) {
             const msg = message as DapEvent;
             if (msg?.type === 'event') {
-              if (msg.event === 'stopped' && msg.body?.allThreadsStopped) {
+              if (msg.event === 'stopped') {
                 pausedSessions.add(session.id);
-                log(`[HotReload] Session ${session.id} paused (allThreadsStopped)`);
+                log('[HotReload] Session ' + session.id + ' paused');
               } else if (msg.event === 'continued') {
                 pausedSessions.delete(session.id);
                 log(`[HotReload] Session ${session.id} resumed`);
               } else if (msg.event === 'terminated' || msg.event === 'exited') {
                 pausedSessions.delete(session.id);
+                effectiveSessionEngines.delete(session.id);
+                void revokeHotReloadSession(session.id, hotReloadLifecycleToken);
               }
             }
             log(`[DAP] <- recv: ${summarizeDapMessage(message)}`);
@@ -576,6 +609,8 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
           },
           onExit(code: number | undefined, signal: string | undefined) {
             pausedSessions.delete(session.id);
+            effectiveSessionEngines.delete(session.id);
+            void revokeHotReloadSession(session.id, hotReloadLifecycleToken);
             log(`[DAP] Exit: code=${code} signal=${signal}`);
           },
         };
@@ -1163,7 +1198,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         }
       }
 
-      let debugEndpoint: TcpListeningEndpoint;
+      let debugEndpoint: DebugpyEndpoint;
       try {
         debugEndpoint = await injector.activateEndpoint(pid, port, engine);
         if (debugEndpoint.port !== port) {
@@ -1250,6 +1285,16 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         redirectOutput,
       };
       debugConfig[DEBUG_SESSION_LOCK_TOKEN_KEY] = ownerToken;
+      if (engine === 'experimental') {
+        if (!isValidExperimentalAuthToken(debugEndpoint.authToken)) {
+          vscode.window.showErrorMessage(
+            'Experimental tracer did not publish a valid DAP authentication credential. ' +
+            'Restart the target process after updating the bootstrap.'
+          );
+          return;
+        }
+        debugConfig[DEBUG_SESSION_AUTH_TOKEN_KEY] = debugEndpoint.authToken;
+      }
 
       log(
         `Debug config: type=django-process request=attach pid=${pid} engine=${engine} ` +
@@ -1401,569 +1446,536 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
     }
   );
 
-  // Command: Clean Python Language Server
+  // Command: scoped cleanup for this workspace's saved runtime
   const cleanLsCmd = vscode.commands.registerCommand(
     'djangoProcessDebugger.cleanPythonLanguageServer',
     async () => {
-      log('Command: cleanPythonLanguageServer');
+      log('Command: cleanThisWorkspace');
+      const activeSessions = hotReloadLeaseManager.getState().sessions;
+      const liveClaims = [...claimedSessionsByPid.keys()].filter(isTargetProcessAlive);
+      if (activeSessions.length > 0 || liveClaims.length > 0) {
+        await vscode.window.showWarningMessage(
+          'Stop this workspace\'s Django Process Debugger sessions before cleaning its runtime.',
+          { modal: true },
+        );
+        return;
+      }
 
-      const { execFile: execFileCb } = await import('child_process');
-      const { promisify } = await import('util');
-      const execFileAsync = promisify(execFileCb);
+      const profile = await getSetupProfile(context);
+      const staleOwnedPids = [...claimedSessionsByPid.keys()]
+        .filter((pid) => !isTargetProcessAlive(pid));
+      const scope: CleanAllScope = {
+        runtimes: profile
+          ? [{ sitePackages: profile.sitePackages, label: profile.pythonPath }]
+          : [],
+        targetPids: staleOwnedPids,
+      };
+      const preflight = await preflightCleanAll(scope);
+      if (!preflight.safe) {
+        log(`[Clean] Safety preflight blocked cleanup: ${preflight.summary}`);
+        for (const issue of preflight.issues) {
+          log(`[Clean] ${issue.code}: ${issue.target} — ${issue.message}`);
+        }
+        const choice = await vscode.window.showErrorMessage(
+          `Workspace cleanup was blocked by ${preflight.counts.issues} safety check(s).`,
+          'Show Logs',
+        );
+        if (choice === 'Show Logs') { getLogger().show(); }
+        return;
+      }
 
-      const actions: string[] = [];
-
-      // ── 1. Remove ALL shared bootstrap and tracer files ──
-      // These are the root cause of Python process poisoning.
-      // Search workspace venvs, asdf installs, and common Python locations.
-      const home = os.homedir();
-      const pyenvRoot = process.env.PYENV_ROOT ?? path.join(home, '.pyenv');
-      const searchRoots = [
-        ...(vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? []),
-        // Version managers
-        path.join(home, '.asdf', 'installs', 'python'),
-        path.join(pyenvRoot, 'versions'),
-        // Conda
-        path.join(home, 'miniconda3', 'envs'),
-        path.join(home, 'anaconda3', 'envs'),
-        path.join(home, 'miniforge3', 'envs'),
-        path.join(home, '.conda', 'envs'),
-        // Poetry / pipenv
-        path.join(home, 'Library', 'Caches', 'pypoetry', 'virtualenvs'),
-        path.join(home, '.cache', 'pypoetry', 'virtualenvs'),
-        path.join(home, '.local', 'share', 'virtualenvs'),
-        // Homebrew
-        '/usr/local/lib',
-        '/opt/homebrew/lib',
-      ];
-
-      const bootstrapFiles = [
-        'django_process_debugger.pth',
-        '_django_debug_bootstrap.py',
-        '_django_debug_tracer.py',
-      ];
-      const bootstrapFindExpression = bootstrapFiles.flatMap((fileName, index) =>
-        index === 0 ? ['-name', fileName] : ['-o', '-name', fileName]
+      const detail = [
+        profile
+          ? `Managed runtime: ${profile.pythonPath}\nsite-packages: ${profile.sitePackages}`
+          : 'No saved runtime profile is present.',
+        staleOwnedPids.length > 0
+          ? `Stale artifacts owned by this window: PID ${staleOwnedPids.join(', ')}`
+          : 'No stale PID artifacts owned by this window were found.',
+        preflight.summary,
+        '',
+        'No Python process will be stopped. Other runtimes, language-server caches, '
+          + 'Python signatures, and shared debugpy storage will not be touched.',
+      ].join('\n');
+      const confirmed = await vscode.window.showWarningMessage(
+        'Clean Django Process Debugger support for this workspace?',
+        { modal: true, detail },
+        'Clean This Workspace',
       );
+      if (confirmed !== 'Clean This Workspace') {
+        return;
+      }
 
-      for (const root of searchRoots) {
-        try {
-          await fsPromises.access(root);
-        } catch { continue; }
-
-        try {
-          const { stdout } = await execFileAsync('find', [
-            root, '-maxdepth', '8',
-            '(', ...bootstrapFindExpression, ')',
-            '-type', 'f',
-          ], { timeout: 10_000 });
-
-          for (const filePath of stdout.trim().split('\n').filter(Boolean)) {
-            try {
-              await fsPromises.unlink(filePath);
-              actions.push(`Removed bootstrap: ${filePath}`);
-              log(`[Clean] Removed: ${filePath}`);
-            } catch (err) {
-              logError(`[Clean] Failed to remove ${filePath}`, err);
-            }
-          }
-        } catch {
-          // find may fail on some dirs, that's ok
+      const result = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Cleaning this workspace\'s Django debugger support...',
+        },
+        async () => runCleanAll(scope),
+      );
+      log(`[Clean] ${result.summary}`);
+      for (const item of result.items) {
+        if (item.status === 'removed') {
+          log(`[Clean] Removed ${item.category}: ${item.path}`);
+        } else if (item.status === 'failed') {
+          log(`[Clean] Failed ${item.category}: ${item.path} — ${item.error ?? 'unknown error'}`);
         }
       }
 
-      // ── 2. Clean up /tmp/django-process-debugger/ temp files ──
-      const tmpDir = '/tmp/django-process-debugger';
-      try {
-        const stat = await fsPromises.stat(tmpDir);
-        if (stat.isDirectory()) {
-          await fsPromises.rm(tmpDir, { recursive: true, force: true });
-          actions.push(`Removed temp dir: ${tmpDir}`);
-          log(`[Clean] Removed: ${tmpDir}`);
-        }
-      } catch { /* not found */ }
-
-      // ── 3. Kill ALL Python processes (thorough clean) ──
-      // Clean All is a full reset — kill every Python process except VS Code internals.
-      try {
-        const { stdout } = await execFileAsync('ps', ['aux']);
-        const myPid = process.pid;
-        const myPpid = (await execFileAsync('ps', ['-o', 'ppid=', '-p', String(myPid)])).stdout.trim();
-
-        // Match any line with a python binary in the command
-        const pythonBinPattern = /python\d?(\.\d+)*/;
-
-        const killed: { pid: number; label: string; command: string }[] = [];
-
-        for (const line of stdout.split('\n')) {
-          const parts = line.trim().split(/\s+/);
-          if (parts.length < 11) { continue; }
-          const pid = parseInt(parts[1], 10);
-          if (isNaN(pid)) { continue; }
-
-          const command = parts.slice(10).join(' ');
-
-          // Must be a Python process
-          if (!pythonBinPattern.test(command)) { continue; }
-
-          // Never kill ourselves or our parent (VS Code extension host)
-          if (pid === myPid || String(pid) === myPpid) { continue; }
-
-          // Categorize for logging
-          let label = 'python';
-          if (/manage\.py\s+runserver|uvicorn\s|gunicorn\s|daphne\s/.test(command)) {
-            label = 'django';
-          } else if (/celery\s+.*worker|-m\s+celery\s+worker/.test(command)) {
-            label = 'celery';
-          } else if (/jedi|pylance|pyright|language.server/i.test(command)) {
-            label = 'language-server';
-          } else if (/debugpy|_django_debug_bootstrap|_django_debug_tracer|django_process_debugger_tracer/.test(command)) {
-            label = 'debug-agent';
-          }
-
-          try {
-            // SIGTERM for servers (graceful), SIGKILL for everything else
-            const signal = (label === 'django' || label === 'celery') ? 'SIGTERM' : 'SIGKILL';
-            process.kill(pid, signal);
-            killed.push({ pid, label, command });
-            log(`[Clean] ${signal} PID=${pid} [${label}]: ${command}`);
-          } catch { /* already dead */ }
-        }
-
-        if (killed.length > 0) {
-          // Group by label for summary
-          const groups = new Map<string, number[]>();
-          for (const k of killed) {
-            const arr = groups.get(k.label) ?? [];
-            arr.push(k.pid);
-            groups.set(k.label, arr);
-          }
-          for (const [label, pids] of groups) {
-            actions.push(`Killed ${pids.length} ${label} process(es): PID ${pids.join(', ')}`);
-          }
-        }
-      } catch (err) {
-        logError('[Clean] Failed to scan processes', err);
+      if (!result.ok) {
+        const choice = await vscode.window.showErrorMessage(
+          `Workspace cleanup was incomplete: ${result.summary}`,
+          'Show Logs',
+        );
+        if (choice === 'Show Logs') { getLogger().show(); }
+        return;
       }
 
-      // ── 4. Clear Jedi & parso caches ──
-      const cacheDirs = [
-        path.join(os.homedir(), '.cache', 'jedi'),
-        path.join(os.homedir(), 'Library', 'Caches', 'jedi'),
-        path.join(os.homedir(), '.cache', 'parso'),
-        path.join(os.homedir(), 'Library', 'Caches', 'parso'),
-      ];
-      for (const dir of cacheDirs) {
-        try {
-          const stat = await fsPromises.stat(dir);
-          if (stat.isDirectory()) {
-            await fsPromises.rm(dir, { recursive: true, force: true });
-            actions.push(`Removed cache: ${dir}`);
-            log(`[Clean] Removed cache: ${dir}`);
-          }
-        } catch { /* not found */ }
-      }
-
-      // ── 5. Remove bundled debugpy (will be reinstalled on next Setup) ──
-      const debugpyDir = debugpyManager.getDebugpyDir();
-      try {
-        const stat = await fsPromises.stat(debugpyDir);
-        if (stat.isDirectory()) {
-          await fsPromises.rm(debugpyDir, { recursive: true, force: true });
-          actions.push(`Removed bundled debugpy: ${debugpyDir}`);
-          log(`[Clean] Removed bundled debugpy: ${debugpyDir}`);
-        }
-      } catch { /* not found */ }
-
-      // ── 6. Remove debug session lock ──
-      removeLock();
       await clearSetupProfile(context);
-      actions.push('Cleared workspace setup profile');
-
-      // ── 7. Restore Python binaries (macOS code signature + quarantine) ──
-      // Repeated crashes can trigger macOS AppleSystemPolicy to block binaries.
-      // We need to: remove quarantine xattr, re-sign, and verify execution.
-      if (process.platform === 'darwin') {
-        const pythonBinaries = new Set<string>();
-        const home = os.homedir();
-
-        // Collect all Python binaries (resolve symlinks to get real files)
-        const collectBinaries = async (dir: string) => {
-          try {
-            const files = await fsPromises.readdir(dir);
-            for (const f of files) {
-              if (/^python3?(\.\d+)*$/.test(f)) {
-                const fullPath = path.join(dir, f);
-                // Add both symlink path and resolved real path
-                try {
-                  const realPath = await fsPromises.realpath(fullPath);
-                  pythonBinaries.add(realPath);
-                } catch { /* broken symlink */ }
-                // Also add the symlink itself if it's a different path
-                try {
-                  await fsPromises.access(fullPath);
-                  pythonBinaries.add(fullPath);
-                } catch { /* skip */ }
-              }
-            }
-          } catch { /* dir not found */ }
-        };
-
-        // Workspace venvs
-        for (const folder of vscode.workspace.workspaceFolders ?? []) {
-          for (const venvName of ['.venv', 'venv', '.virtualenv', 'env', '.env']) {
-            await collectBinaries(path.join(folder.uri.fsPath, venvName, 'bin'));
-          }
-        }
-
-        // Sibling project venvs
-        for (const folder of vscode.workspace.workspaceFolders ?? []) {
-          const parentDir = path.dirname(folder.uri.fsPath);
-          try {
-            const siblings = await fsPromises.readdir(parentDir);
-            for (const sibling of siblings) {
-              for (const venvName of ['.venv', 'venv']) {
-                await collectBinaries(path.join(parentDir, sibling, venvName, 'bin'));
-              }
-            }
-          } catch { /* skip */ }
-        }
-
-        // Version managers: asdf, pyenv, mise
-        const versionManagerDirs = [
-          path.join(home, '.asdf', 'installs', 'python'),
-          process.env.PYENV_ROOT
-            ? path.join(process.env.PYENV_ROOT, 'versions')
-            : path.join(home, '.pyenv', 'versions'),
-          path.join(home, '.local', 'share', 'mise', 'installs', 'python'),
-        ];
-        for (const baseDir of versionManagerDirs) {
-          try {
-            const versions = await fsPromises.readdir(baseDir);
-            for (const ver of versions) {
-              await collectBinaries(path.join(baseDir, ver, 'bin'));
-            }
-          } catch { /* not found */ }
-        }
-
-        // conda
-        const condaDirs = [
-          path.join(home, 'miniconda3', 'envs'),
-          path.join(home, 'anaconda3', 'envs'),
-          path.join(home, 'miniforge3', 'envs'),
-          path.join(home, '.conda', 'envs'),
-        ];
-        for (const condaDir of condaDirs) {
-          try {
-            const envs = await fsPromises.readdir(condaDir);
-            for (const env of envs) {
-              await collectBinaries(path.join(condaDir, env, 'bin'));
-            }
-          } catch { /* not found */ }
-        }
-
-        // Poetry / pipenv
-        const venvCacheDirs = [
-          path.join(home, 'Library', 'Caches', 'pypoetry', 'virtualenvs'),
-          path.join(home, '.cache', 'pypoetry', 'virtualenvs'),
-          path.join(home, '.local', 'share', 'virtualenvs'),
-        ];
-        for (const cacheDir of venvCacheDirs) {
-          try {
-            const entries = await fsPromises.readdir(cacheDir);
-            for (const entry of entries) {
-              await collectBinaries(path.join(cacheDir, entry, 'bin'));
-            }
-          } catch { /* not found */ }
-        }
-
-        // Homebrew
-        for (const brewPrefix of ['/opt/homebrew/bin', '/usr/local/bin']) {
-          await collectBinaries(brewPrefix);
-        }
-
-        // Deduplicate by resolving all to real paths
-        const uniqueBinaries = new Set<string>();
-        for (const pyBin of pythonBinaries) {
-          try {
-            const realPath = await fsPromises.realpath(pyBin);
-            uniqueBinaries.add(realPath);
-          } catch {
-            uniqueBinaries.add(pyBin);
-          }
-        }
-
-        log(`[Clean] Found ${uniqueBinaries.size} unique Python binaries to check`);
-
-        let repairCount = 0;
-        for (const pyBin of uniqueBinaries) {
-          let needsRepair = false;
-
-          // Step A: Check if binary is currently broken by trying to run it
-          try {
-            await execFileAsync(pyBin, ['-S', '-c', 'print("ok")'], { timeout: 5_000 });
-          } catch {
-            needsRepair = true;
-            log(`[Clean] Broken binary detected: ${pyBin}`);
-          }
-
-          if (!needsRepair) { continue; }
-
-          // Step B: Remove quarantine extended attribute
-          try {
-            await execFileAsync('xattr', ['-dr', 'com.apple.quarantine', pyBin], { timeout: 5_000 });
-            log(`[Clean] Removed quarantine xattr: ${pyBin}`);
-          } catch { /* no quarantine attr — fine */ }
-
-          // Step C: Clear macOS security assessment (revoke any cached deny)
-          try {
-            const binDir = path.dirname(pyBin);
-            await execFileAsync('xattr', ['-cr', binDir], { timeout: 5_000 });
-            log(`[Clean] Cleared xattrs on dir: ${binDir}`);
-          } catch { /* skip */ }
-
-          // Step D: Re-sign with ad-hoc signature
-          try {
-            await execFileAsync('codesign', [
-              '--force', '--deep', '--sign', '-', pyBin,
-            ], { timeout: 10_000 });
-            log(`[Clean] Re-signed: ${pyBin}`);
-          } catch (err) {
-            logError(`[Clean] codesign failed for ${pyBin}`, err);
-          }
-
-          // Step E: Verify it actually works now
-          try {
-            await execFileAsync(pyBin, ['-S', '-c', 'print("ok")'], { timeout: 5_000 });
-            repairCount++;
-            log(`[Clean] Verified working: ${pyBin}`);
-          } catch {
-            log(`[Clean] Still broken after repair: ${pyBin} — may need manual reinstall`);
-            actions.push(`WARNING: Could not repair ${pyBin} — consider reinstalling this Python version`);
-          }
-        }
-
-        if (repairCount > 0) {
-          actions.push(`Repaired ${repairCount} Python binary(ies) (quarantine + codesign)`);
-        }
-        log(`[Clean] Checked ${uniqueBinaries.size} binaries, repaired ${repairCount}`);
+      for (const pid of staleOwnedPids) {
+        claimedSessionsByPid.delete(pid);
       }
-
-      // ── Summary ──
-      const summary = actions.join('\n');
-      if (summary) { log(`[Clean] Done:\n${summary}`); }
-
       const choice = await vscode.window.showInformationMessage(
-        actions.length > 0
-          ? `Cleaned ${actions.length} item(s). Python environment restored. Reload window?`
-          : 'Nothing to clean. Reload window to restart language server?',
-        'Reload Window', 'Show Logs',
+        `Workspace debugger support cleaned (${result.counts.removed} managed item(s)). `
+          + 'No Python process was stopped. Restart a running Django/Celery process to unload '
+          + 'a bootstrap that was already imported.',
+        'Show Logs',
       );
-      if (choice === 'Reload Window') {
-        await vscode.commands.executeCommand('workbench.action.reloadWindow');
-      } else if (choice === 'Show Logs') {
-        getLogger().show();
-      }
+      if (choice === 'Show Logs') { getLogger().show(); }
     }
   );
 
-  // ── Hot Reload: file watcher management ──
-  let hotReloadWatcher: vscode.FileSystemWatcher | undefined;
-  let hotReloadPid: number | undefined;
-  let hotReloadSessionId: string | undefined;
-  const effectiveSessionEngines = new Map<string, DebugEngine>();
-  let hotReloadDebounceTimer: ReturnType<typeof setTimeout> | undefined;
-  let hotReloadPendingFiles: Set<string> = new Set();
-  let hotReloadGeneration = 0;
-  let hotReloadAbortController: AbortController | undefined;
-  let hotReloadFlushChain: Promise<void> = Promise.resolve();
-  const hotReloadStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
-
-  function startHotReloadWatcher(pid: number, sessionId: string): void {
-    stopHotReloadWatcher();
-    const hotReloadEnabled = vscode.workspace.getConfiguration('djangoProcessDebugger').get<boolean>('hotReload', true);
-    if (!hotReloadEnabled) {
-      log('[HotReload] Disabled by setting');
-      return;
-    }
-
-    hotReloadAbortController = new AbortController();
-    hotReloadPid = pid;
-    hotReloadSessionId = sessionId;
-
-    hotReloadWatcher = vscode.workspace.createFileSystemWatcher('**/*.py');
-    hotReloadWatcher.onDidChange((uri) => onPyFileChanged(uri));
-    hotReloadWatcher.onDidCreate((uri) => onPyFileChanged(uri));
-
-    hotReloadStatusItem.text = '$(flame) Hot Reload';
-    hotReloadStatusItem.tooltip = `Hot reload active for PID ${pid}. Changed .py files are reloaded without restarting.`;
-    hotReloadStatusItem.show();
-
-    log(`[HotReload] File watcher started for PID=${pid}`);
+  // ── Hot Reload: session/PID lease lifecycle and file coordination ──
+  interface HotReloadPidBatch {
+    pid: number;
+    leaseId: string;
+    generation: number;
+    pendingFiles: Set<string>;
+    inFlightFiles: Set<string>;
+    abortController: AbortController;
+    flushChain: Promise<void>;
   }
 
-  function stopHotReloadWatcher(): void {
-    hotReloadGeneration += 1;
-    hotReloadAbortController?.abort();
-    hotReloadAbortController = undefined;
+  let hotReloadWatcher: vscode.FileSystemWatcher | undefined;
+  let hotReloadDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+  let hotReloadBatchGeneration = 0;
+  let hotReloadLocallyDisposed = false;
+  let hotReloadShutdownPromise: Promise<void> | undefined;
+  const hotReloadBatches = new Map<number, HotReloadPidBatch>();
+  const hotReloadBacklogs = new Map<number, Set<string>>();
+  const effectiveSessionEngines = new Map<string, DebugEngine>();
+  const hotReloadStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
+
+  function activeLeaseForPid(pid: number, leaseId?: string) {
+    return hotReloadLeaseManager.getActiveLeases().find((lease) =>
+      lease.pid === pid && (leaseId === undefined || lease.leaseId === leaseId)
+    );
+  }
+
+  function abortHotReloadBatch(batch: HotReloadPidBatch): void {
+    const state = hotReloadLeaseManager.getState();
+    const shouldPreserve = (
+      !hotReloadLocallyDisposed
+      && state.enabled
+      && state.sessions.some((session) => session.pid === batch.pid)
+    );
+    if (shouldPreserve) {
+      const backlog = hotReloadBacklogs.get(batch.pid) ?? new Set<string>();
+      for (const filePath of batch.pendingFiles) {
+        backlog.add(filePath);
+      }
+      for (const filePath of batch.inFlightFiles) {
+        backlog.add(filePath);
+      }
+      hotReloadBacklogs.set(batch.pid, backlog);
+    }
+    batch.generation += 1;
+    batch.abortController.abort();
+    batch.pendingFiles.clear();
+    batch.inFlightFiles.clear();
+    if (hotReloadBatches.get(batch.pid) === batch) {
+      hotReloadBatches.delete(batch.pid);
+    }
+  }
+
+  function getOrCreateHotReloadBatch(
+    pid: number,
+    leaseId: string,
+  ): HotReloadPidBatch {
+    const existing = hotReloadBatches.get(pid);
+    if (existing?.leaseId === leaseId && !existing.abortController.signal.aborted) {
+      return existing;
+    }
+    if (existing) {
+      abortHotReloadBatch(existing);
+    }
+    const batch: HotReloadPidBatch = {
+      pid,
+      leaseId,
+      generation: ++hotReloadBatchGeneration,
+      pendingFiles: new Set<string>(),
+      inFlightFiles: new Set<string>(),
+      abortController: new AbortController(),
+      flushChain: Promise.resolve(),
+    };
+    hotReloadBatches.set(pid, batch);
+    return batch;
+  }
+
+  function addHotReloadBacklog(pid: number, filePath: string): void {
+    const backlog = hotReloadBacklogs.get(pid) ?? new Set<string>();
+    backlog.add(filePath);
+    hotReloadBacklogs.set(pid, backlog);
+  }
+
+  function flushAvailableHotReloadBacklogs(): void {
+    for (const lease of hotReloadLeaseManager.getActiveLeases()) {
+      const backlog = hotReloadBacklogs.get(lease.pid);
+      if (!backlog || backlog.size === 0) {
+        continue;
+      }
+      const batch = getOrCreateHotReloadBatch(lease.pid, lease.leaseId);
+      for (const filePath of backlog) {
+        batch.pendingFiles.add(filePath);
+      }
+      hotReloadBacklogs.delete(lease.pid);
+      scheduleHotReloadFlush(batch);
+    }
+  }
+
+  function updateHotReloadStatus(): void {
+    if (hotReloadLocallyDisposed || !hotReloadWatcher) {
+      hotReloadStatusItem.hide();
+      return;
+    }
+    const state = hotReloadLeaseManager.getState();
+    const desiredPids = [...new Set(state.sessions.map((session) => session.pid))].sort(
+      (left, right) => left - right
+    );
+    const activePids = hotReloadLeaseManager.getActiveLeases().map((lease) => lease.pid);
+    if (activePids.length === desiredPids.length && desiredPids.length > 0) {
+      hotReloadStatusItem.text = desiredPids.length === 1
+        ? '$(flame) Hot Reload'
+        : '$(flame) Hot Reload (' + desiredPids.length + ' targets)';
+      hotReloadStatusItem.tooltip = 'Hot reload active for PID'
+        + (desiredPids.length === 1 ? ' ' : 's ')
+        + desiredPids.join(', ')
+        + '. Django autoreload is suppressed only while these session leases are live.';
+    } else {
+      hotReloadStatusItem.text = '$(clock) Hot Reload — connecting';
+      hotReloadStatusItem.tooltip = 'Active leases: ' + activePids.length
+        + '/' + desiredPids.length + '. Debugging remains available while hot reload reconnects.';
+    }
+    hotReloadStatusItem.show();
+  }
+
+  function disposeWorkspaceHotReloadWatcher(): void {
     if (hotReloadDebounceTimer) {
       clearTimeout(hotReloadDebounceTimer);
       hotReloadDebounceTimer = undefined;
     }
-    hotReloadPendingFiles.clear();
+    for (const batch of [...hotReloadBatches.values()]) {
+      abortHotReloadBatch(batch);
+    }
+    hotReloadBacklogs.clear();
     if (hotReloadWatcher) {
       hotReloadWatcher.dispose();
       hotReloadWatcher = undefined;
+      log('[HotReload] Workspace watcher stopped');
     }
-    hotReloadPid = undefined;
-    hotReloadSessionId = undefined;
     hotReloadStatusItem.hide();
-    log('[HotReload] File watcher stopped');
+  }
+
+  function reconcileHotReloadState(): void {
+    if (hotReloadLocallyDisposed) {
+      return;
+    }
+    const state = hotReloadLeaseManager.getState();
+    const shouldWatch = state.enabled && state.sessions.length > 0;
+    if (shouldWatch && !hotReloadWatcher) {
+      hotReloadWatcher = vscode.workspace.createFileSystemWatcher('**/*.py');
+      hotReloadWatcher.onDidChange(onPyFileChanged);
+      hotReloadWatcher.onDidCreate(onPyFileChanged);
+      log('[HotReload] Workspace watcher started');
+    } else if (!shouldWatch) {
+      disposeWorkspaceHotReloadWatcher();
+      return;
+    }
+
+    const desiredPids = new Set(state.sessions.map((session) => session.pid));
+    for (const pid of hotReloadBacklogs.keys()) {
+      if (!desiredPids.has(pid)) {
+        hotReloadBacklogs.delete(pid);
+      }
+    }
+    const activeByPid = new Map(
+      hotReloadLeaseManager.getActiveLeases().map((lease) => [lease.pid, lease.leaseId])
+    );
+    for (const batch of [...hotReloadBatches.values()]) {
+      if (activeByPid.get(batch.pid) !== batch.leaseId) {
+        abortHotReloadBatch(batch);
+      }
+    }
+    if (!hotReloadDebounceTimer) {
+      flushAvailableHotReloadBacklogs();
+    }
+    updateHotReloadStatus();
   }
 
   function onPyFileChanged(uri: vscode.Uri): void {
-    if (!hotReloadPid) { return; }
+    reconcileHotReloadState();
     const filePath = uri.fsPath;
-
     if (shouldIgnoreForHotReload(filePath)) {
       return;
     }
 
-    hotReloadPendingFiles.add(filePath);
+    const state = hotReloadLeaseManager.getState();
+    if (!state.enabled) {
+      return;
+    }
+    const desiredPids = new Set(state.sessions.map((session) => session.pid));
+    if (desiredPids.size === 0) {
+      return;
+    }
+    for (const pid of desiredPids) {
+      addHotReloadBacklog(pid, filePath);
+    }
 
-    // Debounce: batch changes within 500ms window
+    const activeLeases = hotReloadLeaseManager.getActiveLeases();
+    const desiredPidCount = desiredPids.size;
+    if (activeLeases.length < desiredPidCount) {
+      void hotReloadLeaseManager.reconcile().then(
+        () => reconcileHotReloadState(),
+        (error) => logError('[HotReload] Lease retry failed', error),
+      );
+    }
     if (hotReloadDebounceTimer) {
       clearTimeout(hotReloadDebounceTimer);
     }
     hotReloadDebounceTimer = setTimeout(() => {
       hotReloadDebounceTimer = undefined;
-      scheduleHotReloadFlush();
+      flushAvailableHotReloadBacklogs();
     }, 500);
   }
 
-  function scheduleHotReloadFlush(): void {
-    const generation = hotReloadGeneration;
-    hotReloadFlushChain = hotReloadFlushChain
+  function scheduleHotReloadFlush(batch: HotReloadPidBatch): void {
+    const generation = batch.generation;
+    batch.flushChain = batch.flushChain
       .catch((error) => {
-        logError('[HotReload] Previous reload batch failed', error);
+        logError('[HotReload] Previous reload batch failed for PID=' + batch.pid, error);
       })
-      .then(() => drainHotReload(generation));
+      .then(() => drainHotReload(batch.pid, generation));
   }
 
-  async function drainHotReload(generation: number): Promise<void> {
+  function isCurrentHotReloadBatch(
+    batch: HotReloadPidBatch,
+    generation: number,
+  ): boolean {
+    return (
+      hotReloadBatches.get(batch.pid) === batch
+      && batch.generation === generation
+      && !batch.abortController.signal.aborted
+      && activeLeaseForPid(batch.pid, batch.leaseId) !== undefined
+    );
+  }
+
+  async function drainHotReload(pid: number, generation: number): Promise<void> {
+    const batch = hotReloadBatches.get(pid);
     if (
-      generation === hotReloadGeneration
-      && hotReloadPid !== undefined
-      && hotReloadSessionId !== undefined
-      && hotReloadAbortController !== undefined
-      && hotReloadPendingFiles.size > 0
+      !batch
+      || !isCurrentHotReloadBatch(batch, generation)
+      || batch.pendingFiles.size === 0
     ) {
-      const pid = hotReloadPid;
-      const sessionId = hotReloadSessionId;
-      const abortController = hotReloadAbortController;
-      const files = [...hotReloadPendingFiles];
-      hotReloadPendingFiles.clear();
+      return;
+    }
 
-      log(`[HotReload] Requesting reload for ${files.length} file(s): ${files.join(', ')}`);
-      hotReloadStatusItem.text = '$(sync~spin) Reloading...';
+    const files = [...batch.pendingFiles];
+    batch.pendingFiles.clear();
+    for (const filePath of files) {
+      batch.inFlightFiles.add(filePath);
+    }
+    const signal = batch.abortController.signal;
+    log('[HotReload] Requesting reload for PID=' + pid + ': ' + files.join(', '));
+    hotReloadStatusItem.text = '$(sync~spin) Reloading PID ' + pid + '...';
 
-      try {
-        const requestId = await injector.requestHotReload(pid, files);
-        if (requestId === null || abortController.signal.aborted) { return; }
+    try {
+      const requestId = await injector.requestHotReload(pid, files, batch.leaseId);
+      if (requestId === null || !isCurrentHotReloadBatch(batch, generation)) {
+        return;
+      }
 
-        // The request id prevents an old/crashed watcher result from being
-        // consumed by a later batch. Only one batch per session is in flight.
-        let results = await injector.pollReloadResult(
+      let results = await injector.pollReloadResult(
+        pid,
+        3_000,
+        20,
+        requestId,
+        signal,
+        batch.leaseId,
+      );
+
+      let pending = false;
+      if (results === null && isCurrentHotReloadBatch(batch, generation)) {
+        pending = await injector.isReloadPending(pid, requestId, batch.leaseId);
+        if (!pending) {
+          results = await injector.readReloadResult(pid, requestId, batch.leaseId);
+        }
+      }
+      if (
+        results === null
+        && pending
+        && isCurrentHotReloadBatch(batch, generation)
+      ) {
+        const lease = activeLeaseForPid(pid, batch.leaseId);
+        const atBreakpoint = lease?.ownerSessionIds.some((sessionId) =>
+          pausedSessions.has(sessionId)
+        ) ?? false;
+        hotReloadStatusItem.text = atBreakpoint
+          ? '$(clock) Reload queued — continue to apply'
+          : '$(clock) Reload queued for PID ' + pid + '...';
+        hotReloadStatusItem.tooltip = atBreakpoint
+          ? 'Hot reload is waiting because the target is paused at a breakpoint.'
+          : undefined;
+        log('[HotReload] Extending pending request=' + requestId
+          + ' for PID=' + pid + ', paused=' + atBreakpoint);
+        results = await injector.pollReloadResult(
           pid,
-          3_000,
+          60_000,
           20,
           requestId,
-          abortController.signal,
+          signal,
+          batch.leaseId,
         );
+      }
 
-        let pending = false;
-        if (results === null && !abortController.signal.aborted) {
-          pending = await injector.isReloadPending(pid, requestId);
-          if (!pending) {
-            // The watcher publishes the result before clearing .processing.
-            // Re-read across that transition so a result created between the
-            // short poll and pending check cannot be missed.
-            results = await injector.readReloadResult(pid, requestId);
-          }
-        }
-        if (results === null && !abortController.signal.aborted && pending) {
-          const atBreakpoint = pausedSessions.has(sessionId);
-          if (generation === hotReloadGeneration) {
-            hotReloadStatusItem.text = atBreakpoint
-              ? '$(clock) Reload queued — continue to apply'
-              : '$(clock) Reload queued...';
-            hotReloadStatusItem.tooltip = atBreakpoint
-              ? `Hot reload is waiting because the process is paused at a breakpoint. ` +
-                `The Python watcher thread cannot run until you continue.`
-              : undefined;
-          }
-          log(
-            `[HotReload] Result not ready after 3s — request=${requestId}, `
-            + `pending=true, paused=${atBreakpoint}. Extending timeout.`,
-          );
-          results = await injector.pollReloadResult(
-            pid,
-            60_000,
-            20,
-            requestId,
-            abortController.signal,
+      if (!isCurrentHotReloadBatch(batch, generation)) {
+        return;
+      }
+      if (results !== null) {
+        const ok = results.filter((result) => result.startsWith('OK:'));
+        const errors = results.filter((result) => result.startsWith('ERR:'));
+        const skipped = results.filter((result) => result.startsWith('SKIP:'));
+        if (ok.length > 0) {
+          const modules = ok.map((result) => result.replace('OK:', ''));
+          void vscode.window.showInformationMessage(
+            '$(flame) Hot reloaded PID ' + pid + ': ' + modules.join(', ')
           );
         }
-
-        if (abortController.signal.aborted || generation !== hotReloadGeneration) {
-          return;
-        }
-        if (results !== null) {
-          const ok = results.filter((r) => r.startsWith('OK:'));
-          const err = results.filter((r) => r.startsWith('ERR:'));
-          const skip = results.filter((r) => r.startsWith('SKIP:'));
-
-          if (ok.length > 0) {
-            const moduleNames = ok.map((r) => r.replace('OK:', ''));
-            vscode.window.showInformationMessage(
-              `$(flame) Hot reloaded: ${moduleNames.join(', ')}`
-            );
-          }
-          if (err.length > 0) {
-            const details = err.map((r) => r.replace('ERR:', ''));
-            vscode.window.showWarningMessage(
-              `$(warning) Reload failed: ${details.join('; ')}`
-            );
-          }
-          if (skip.length > 0 && ok.length === 0 && err.length === 0) {
-            log(`[HotReload] All files skipped (not loaded as modules): ${skip.join(', ')}`);
-          }
-          log(
-            `[HotReload] Results for ${requestId}: `
-            + `${ok.length} OK, ${err.length} ERR, ${skip.length} SKIP`,
+        if (errors.length > 0) {
+          const details = errors.map((result) => result.replace('ERR:', ''));
+          void vscode.window.showWarningMessage(
+            '$(warning) Reload failed for PID ' + pid + ': ' + details.join('; ')
           );
-        } else {
-          log(`[HotReload] No result for ${requestId} after extended wait`);
         }
-      } catch (err) {
-        if (!abortController.signal.aborted) {
-          logError('[HotReload] Failed to request reload', err);
+        if (skipped.length > 0 && ok.length === 0 && errors.length === 0) {
+          log('[HotReload] All files skipped for PID=' + pid + ': ' + skipped.join(', '));
         }
-      } finally {
-        if (generation === hotReloadGeneration) {
-          hotReloadStatusItem.text = '$(flame) Hot Reload';
-          hotReloadStatusItem.tooltip = `Hot reload active for PID ${pid}. ` +
-            `Changed .py files are reloaded without restarting.`;
-        }
+        log('[HotReload] Results for ' + requestId + ': '
+          + ok.length + ' OK, ' + errors.length + ' ERR, '
+          + skipped.length + ' SKIP');
+      } else {
+        log('[HotReload] No result for ' + requestId + ' after extended wait');
+      }
+    } catch (error) {
+      if (!signal.aborted) {
+        logError('[HotReload] Failed to reload PID=' + pid, error);
+      }
+    } finally {
+      batch.inFlightFiles.clear();
+      if (isCurrentHotReloadBatch(batch, generation)) {
+        updateHotReloadStatus();
       }
     }
   }
+
+  async function registerHotReloadSession(
+    sessionId: string,
+    pid: number,
+    lifecycleToken: symbol,
+  ): Promise<void> {
+    try {
+      await hotReloadLeaseManager.registerSession(sessionId, pid);
+      // A terminate/restart racing this await already invalidates ownership in
+      // the manager. Never unregister by session ID here: a newer generation
+      // may have claimed that ID while this acquire was completing.
+      if (hotReloadLifecycleTokens.get(sessionId) !== lifecycleToken) { return; }
+    } catch (error) {
+      logError('[HotReload] Could not acquire lease for PID=' + pid, error);
+      if (hotReloadLifecycleTokens.get(sessionId) === lifecycleToken) {
+        void vscode.window.showWarningMessage(
+          'Hot reload could not start for PID ' + pid
+          + '. The debug session remains active; see logs for details.'
+        );
+      }
+    } finally {
+      reconcileHotReloadState();
+    }
+  }
+
+  function revokeHotReloadSession(
+    sessionId: string,
+    expectedLifecycleToken?: symbol,
+  ): Promise<void> {
+    const currentToken = hotReloadLifecycleTokens.get(sessionId);
+    const inFlight = hotReloadReleasesBySession.get(sessionId);
+    if (
+      expectedLifecycleToken !== undefined
+      && currentToken !== expectedLifecycleToken
+    ) {
+      return inFlight?.lifecycleToken === expectedLifecycleToken
+        ? inFlight.promise
+        : Promise.resolve();
+    }
+    if (currentToken === undefined) {
+      return inFlight?.promise ?? Promise.resolve();
+    }
+
+    hotReloadLifecycleTokens.delete(sessionId);
+    const release = hotReloadLeaseManager.unregisterSession(sessionId);
+    const record = {
+      lifecycleToken: currentToken,
+      promise: release,
+    };
+    hotReloadReleasesBySession.set(sessionId, record);
+    reconcileHotReloadState();
+    void release.then(
+      () => reconcileHotReloadState(),
+      (error) => logError('[HotReload] Session lease release failed', error),
+    ).finally(() => {
+      if (hotReloadReleasesBySession.get(sessionId) === record) {
+        hotReloadReleasesBySession.delete(sessionId);
+      }
+    });
+    return release;
+  }
+
+  function shutdownHotReloadLifecycle(): Promise<void> {
+    hotReloadShutdownPromise ??= (async () => {
+      hotReloadLocallyDisposed = true;
+      hotReloadLifecycleTokens.clear();
+      disposeWorkspaceHotReloadWatcher();
+      const inFlightReleases = [...hotReloadReleasesBySession.values()]
+        .map((record) => record.promise);
+      await Promise.allSettled([
+        hotReloadLeaseManager.dispose(),
+        ...inFlightReleases,
+      ]);
+      hotReloadReleasesBySession.clear();
+    })();
+    return hotReloadShutdownPromise;
+  }
+
+  activeHotReloadShutdown = shutdownHotReloadLifecycle;
+  context.subscriptions.push({
+    dispose: () => { void shutdownHotReloadLifecycle(); },
+  });
 
   // Debug session lifecycle logging
   context.subscriptions.push(
     vscode.debug.onDidStartDebugSession(async (session) => {
       const engine = session.type === 'django-process' ? targetEngineFromSession(session) : undefined;
       const sessionPid = session.type === 'django-process' ? targetPidFromSession(session) : undefined;
+      const hotReloadLifecycleToken = session.type === 'django-process'
+        ? ensureHotReloadLifecycleToken(session)
+        : undefined;
       if (engine) {
         effectiveSessionEngines.set(session.id, engine);
       }
@@ -1989,6 +2001,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         // startup path can never overwrite a live session's lock.
         const claim = await sessionLockGuard.claim(session, lockTarget);
         if (!claim.allowed) {
+          void revokeHotReloadSession(session.id, hotReloadLifecycleToken);
           effectiveSessionEngines.delete(session.id);
           log(`[DebugSession] Stopping unclaimed session ${session.id}: ${claim.message}`);
           void vscode.window.showErrorMessage(claim.message);
@@ -2005,6 +2018,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
           lockInfoForTarget(session, lockTarget, 'active'),
         );
         if (!promoted) {
+          void revokeHotReloadSession(session.id, hotReloadLifecycleToken);
           effectiveSessionEngines.delete(session.id);
           const currentClaim = claimedSessionsByPid.get(sessionPid);
           if (currentClaim?.sessionId === session.id
@@ -2020,10 +2034,18 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         }
         log(`[DebugSession] Lock file active for PID=${sessionPid} (engine=${engine})`);
 
-        if (supportsHotReload(engine)) {
-          startHotReloadWatcher(sessionPid, session.id);
+        if (
+          supportsHotReload(engine)
+          && hotReloadLifecycleToken
+          && hotReloadLifecycleTokens.get(session.id) === hotReloadLifecycleToken
+        ) {
+          await registerHotReloadSession(
+            session.id,
+            sessionPid,
+            hotReloadLifecycleToken,
+          );
         } else {
-          log(`[HotReload] Disabled for ${engine}`);
+          void revokeHotReloadSession(session.id, hotReloadLifecycleToken);
         }
       }
       log(
@@ -2035,6 +2057,11 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
     vscode.debug.onDidTerminateDebugSession(async (session) => {
       log(`[DebugSession] Terminated: ${session.name}`);
       if (session.type === 'django-process') {
+        // Revoke the capability and abort local polls before waiting on lock I/O.
+        const hotReloadRelease = revokeHotReloadSession(
+          session.id,
+          hotReloadTokenBySession.get(session),
+        );
         const sessionPid = targetPidFromSession(session);
         const engine = effectiveSessionEngines.get(session.id) ?? targetEngineFromSession(session);
         effectiveSessionEngines.delete(session.id);
@@ -2062,17 +2089,29 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
             claimedSessionsByPid.delete(sessionPid);
           }
         }
-        const hotReloadStopped = sessionPid !== undefined
-          && hotReloadPid === sessionPid
-          && hotReloadSessionId === session.id;
-        if (hotReloadStopped) {
-          stopHotReloadWatcher();
-        }
+        await hotReloadRelease;
         log(
           `[DebugSession] ${lockRemoved ? `Lock file removed for PID=${sessionPid}` : 'No PID lock to remove'} ` +
-          `(engine=${engine})${hotReloadStopped ? ', hot reload stopped' : ''}`
+          '(engine=' + engine + '), hot reload lease released'
         );
       }
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!event.affectsConfiguration('djangoProcessDebugger.hotReload')) {
+        return;
+      }
+      const enabled = vscode.workspace
+        .getConfiguration('djangoProcessDebugger')
+        .get<boolean>('hotReload', true);
+      const update = hotReloadLeaseManager.setEnabled(enabled);
+      reconcileHotReloadState();
+      void update.then(
+        () => reconcileHotReloadState(),
+        (error) => logError('[HotReload] Setting reconciliation failed', error),
+      );
     }),
   );
 
@@ -2097,4 +2136,8 @@ function findFreePort(): Promise<number> {
   });
 }
 
-export function deactivate() {}
+export async function deactivate(): Promise<void> {
+  const shutdown = activeHotReloadShutdown;
+  activeHotReloadShutdown = undefined;
+  await shutdown?.();
+}

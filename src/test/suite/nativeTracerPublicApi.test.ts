@@ -34,13 +34,14 @@ sys.path.insert(0, sys.argv[1])
 import django_process_debugger_tracer as tracer_module
 import _django_debug_tracer as legacy_module
 
+AUTH_TOKEN = "0123456789abcdef" * 4
 assert legacy_module is tracer_module
-assert tracer_module.TRACER_API_VERSION == 1
+assert tracer_module.TRACER_API_VERSION == 2
 assert tracer_module.TRACER_VERSION == sys.argv[2]
 assert tracer_module.EXEMPT_THREAD_ATTRIBUTE == "django_debugger_do_not_trace"
 
 initial = tracer_module.status()
-assert initial["apiVersion"] == 1
+assert initial["apiVersion"] == 2
 assert initial["version"] == sys.argv[2]
 assert initial["pid"] > 0
 assert initial["active"] is False
@@ -60,7 +61,18 @@ setattr(thread, "pydev_do_not_trace", True)
 assert probe._trace(frame, "call", None) is None
 delattr(thread, "pydev_do_not_trace")
 
-endpoint = tracer_module.start("127.0.0.1", 0)
+endpoint = tracer_module.start("127.0.0.1", 0, auth_token=AUTH_TOKEN)
+assert tracer_module.start(
+    "127.0.0.1",
+    endpoint[1] + 1,
+    auth_token=AUTH_TOKEN,
+) == endpoint
+try:
+    tracer_module.start("127.0.0.1", 0, auth_token="f" * 64)
+except RuntimeError as error:
+    assert AUTH_TOKEN not in str(error)
+else:
+    raise AssertionError("active tracer accepted different credentials")
 active = tracer_module.status()
 assert active["active"] is True
 assert tuple(active["endpoint"]) == endpoint
@@ -89,7 +101,7 @@ print(json.dumps(active))
       { env: cleanPythonEnv(), timeout: 15_000 },
     );
     const status = JSON.parse(stdout.trim()) as Record<string, unknown>;
-    assert.strictEqual(status.apiVersion, 1);
+    assert.strictEqual(status.apiVersion, 2);
     assert.strictEqual(status.version, BOOTSTRAP_VERSION);
     assert.strictEqual(status.active, true);
   });
@@ -111,7 +123,7 @@ spec.loader.exec_module(legacy)
 import django_process_debugger_tracer as canonical
 assert canonical is legacy
 assert sys.modules["_django_debug_tracer"] is sys.modules["django_process_debugger_tracer"]
-assert canonical.TRACER_API_VERSION == 1
+assert canonical.TRACER_API_VERSION == 2
 `;
     await execFileAsync(
       python,
