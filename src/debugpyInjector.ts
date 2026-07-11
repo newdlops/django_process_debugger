@@ -22,7 +22,7 @@ const TRACER_SOURCE_PATH = path.resolve(
   'python',
   'django_process_debugger_tracer.py',
 );
-export const BOOTSTRAP_VERSION = '2026.07.10.9';
+export const BOOTSTRAP_VERSION = '2026.07.10.10';
 export type DebugpyEndpoint = TcpListeningEndpoint;
 type BootstrapRuntimeState = {
   pid: number;
@@ -195,6 +195,12 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '        # invocation arrives as argv == ["-m", "worker", ...].',
     '        if _argv0 == "-m" and "worker" in _parts:',
     '            return True',
+    '        # Interactive Django shells are long-lived attach targets too. Match',
+    '        # the manage.py command tokens rather than a broad substring so a',
+    '        # similarly named management command is not opted in accidentally.',
+    '        for _index, _part in enumerate(_parts[:-1]):',
+    '            if _os.path.basename(_part) == "manage.py" and _parts[_index + 1] in ("shell", "shell_plus"):',
+    '                return True',
     '        # Other long-running servers (script form, or "<name> " in cmd).',
     '        _server_patterns = (',
     '            "manage.py runserver",',

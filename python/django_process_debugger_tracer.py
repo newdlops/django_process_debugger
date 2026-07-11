@@ -26,6 +26,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 
+TRACER_API_VERSION = 1
+TRACER_VERSION = "2026.07.10.10"
+EXEMPT_THREAD_ATTRIBUTE = "django_debugger_do_not_trace"
+
+_CANONICAL_MODULE_NAME = "django_process_debugger_tracer"
+_LEGACY_MODULE_NAME = "_django_debug_tracer"
 _THIS_FILE = os.path.normcase(os.path.realpath(__file__))
 _MAX_DAP_MESSAGE_BYTES = 8 * 1024 * 1024
 _MAX_DAP_HEADER_BYTES = 64 * 1024
@@ -351,6 +357,19 @@ def _existing_thread_trace_hook():
     # CPython 3.8-3.9 has no public getter, but threading.settrace stores the
     # future-thread hook here. Reading it is safer than silently replacing it.
     return getattr(threading, "_trace_hook", None)
+
+
+def _thread_is_exempt(thread: Optional[threading.Thread] = None) -> bool:
+    """Return whether a host marked one service thread as debugger-internal."""
+    try:
+        current = thread if thread is not None else threading.current_thread()
+        return bool(
+            getattr(current, EXEMPT_THREAD_ATTRIBUTE, False)
+            or getattr(current, "pydev_do_not_trace", False)
+        )
+    except BaseException:
+        # A debugger integration hint must never make application code fail.
+        return False
 
 
 def _executable_lines(filename: str) -> Set[int]:
@@ -969,6 +988,7 @@ class NativeDapTracer:
             self.owner_pid != os.getpid()
             or not self.enabled
             or sys.is_finalizing()
+            or _thread_is_exempt()
         ):
             return
         if native_id in (self.control_ident, self.log_output_ident):
@@ -1116,6 +1136,7 @@ class NativeDapTracer:
             self.owner_pid != os.getpid()
             or not self.enabled
             or sys.is_finalizing()
+            or _thread_is_exempt()
             or native_id in (self.control_ident, self.log_output_ident)
         ):
             return
@@ -1227,6 +1248,8 @@ class NativeDapTracer:
             return None
         native_id = threading.get_ident()
         if native_id in (self.control_ident, self.log_output_ident):
+            return None
+        if _thread_is_exempt():
             return None
         if not self.configured:
             # Remove local line tracing while detached. The process-wide call
@@ -4703,6 +4726,84 @@ def start(host: str = "127.0.0.1", port: int = 0) -> Tuple[str, int]:
             raise
 
 
+def status() -> Dict[str, Any]:
+    """Return a bounded, JSON-friendly snapshot of the process-wide tracer."""
+    with _ACTIVE_LOCK:
+        tracer = _ACTIVE_TRACER
+        active = bool(
+            tracer is not None
+            and tracer.enabled
+            and tracer.owner_pid == os.getpid()
+            and tracer.endpoint is not None
+        )
+        endpoint = tracer.endpoint if active and tracer is not None else None
+        return {
+            "apiVersion": TRACER_API_VERSION,
+            "version": TRACER_VERSION,
+            "pid": os.getpid(),
+            "active": active,
+            "endpoint": tuple(endpoint) if endpoint is not None else None,
+            "clientAttached": bool(active and tracer is not None and tracer.client),
+        }
+
+
+def _is_tracer_trace_hook(value: Any, tracer: NativeDapTracer) -> bool:
+    return (
+        getattr(value, "__self__", None) is tracer
+        and getattr(value, "__func__", None) is NativeDapTracer.trace
+    )
+
+
+def trace_this_thread(enabled: bool) -> None:
+    """Enable or disable the active native tracer on the calling thread only.
+
+    Hosts can create service threads with ``EXEMPT_THREAD_ATTRIBUTE`` set to a
+    true value, then opt only a user-code execution thread back in. The legacy
+    ``pydev_do_not_trace`` marker remains authoritative and is never cleared by
+    this API; a host sharing that marker must clear it explicitly before opting
+    the thread in.
+    """
+    if type(enabled) is not bool:
+        raise TypeError("enabled must be a bool")
+
+    with _ACTIVE_LOCK:
+        tracer = _ACTIVE_TRACER
+        if (
+            tracer is None
+            or not tracer.enabled
+            or tracer.owner_pid != os.getpid()
+        ):
+            if enabled:
+                raise RuntimeError("Experimental tracer is not active")
+            return
+
+    current_hook = sys.gettrace()
+    owns_hook = _is_tracer_trace_hook(current_hook, tracer)
+    if enabled and current_hook is not None and not owns_hook:
+        raise RuntimeError("Current thread already has a different trace hook")
+
+    thread = threading.current_thread()
+    try:
+        setattr(thread, EXEMPT_THREAD_ATTRIBUTE, not enabled)
+    except BaseException:
+        pass
+
+    frame = sys._getframe(1)
+    if enabled:
+        sys.settrace(tracer.trace)
+        while frame is not None:
+            frame.f_trace = tracer.trace
+            frame = frame.f_back
+        return
+
+    if owns_hook:
+        sys.settrace(None)
+    while frame is not None:
+        if _is_tracer_trace_hook(frame.f_trace, tracer):
+            frame.f_trace = None
+        frame = frame.f_back
+
+
 def _reset_after_fork_child() -> None:
     """Reset module ownership in a freshly-forked child process."""
     global _ACTIVE_TRACER, _ACTIVE_LOCK
@@ -4728,3 +4829,20 @@ def _reset_after_fork_child() -> None:
 _register_at_fork = getattr(os, "register_at_fork", None)
 if _register_at_fork is not None:
     _register_at_fork(after_in_child=_reset_after_fork_child)
+
+
+# The production bootstrap historically imports ``_django_debug_tracer`` while
+# the canonical reusable artifact is ``django_process_debugger_tracer``. Publish
+# both names only after initialization so whichever name loads first owns the
+# single process-wide _ACTIVE_TRACER and the second import cannot create another.
+_this_module = sys.modules.get(__name__)
+if _this_module is not None:
+    _existing_alias = None
+    for _module_name in (_CANONICAL_MODULE_NAME, _LEGACY_MODULE_NAME):
+        _candidate = sys.modules.get(_module_name)
+        if _candidate is not None and _candidate is not _this_module:
+            _existing_alias = _candidate
+            break
+    _shared_module = _existing_alias or _this_module
+    sys.modules[_CANONICAL_MODULE_NAME] = _shared_module
+    sys.modules[_LEGACY_MODULE_NAME] = _shared_module

@@ -37,6 +37,12 @@ import {
   supportsHotReload,
 } from './debugEngine';
 import {
+  DJANGO_PROCESS_DEBUGGER_PUBLIC_API,
+  SETUP_COMMAND_ID,
+  STATUS_COMMAND_ID,
+  type DjangoProcessDebuggerPublicApiV1,
+} from './publicApi';
+import {
   RuntimeCandidate,
   SetupProfile,
   buildSavedProfileCandidate,
@@ -200,7 +206,7 @@ function targetEngineFromSession(session: vscode.DebugSession): DebugEngine {
   return normalizeDebugEngine(session.configuration.engine ?? getConfiguredDebugEngine());
 }
 
-export function activate(context: vscode.ExtensionContext) {
+export function activate(context: vscode.ExtensionContext): DjangoProcessDebuggerPublicApiV1 {
   log('Extension activating...');
 
   const processFinder = new DjangoProcessFinder();
@@ -854,7 +860,7 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     if (selected.action === 'setup') {
-      await vscode.commands.executeCommand('djangoProcessDebugger.setup');
+      await vscode.commands.executeCommand(SETUP_COMMAND_ID);
     } else if (selected.action === 'reinstall') {
       await vscode.commands.executeCommand('djangoProcessDebugger.reinstallDebugpy');
     } else if (selected.action === 'logs') {
@@ -864,7 +870,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Command: Setup
   const setupCmd = vscode.commands.registerCommand(
-    'djangoProcessDebugger.setup',
+    SETUP_COMMAND_ID,
     async () => {
       log('Command: setup');
       const profile = await installSetupForRuntime('manual-setup');
@@ -880,7 +886,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Command: Show setup status
   const statusCmd = vscode.commands.registerCommand(
-    'djangoProcessDebugger.showSetupStatus',
+    STATUS_COMMAND_ID,
     async () => {
       log('Command: showSetupStatus');
       await showSetupStatus();
@@ -1147,7 +1153,7 @@ export function activate(context: vscode.ExtensionContext) {
             'Show Logs',
           );
           if (choice === 'Run Setup') {
-            await vscode.commands.executeCommand('djangoProcessDebugger.setup');
+            await vscode.commands.executeCommand(SETUP_COMMAND_ID);
           } else if (choice === 'Show Status') {
             await showSetupStatus();
           } else if (choice === 'Show Logs') {
@@ -2072,6 +2078,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(factory, tracker, attachCmd, setupCmd, statusCmd, killCmd, reinstallCmd, cleanLsCmd, hotReloadStatusItem, getLogger());
   log('Extension activated');
+  return DJANGO_PROCESS_DEBUGGER_PUBLIC_API;
 }
 
 function findFreePort(): Promise<number> {

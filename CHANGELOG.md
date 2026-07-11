@@ -16,6 +16,8 @@
 - Added Raised and Uncaught exception breakpoints plus DAP `exceptionInfo` details to the experimental tracer. Raised exceptions stop once at their first raise site, while uncaught process/thread exits provide post-mortem inspection, Evaluate, and Continue with hook-free, bounded `args` previews, chained exceptions, and Python 3.11+ exception-group children.
 - Added a `Django Request Exceptions` filter that stops with `userUnhandled` at Django's `got_request_exception` HTTP 500 boundary and exposes a Django request scope without automatically evaluating bodies, headers, or cookies. Selecting it with Raised exceptions provides raise-site and framework-boundary stops; Django-request post-mortem frames support inspection, Evaluate, and Continue but reject stepping and Set Variable, while asyncio-task and non-Django exception coverage remains unchanged.
 - Added hot reload support to the experimental tracer using the same bootstrap watcher as debugpy, with the internal reload thread excluded from native tracing.
+- Added a declarative extension API v1 for sibling extensions. Consumers start the public `django-process` debug type and retain PID locking, engine ownership, bootstrap validation, and hot reload instead of invoking internal activation helpers.
+- Added `manage.py shell` and `shell_plus` to the bootstrap target gate so the debugger can attach directly to live interactive Django shell processes.
 
 ### Fixed
 - Attach process picker now shows attachable Django server targets grouped by listener host and port, so parent/child/wrapper processes collapse only when they resolve to the same `host:port`.
@@ -26,9 +28,11 @@
 - Variable expansion no longer executes a user-defined `__dict__` descriptor while probing object state.
 - PID debug-session claims are now atomic across VS Code windows and expire with their owning extension host, while Restart safely transfers the same claim.
 - Hot reload now patches every still-live function generation instead of only the objects present before the first reload, so URL-conf, class, and decorated references captured after earlier reloads continue updating. Request claiming and result publication are atomic and request-correlated, eliminating worker unlink/chmod races, partial results, stale-result mixups, and overlapping VS Code flushes.
+- Experimental host integrations can opt individual user-code threads into tracing while keeping backend service workers exempt; canonical and legacy tracer imports now share one process-wide singleton.
+- Generated `.django-shell` analysis and console-cell files are excluded from hot reload requests.
 
 ### Changed
-- Bootstrap version bumped to `2026.07.10.9`. Existing runtimes auto-update on the next attach; restart running Django/Celery processes afterward so the new tracer and hot-reload features are loaded.
+- Bootstrap version bumped to `2026.07.10.10`. Existing runtimes auto-update on the next attach; restart running Django/Celery/shell processes afterward so the host-integration contract is loaded.
 
 ## [0.2.7] - 2026-06-09
 

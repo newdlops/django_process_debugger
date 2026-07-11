@@ -3,7 +3,7 @@
     "activeCommit": 0,
     "commits": [
         {
-            "activePatchIndex": 16,
+            "activePatchIndex": 17,
             "patches": [
                 {
                     "date": 1782910139567,
@@ -72,6 +72,10 @@
                 {
                     "date": 1783689972933,
                     "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-process-debugger\",\n   \"displayName\": \"Django Process Debugger\",\n   \"description\": \"Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase\",\n-  \"version\": \"0.2.907\",\n+  \"version\": \"0.2.908\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"icon.png\",\n   \"galleryBanner\": {\n"
+                },
+                {
+                    "date": 1783729687802,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-process-debugger\",\n   \"displayName\": \"Django Process Debugger\",\n   \"description\": \"Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase\",\n-  \"version\": \"0.2.908\",\n+  \"version\": \"0.2.909\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"icon.png\",\n   \"galleryBanner\": {\n"
                 }
             ],
             "date": 1782910139567,

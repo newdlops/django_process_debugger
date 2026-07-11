@@ -125,6 +125,8 @@ describe('Feature: hot reload exclusion filter', function () {
     '/Users/me/project/myapp/__pycache__/views.cpython-311.pyc',
     '/Users/me/project/myapp/migrations/0001_initial.py',
     '/Users/me/project/node_modules/@types/node/fs.d.ts',
+    '/Users/me/project/.django-shell/console-cell.py',
+    'C:\\Users\\me\\project\\.django-shell\\analysis.py',
     // raw `site-packages` anywhere
     '/opt/homebrew/lib/python3.11/site-packages/foo.py',
   ];
@@ -139,6 +141,22 @@ describe('Feature: hot reload exclusion filter', function () {
     for (const p of skipPaths) {
       assert.strictEqual(shouldIgnoreForHotReload(p), true, `should ignore: ${p}`);
     }
+  });
+
+  it('ignores generated .django-shell files with normalized directory boundaries', function () {
+    assert.strictEqual(
+      shouldIgnoreForHotReload('/workspace/project/.django-shell/console-cell.py'),
+      true,
+    );
+    assert.strictEqual(
+      shouldIgnoreForHotReload('C:\\workspace\\project\\.django-shell\\console-cell.py'),
+      true,
+    );
+    assert.strictEqual(
+      shouldIgnoreForHotReload('/workspace/project/.django-shell-backup/console-cell.py'),
+      false,
+    );
+    assert.ok(HOT_RELOAD_EXCLUDE_SUBSTRINGS.includes('/.django-shell/'));
   });
 
   it('exposes the exclusion list for documentation/self-check', function () {

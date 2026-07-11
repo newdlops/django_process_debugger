@@ -14,11 +14,15 @@ const EXCLUDE_SUBSTRINGS: readonly string[] = [
   '/venv/',
   'node_modules',
   '/migrations/',
+  '/.django-shell/',
 ];
 
 export function shouldIgnoreForHotReload(filePath: string): boolean {
+  // Watcher paths use platform separators. Normalize once so directory-boundary
+  // exclusions behave identically for POSIX and Windows-style paths.
+  const normalizedPath = filePath.replace(/\\/g, '/');
   for (const needle of EXCLUDE_SUBSTRINGS) {
-    if (filePath.includes(needle)) {
+    if (normalizedPath.includes(needle)) {
       return true;
     }
   }

@@ -2,6 +2,7 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 import { describe, it, before } from 'mocha';
 import { getPerf } from './perfReporter';
+import type { DjangoProcessDebuggerPublicApiV1 } from '../../publicApi';
 
 const EXTENSION_ID = 'newdlops.django-process-debugger';
 
@@ -36,6 +37,22 @@ describe('Feature: command registration', function () {
     for (const cmd of EXPECTED_COMMANDS) {
       assert.ok(all.includes(cmd), `missing command: ${cmd}`);
     }
+  });
+
+  it('returns the public v1 API from extension activation', function () {
+    const ext = vscode.extensions.getExtension<DjangoProcessDebuggerPublicApiV1>(EXTENSION_ID)!;
+    assert.ok(ext.isActive);
+    assert.strictEqual(ext.exports.apiVersion, 1);
+    assert.strictEqual(ext.exports.debugType, 'django-process');
+    assert.deepStrictEqual([...ext.exports.engines], ['debugpy', 'experimental']);
+    assert.deepStrictEqual(ext.exports.commands, {
+      setup: 'djangoProcessDebugger.setup',
+      status: 'djangoProcessDebugger.showSetupStatus',
+    });
+    assert.deepStrictEqual(ext.exports.capabilities.experimental, {
+      localPid: true,
+      hotReload: true,
+    });
   });
 
   it('contributes the django-process debug type', function () {

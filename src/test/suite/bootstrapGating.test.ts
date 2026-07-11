@@ -9,6 +9,7 @@ import { getPerf } from './perfReporter';
 import {
   createTempVenv,
   findSystemPython,
+  fixturesDir,
   projectRoot,
   spawnFakeRunserver,
   SpawnedProcess,
@@ -119,6 +120,35 @@ describe('Feature: bootstrap gating on non-target processes', function () {
       delta.includes('SIGUSR1+SIGUSR2 handlers installed'),
       `expected signal handlers to be installed, got:\n${delta || '(empty)'}`,
     );
+  });
+
+  it('live `manage.py shell` and `shell_plus` commands install the signal handlers', async function () {
+    if (!venv) { this.skip(); return; }
+    this.timeout(20_000);
+
+    const managePy = path.join(fixturesDir(), 'manage.py');
+    for (const command of ['shell', 'shell_plus']) {
+      const snapshot = await readLogSafe(bootstrapLog);
+      // The dependency-free fixture exits after rejecting the unsupported fake
+      // command. The .pth bootstrap runs before manage.py, which is the exact
+      // startup boundary whose target decision this test exercises.
+      await execFileAsync(
+        venv.python,
+        [managePy, command],
+        { timeout: 10_000 },
+      ).catch(() => { /* fixture exit is expected after site initialization */ });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const delta = stripBefore(await readLogSafe(bootstrapLog), snapshot);
+      assert.ok(
+        delta.includes('Bootstrap module loaded'),
+        `expected bootstrap log entry for "manage.py ${command}", got:\n${delta || '(empty)'}`,
+      );
+      assert.ok(
+        delta.includes('SIGUSR1+SIGUSR2 handlers installed'),
+        `expected signal handlers for "manage.py ${command}", got:\n${delta || '(empty)'}`,
+      );
+    }
   });
 
   it('celery worker via `python -m celery` triggers bootstrap log entry', async function () {
