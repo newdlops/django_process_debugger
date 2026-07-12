@@ -3,7 +3,7 @@
     "activeCommit": 0,
     "commits": [
         {
-            "activePatchIndex": 17,
+            "activePatchIndex": 18,
             "patches": [
                 {
                     "date": 1782910139567,
@@ -76,6 +76,10 @@
                 {
                     "date": 1783729687802,
                     "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-process-debugger\",\n   \"displayName\": \"Django Process Debugger\",\n   \"description\": \"Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase\",\n-  \"version\": \"0.2.908\",\n+  \"version\": \"0.2.909\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"icon.png\",\n   \"galleryBanner\": {\n"
+                },
+                {
+                    "date": 1783868057751,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"django-process-debugger\",\n   \"displayName\": \"Django Process Debugger\",\n   \"description\": \"Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase\",\n-  \"version\": \"0.2.909\",\n+  \"version\": \"0.2.911\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"icon\": \"icon.png\",\n   \"galleryBanner\": {\n@@ -29,9 +29,11 @@\n     \"celery\",\n     \"macos\",\n     \"apple-silicon\"\n   ],\n-  \"activationEvents\": [],\n+  \"activationEvents\": [\n+    \"onStartupFinished\"\n+  ],\n   \"main\": \"./out/extension.js\",\n   \"contributes\": {\n     \"debuggers\": [\n       {\n@@ -122,8 +124,18 @@\n         \"djangoProcessDebugger.hotReload\": {\n           \"type\": \"boolean\",\n           \"default\": true,\n           \"description\": \"When true, changed Python files are hot-reloaded via importlib.reload() without restarting the Django process, keeping the debug session alive. Django's autoreloader is suppressed while active.\"\n+        },\n+        \"djangoProcessDebugger.mcp.enabled\": {\n+          \"type\": \"boolean\",\n+          \"default\": true,\n+          \"description\": \"Start a private, workspace-scoped MCP endpoint in each trusted VS Code window for Claude, Codex, and other MCP clients.\"\n+        },\n+        \"djangoProcessDebugger.mcp.allowControl\": {\n+          \"type\": \"boolean\",\n+          \"default\": true,\n+          \"description\": \"Allow connected MCP clients to attach, manage MCP-owned breakpoints, and pause, continue, step, or disconnect Django debug sessions. Runtime inspection remains available when disabled.\"\n         }\n       }\n     },\n     \"commands\": [\n@@ -148,9 +160,13 @@\n         \"title\": \"Django Debugger: Reinstall debugpy\"\n       },\n       {\n         \"command\": \"djangoProcessDebugger.cleanPythonLanguageServer\",\n-        \"title\": \"Django Debugger: Clean All (Remove Bootstrap & Restore Python)\"\n+        \"title\": \"Django Debugger: Clean This Workspace\"\n+      },\n+      {\n+        \"command\": \"djangoProcessDebugger.installMcp\",\n+        \"title\": \"Django Debugger: Install MCP for This Workspace\"\n       }\n     ]\n   },\n   \"scripts\": {\n"
                 }
             ],
             "date": 1782910139567,

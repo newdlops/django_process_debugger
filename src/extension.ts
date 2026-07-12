@@ -60,11 +60,60 @@ import {
   isProfileStillInstalled,
   saveSetupProfile,
 } from './runtimeSetup';
+import { setupMcpWorkspace } from './mcp/setup';
+import { diagnoseMcpWorkspace, type McpWorkspaceDiagnostics } from './mcp/diagnostics';
+import { McpVerificationError, verifyMcpWorkspace } from './mcp/verification';
+import { DjangoMcpDebugController } from './mcp/debugController';
+import { startMcpWindowHost, type StartedMcpWindowHost } from './mcp/windowHost';
+import {
+  createMcpWindowId,
+  defaultMcpRegistryDir,
+  McpWindowIdCollisionError,
+  type McpWorkspaceFolderManifest,
+} from './mcp/windowRegistry';
+import type { McpTransportBackend } from './mcp/transport';
 
 const LOCK_DIR = '/tmp/django-process-debugger';
 const LEGACY_LOCK_FILE = path.join(LOCK_DIR, 'debug-session.lock');
 const PENDING_LOCK_TTL_MS = 30_000;
+const MCP_WINDOW_ID_VARIABLE = 'DJANGO_PROCESS_DEBUGGER_WINDOW_ID';
+const MCP_REGISTRY_DIR_VARIABLE = 'DJANGO_PROCESS_DEBUGGER_MCP_REGISTRY_DIR';
 let activeHotReloadShutdown: (() => Promise<void>) | undefined;
+let activeMcpShutdown: (() => Promise<void>) | undefined;
+
+export function mcpToolRequiresEvaluatePermission(name: string, args: unknown): boolean {
+  if (name === 'django_expression_inspect') {
+    return true;
+  }
+  if (name !== 'django_breakpoints_update'
+    || typeof args !== 'object'
+    || args === null
+    || !Array.isArray((args as { breakpoints?: unknown }).breakpoints)) {
+    return false;
+  }
+  return ((args as { breakpoints: unknown[] }).breakpoints).some((breakpoint) =>
+    typeof breakpoint === 'object'
+    && breakpoint !== null
+    && (typeof (breakpoint as { condition?: unknown }).condition === 'string'
+      || typeof (breakpoint as { logMessage?: unknown }).logMessage === 'string'));
+}
+
+function configureMcpWindowEnvironment(
+  collection: vscode.EnvironmentVariableCollection,
+): string {
+  collection.persistent = true;
+  // Keep terminal-launched clients on the exact registry used by the window
+  // host. IDE-launched clients use the same deterministic default directly.
+  collection.replace(MCP_REGISTRY_DIR_VARIABLE, defaultMcpRegistryDir());
+  // Never reuse a cached id from a previous extension host. Environment
+  // collections persist across window reloads and two windows for the same
+  // workspace can begin with the same cached value. A fresh id keeps new
+  // terminals window-local; terminals retaining an old id go through the
+  // bridge's fail-closed stale-id discovery path.
+  const created = createMcpWindowId();
+  collection.replace(MCP_WINDOW_ID_VARIABLE, created);
+  return created;
+}
 
 interface LockInfo {
   pid: number;
@@ -231,6 +280,44 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
     },
     onStateChange: () => {
       queueMicrotask(() => reconcileHotReloadState());
+    },
+  });
+
+  let mcpWindowId = configureMcpWindowEnvironment(context.environmentVariableCollection);
+  const mcpController = new DjangoMcpDebugController({
+    processFinder,
+    windowId: mcpWindowId,
+    getWorkspaceFolders: () => vscode.workspace.workspaceFolders,
+    getEngine: getConfiguredDebugEngine,
+    getJustMyCode: () => vscode.workspace
+      .getConfiguration('djangoProcessDebugger')
+      .get<boolean>('justMyCode', true),
+    getRedirectOutput: () => vscode.workspace
+      .getConfiguration('djangoProcessDebugger')
+      .get<boolean>('redirectOutput', true),
+    getRuntimeStatus: async () => {
+      const profile = await getSetupProfile(context);
+      return {
+        configuredEngine: getConfiguredDebugEngine(),
+        setup: profile
+          ? {
+            configured: true,
+            pythonPath: profile.pythonPath,
+            pythonVersion: profile.pythonVersion,
+            bootstrapVersion: profile.bootstrapVersion,
+            lastSetupAt: profile.lastSetupAt,
+          }
+          : { configured: false },
+        hotReload: hotReloadLeaseManager.getState(),
+        mcpPolicy: {
+          allowControl: vscode.workspace
+            .getConfiguration('djangoProcessDebugger')
+            .get<boolean>('mcp.allowControl', true),
+          allowEvaluate: vscode.workspace
+            .getConfiguration('djangoProcessDebugger')
+            .get<boolean>('mcp.allowEvaluate', false),
+        },
+      };
     },
   });
 
@@ -588,6 +675,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
             log(`[DAP] -> send: ${summarizeDapMessage(message)}`);
           },
           onDidSendMessage(message: unknown) {
+            mcpController.handleDapMessage(session, message);
             const msg = message as DapEvent;
             if (msg?.type === 'event') {
               if (msg.event === 'stopped') {
@@ -1544,6 +1632,206 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
     }
   );
 
+  const mcpBridgeModulePath = context.asAbsolutePath(path.join('out', 'mcp', 'stdioBridge.js'));
+
+  async function selectMcpWorkspaceFolder(
+    placeHolder: string,
+  ): Promise<vscode.WorkspaceFolder | undefined> {
+    const folders = (vscode.workspace.workspaceFolders ?? [])
+      .filter((folder) => folder.uri.scheme === 'file');
+    if (folders.length === 0) {
+      void vscode.window.showErrorMessage(
+        'Open a local workspace folder before using the Django debugger MCP commands.'
+      );
+      return undefined;
+    }
+    if (folders.length === 1) {
+      return folders[0];
+    }
+    const selected = await vscode.window.showQuickPick(
+      folders.map((folder) => ({
+        label: folder.name,
+        description: folder.uri.fsPath,
+        folder,
+      })),
+      { placeHolder, matchOnDescription: true },
+    );
+    return selected?.folder;
+  }
+
+  function requireTrustedMcpWorkspace(): boolean {
+    if (vscode.workspace.isTrusted) {
+      return true;
+    }
+    void vscode.window.showErrorMessage(
+      'Trust this workspace before executing or repairing Django debugger MCP project files.'
+    );
+    return false;
+  }
+
+  async function diagnoseMcpFolder(
+    folder: vscode.WorkspaceFolder,
+  ): Promise<McpWorkspaceDiagnostics> {
+    const result = await diagnoseMcpWorkspace({
+      workspaceRoot: folder.uri.fsPath,
+      bridgeModulePath: mcpBridgeModulePath,
+      windowId: mcpWindowId,
+      registryDir: defaultMcpRegistryDir(),
+    });
+    log(`[MCP Status] ${folder.name}\n${JSON.stringify(result, null, 2)}`);
+    return result;
+  }
+
+  async function installOrRepairMcpFolder(
+    folder: vscode.WorkspaceFolder,
+    operation: 'installed' | 'repaired',
+  ): Promise<boolean> {
+    if (!requireTrustedMcpWorkspace()) {
+      return false;
+    }
+    try {
+      const result = await setupMcpWorkspace({
+        workspaceRoot: folder.uri.fsPath,
+        bridgeModulePath: mcpBridgeModulePath,
+      });
+      log(`[MCP] ${operation} workspace bridge at ${result.launcherPath}`);
+      void vscode.window.showInformationMessage(
+        `Django debugger MCP ${operation} for ${folder.name}. Restart or reconnect Claude/Codex after configuration changes.`
+      );
+      return true;
+    } catch (error) {
+      logError(`[MCP] Workspace ${operation} failed`, error);
+      const message = error instanceof Error ? error.message : String(error);
+      void vscode.window.showErrorMessage(`Could not ${operation === 'installed' ? 'install' : 'repair'} Django debugger MCP: ${message}`);
+      return false;
+    }
+  }
+
+  async function verifyMcpFolder(folder: vscode.WorkspaceFolder): Promise<void> {
+    if (!requireTrustedMcpWorkspace()) {
+      return;
+    }
+    let diagnostics: McpWorkspaceDiagnostics | undefined;
+    try {
+      diagnostics = await diagnoseMcpFolder(folder);
+      if (!diagnostics.installed || diagnostics.repairNeeded) {
+        const choice = await vscode.window.showWarningMessage(
+          diagnostics.installed
+            ? `Django debugger MCP project files are stale or modified for ${folder.name}. Repair them before verification.`
+            : `Django debugger MCP is not fully installed for ${folder.name}.`,
+          'Repair MCP',
+          'Show Logs',
+        );
+        if (choice === 'Repair MCP') {
+          if (!await installOrRepairMcpFolder(folder, 'repaired')) {
+            return;
+          }
+          diagnostics = await diagnoseMcpFolder(folder);
+          if (!diagnostics.installed || diagnostics.repairNeeded) {
+            throw new Error('MCP project files are still not current after repair.');
+          }
+        } else if (choice === 'Show Logs') {
+          getLogger().show();
+          return;
+        } else {
+          return;
+        }
+      }
+      const verified = await verifyMcpWorkspace({
+        workspaceRoot: folder.uri.fsPath,
+        launcherPath: diagnostics.paths.launcher,
+        windowId: mcpWindowId,
+        registryDir: defaultMcpRegistryDir(),
+      });
+      log(`[MCP Verify] ${folder.name}\n${JSON.stringify(verified, null, 2)}`);
+      const choice = await vscode.window.showInformationMessage(
+        `Django debugger MCP verified for ${folder.name}: ${verified.toolNames.length} tools, protocol ${verified.protocolVersion}, ${verified.elapsedMs}ms.`,
+        'Show Logs',
+      );
+      if (choice === 'Show Logs') {
+        getLogger().show();
+      }
+    } catch (error) {
+      logError('[MCP Verify] End-to-end verification failed', error);
+      const message = error instanceof Error ? error.message : String(error);
+      const repairable = diagnostics?.repairNeeded === true
+        || (error instanceof McpVerificationError
+          && (error.code === 'UNSAFE_LAUNCHER' || error.code === 'UNSAFE_RUNTIME'));
+      const choice = await vscode.window.showErrorMessage(
+        `Django debugger MCP verification failed: ${message}${repairable
+          ? ''
+          : ' Check that this trusted workspace is open and the MCP endpoint is enabled in its VS Code window.'}`,
+        ...(repairable ? ['Repair MCP', 'Show Logs'] : ['Show Logs']),
+      );
+      if (choice === 'Repair MCP') {
+        await installOrRepairMcpFolder(folder, 'repaired');
+      } else if (choice === 'Show Logs') {
+        getLogger().show();
+      }
+    }
+  }
+
+  const installMcpCmd = vscode.commands.registerCommand(
+    'djangoProcessDebugger.installMcp',
+    async () => {
+      const folder = await selectMcpWorkspaceFolder(
+        'Select the project root where Claude/Codex MCP configuration should be installed',
+      );
+      if (folder) {
+        await installOrRepairMcpFolder(folder, 'installed');
+      }
+    },
+  );
+  const repairMcpCmd = vscode.commands.registerCommand(
+    'djangoProcessDebugger.repairMcp',
+    async () => {
+      const folder = await selectMcpWorkspaceFolder('Select the MCP project to repair');
+      if (folder) {
+        await installOrRepairMcpFolder(folder, 'repaired');
+      }
+    },
+  );
+  const verifyMcpCmd = vscode.commands.registerCommand(
+    'djangoProcessDebugger.verifyMcp',
+    async () => {
+      const folder = await selectMcpWorkspaceFolder('Select the MCP project to verify');
+      if (folder) {
+        await verifyMcpFolder(folder);
+      }
+    },
+  );
+  const mcpStatusCmd = vscode.commands.registerCommand(
+    'djangoProcessDebugger.showMcpStatus',
+    async () => {
+      const folder = await selectMcpWorkspaceFolder('Select the MCP project to inspect');
+      if (!folder) {
+        return;
+      }
+      try {
+        const result = await diagnoseMcpFolder(folder);
+        const issueCodes = result.issues.slice(0, 3).map((issue) => issue.code).join(', ');
+        const summary = result.verified
+          ? `Django debugger MCP is installed, current, and healthy for ${folder.name}.`
+          : `Django debugger MCP needs attention for ${folder.name}${issueCodes ? `: ${issueCodes}` : '.'}`;
+        const actions = result.repairNeeded
+          ? ['Repair MCP', 'Verify Connection', 'Show Logs']
+          : ['Verify Connection', 'Show Logs'];
+        const choice = await vscode.window.showInformationMessage(summary, ...actions);
+        if (choice === 'Repair MCP') {
+          await installOrRepairMcpFolder(folder, 'repaired');
+        } else if (choice === 'Verify Connection') {
+          await verifyMcpFolder(folder);
+        } else if (choice === 'Show Logs') {
+          getLogger().show();
+        }
+      } catch (error) {
+        logError('[MCP Status] Diagnostics failed', error);
+        const message = error instanceof Error ? error.message : String(error);
+        void vscode.window.showErrorMessage(`Could not inspect Django debugger MCP: ${message}`);
+      }
+    },
+  );
+
   // ── Hot Reload: session/PID lease lifecycle and file coordination ──
   interface HotReloadPidBatch {
     pid: number;
@@ -1971,6 +2259,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
   // Debug session lifecycle logging
   context.subscriptions.push(
     vscode.debug.onDidStartDebugSession(async (session) => {
+      mcpController.handleSessionStarted(session);
       const engine = session.type === 'django-process' ? targetEngineFromSession(session) : undefined;
       const sessionPid = session.type === 'django-process' ? targetPidFromSession(session) : undefined;
       const hotReloadLifecycleToken = session.type === 'django-process'
@@ -2055,6 +2344,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       );
     }),
     vscode.debug.onDidTerminateDebugSession(async (session) => {
+      mcpController.handleSessionTerminated(session);
       log(`[DebugSession] Terminated: ${session.name}`);
       if (session.type === 'django-process') {
         // Revoke the capability and abort local polls before waiting on lock I/O.
@@ -2115,7 +2405,217 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
     }),
   );
 
-  context.subscriptions.push(factory, tracker, attachCmd, setupCmd, statusCmd, killCmd, reinstallCmd, cleanLsCmd, hotReloadStatusItem, getLogger());
+  const mcpControlTools = new Set([
+    'django_session_start',
+    'django_breakpoints_update',
+    'django_execution_control',
+  ]);
+  const controllerBackend = mcpController.asTransportBackend();
+  const mcpBackend: McpTransportBackend = {
+    ...controllerBackend,
+    async callTool(name, args, requestContext) {
+      const evaluateAllowed = vscode.workspace
+        .getConfiguration('djangoProcessDebugger')
+        .get<boolean>('mcp.allowEvaluate', false);
+      if (mcpToolRequiresEvaluatePermission(name, args) && !evaluateAllowed) {
+        const result = {
+          ok: false,
+          error: {
+            code: 'POLICY_DISABLED',
+            message: 'MCP expression evaluation is disabled by djangoProcessDebugger.mcp.allowEvaluate.',
+          },
+        };
+        return {
+          structuredContent: result,
+          text: JSON.stringify(result),
+          isError: true,
+        };
+      }
+      const controlAllowed = vscode.workspace
+        .getConfiguration('djangoProcessDebugger')
+        .get<boolean>('mcp.allowControl', true);
+      if (mcpControlTools.has(name) && !controlAllowed) {
+        const result = {
+          ok: false,
+          error: {
+            code: 'POLICY_DISABLED',
+            message: 'MCP debugger control is disabled by djangoProcessDebugger.mcp.allowControl.',
+          },
+        };
+        return {
+          structuredContent: result,
+          text: JSON.stringify(result),
+          isError: true,
+        };
+      }
+      return controllerBackend.callTool(name, args, requestContext);
+    },
+  };
+
+  async function mcpWorkspaceFolders(): Promise<McpWorkspaceFolderManifest[]> {
+    const result: McpWorkspaceFolderManifest[] = [];
+    for (const folder of vscode.workspace.workspaceFolders ?? []) {
+      if (folder.uri.scheme !== 'file') {
+        continue;
+      }
+      let canonicalPath: string;
+      try {
+        canonicalPath = await fs.promises.realpath(folder.uri.fsPath);
+      } catch {
+        canonicalPath = path.resolve(folder.uri.fsPath);
+      }
+      result.push({
+        name: folder.name,
+        uri: folder.uri.toString(),
+        fsPath: folder.uri.fsPath,
+        canonicalPath: path.resolve(canonicalPath),
+      });
+    }
+    return result.sort((left, right) => left.canonicalPath.localeCompare(right.canonicalPath));
+  }
+
+  let mcpHost: StartedMcpWindowHost | undefined;
+  let mcpDisposed = false;
+  let mcpLifecycleChain = Promise.resolve();
+  const extensionVersion = String(
+    (context.extension.packageJSON as { version?: unknown }).version ?? '0.0.0',
+  );
+
+  function clearMcpOwnedBreakpoints(): void {
+    try {
+      const removed = mcpController.clearOwnedBreakpoints();
+      if (removed > 0) {
+        log(`[MCP] Removed ${removed} MCP-owned breakpoint(s)`);
+      }
+    } catch (error) {
+      logError('[MCP] Could not remove MCP-owned breakpoints', error);
+    }
+  }
+
+  function queueMcpReconcile(restart = false): Promise<void> {
+    mcpLifecycleChain = mcpLifecycleChain.then(async () => {
+      if (mcpDisposed) {
+        return;
+      }
+      if (restart) {
+        if (mcpHost) {
+          const previous = mcpHost;
+          mcpHost = undefined;
+          await previous.dispose();
+        }
+        clearMcpOwnedBreakpoints();
+      }
+
+      const enabled = vscode.workspace
+        .getConfiguration('djangoProcessDebugger')
+        .get<boolean>('mcp.enabled', true);
+      const folders = enabled && vscode.workspace.isTrusted
+        ? await mcpWorkspaceFolders()
+        : [];
+      const shouldRun = enabled && vscode.workspace.isTrusted && folders.length > 0;
+      if (!shouldRun) {
+        if (mcpHost) {
+          const previous = mcpHost;
+          mcpHost = undefined;
+          await previous.dispose();
+          log('[MCP] Window endpoint stopped');
+        }
+        clearMcpOwnedBreakpoints();
+        return;
+      }
+      if (mcpHost) {
+        return;
+      }
+
+      let started: StartedMcpWindowHost | undefined;
+      for (let attempt = 0; attempt < 3 && started === undefined; attempt += 1) {
+        try {
+          started = await startMcpWindowHost({
+            windowId: mcpWindowId,
+            extensionPid: process.pid,
+            extensionVersion,
+            workspaceFolders: folders,
+            backend: mcpBackend,
+            instructions: [
+              'Use django_targets_list before django_session_start.',
+              'Target, stop, frame, and variable references are opaque and expire.',
+              'Use django_session_wait_ready after starting, then django_execution_wait and django_state_snapshot.',
+              'Pass the current stopRef when continuing or stepping so a newer stop is never resumed by mistake.',
+              'This server is restricted to the workspace folders in the owning VS Code window.',
+            ].join(' '),
+          });
+        } catch (error) {
+          if (!(error instanceof McpWindowIdCollisionError) || attempt >= 2) {
+            throw error;
+          }
+          const collidedId = mcpWindowId;
+          mcpWindowId = createMcpWindowId();
+          context.environmentVariableCollection.replace(MCP_WINDOW_ID_VARIABLE, mcpWindowId);
+          mcpController.setWindowId(mcpWindowId);
+          log(`[MCP] Window id collision for ${collidedId}; retrying with ${mcpWindowId}`);
+        }
+      }
+      if (!started) {
+        throw new Error('MCP window endpoint could not claim a unique discovery id.');
+      }
+      if (mcpDisposed) {
+        await started.dispose();
+        return;
+      }
+      mcpHost = started;
+      log(`[MCP] Window endpoint listening at ${started.url} (window=${mcpWindowId})`);
+    }).catch((error) => {
+      logError('[MCP] Window endpoint reconciliation failed', error);
+    });
+    return mcpLifecycleChain;
+  }
+
+  async function shutdownMcpLifecycle(): Promise<void> {
+    if (mcpDisposed) {
+      await mcpLifecycleChain;
+      return;
+    }
+    mcpDisposed = true;
+    await mcpLifecycleChain;
+    const current = mcpHost;
+    mcpHost = undefined;
+    await current?.dispose();
+    clearMcpOwnedBreakpoints();
+  }
+
+  activeMcpShutdown = shutdownMcpLifecycle;
+  context.subscriptions.push(
+    { dispose: () => { void shutdownMcpLifecycle(); } },
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      void queueMcpReconcile(true);
+    }),
+    vscode.workspace.onDidGrantWorkspaceTrust(() => {
+      void queueMcpReconcile();
+    }),
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration('djangoProcessDebugger.mcp.enabled')) {
+        void queueMcpReconcile();
+      }
+    }),
+  );
+  void queueMcpReconcile();
+
+  context.subscriptions.push(
+    factory,
+    tracker,
+    attachCmd,
+    setupCmd,
+    statusCmd,
+    killCmd,
+    reinstallCmd,
+    cleanLsCmd,
+    installMcpCmd,
+    repairMcpCmd,
+    verifyMcpCmd,
+    mcpStatusCmd,
+    hotReloadStatusItem,
+    getLogger(),
+  );
   log('Extension activated');
   return DJANGO_PROCESS_DEBUGGER_PUBLIC_API;
 }
@@ -2137,7 +2637,12 @@ function findFreePort(): Promise<number> {
 }
 
 export async function deactivate(): Promise<void> {
-  const shutdown = activeHotReloadShutdown;
+  const hotReloadShutdown = activeHotReloadShutdown;
+  const mcpShutdown = activeMcpShutdown;
   activeHotReloadShutdown = undefined;
-  await shutdown?.();
+  activeMcpShutdown = undefined;
+  await Promise.allSettled([
+    hotReloadShutdown?.(),
+    mcpShutdown?.(),
+  ].filter((operation): operation is Promise<void> => operation !== undefined));
 }

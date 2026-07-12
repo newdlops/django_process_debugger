@@ -64,6 +64,41 @@ Your debug session stays alive, breakpoints remain active, and the next request 
 | **Django Debugger: Kill Django/Celery Process** | Kill selected processes (multi-select supported) |
 | **Django Debugger: Reinstall debugpy** | Remove and reinstall the bundled debugpy |
 | **Django Debugger: Clean This Workspace** | Remove debugger bootstrap files from this workspace's saved runtime after a safety preview. Does not stop Python processes or touch other runtimes/caches. |
+| **Django Debugger: Install MCP for This Workspace** | Configure the current project so Claude Code and Codex can use this VS Code window's debugger MCP endpoint. |
+| **Django Debugger: Show MCP Status** | Check project configuration, copied bridge files, the current window registration, and endpoint health. |
+| **Django Debugger: Verify MCP Connection** | Launch the installed project bridge and verify MCP initialization, tool discovery, and debugger status end to end. |
+| **Django Debugger: Repair MCP for This Workspace** | Safely refresh stale or missing project-local MCP files and client configuration. |
+
+## Agent MCP
+
+Each trusted VS Code window starts its own private, workspace-scoped MCP endpoint. In a trusted project, run **Django Debugger: Install MCP for This Workspace** to add Claude Code (`.mcp.json`) and Codex (`.codex/config.toml`) configuration plus a project-local launcher under `.django-process-debugger/`. The installer copies the two required bridge runtime files into `.django-process-debugger/runtime/`; generated launchers and client configuration contain no absolute workspace or VS Code extension paths, so the project continues to work from nested working directories and after it is moved. Restart or reconnect the agent after installation. After extension upgrades, **Show MCP Status** reports stale copies and **Repair MCP** refreshes them.
+
+The generated configuration executes the project-local `.django-process-debugger/mcp-stdio.js` file with Node.js. Review and version-control these files according to the project's normal policy; installation, repair, and verification are blocked while VS Code Workspace Trust is disabled. Claude uses `CLAUDE_PROJECT_DIR` when available, while both Claude and Codex can locate the launcher by walking up from their current working directory. The generated Codex project configuration uses the `writes` approval mode, so read-only inspection can proceed normally while state-changing debugger tools prompt for approval by default.
+
+The MCP server exposes a deliberately debugger-specific surface:
+
+- inspect the window, setup, and active-session status
+- list only Django/Celery targets whose working directory belongs to this workspace
+- attach through the normal `django-process` debug-session path
+- add and remove MCP-owned breakpoints without replacing user breakpoints
+- wait for session readiness or stops, and report breakpoint verification per live session
+- inspect bounded stacks, scopes, variables, Django request context, and failure/exception summaries
+- optionally inspect a restricted identifier/attribute/literal-index path, such as `request.user.email`
+- pause, continue, step, or disconnect a session
+
+MCP clients never receive the target control socket, DAP authentication credential, or hot-reload lease token. Target selection uses short-lived opaque references instead of accepting arbitrary PIDs, and frame/variable references expire as soon as execution resumes. Runtime setup, process killing, cleanup, `Set Variable`, and arbitrary DAP requests are not exposed. By default, conditional/log breakpoints and expression inspection are also blocked. If `mcp.allowEvaluate` is enabled, breakpoint conditions and log messages may use general debugger expressions; `django_expression_inspect` remains limited to identifier/attribute/literal-index paths and still rejects calls, operators, assignments, and dunder access.
+
+A typical client flow is `django_targets_list` → `django_breakpoints_update` → `django_session_start` → `django_session_wait_ready` → `django_execution_wait` → `django_state_snapshot` or `django_request_context` → `django_execution_control`. `django_breakpoints_status` verifies live adapter breakpoints, `django_failure_snapshot` summarizes a stopped failure, and `django_variables_expand` traverses opaque variable references. In total, the endpoint publishes 13 focused tools.
+
+If the same project is open in more than one VS Code window, launch the agent from the desired window's integrated terminal so the bridge receives that window's identity. The bridge fails rather than choosing an ambiguous window. Multi-root windows use all workspace folders as their access boundary.
+
+Settings:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `djangoProcessDebugger.mcp.enabled` | `true` | Publish the private endpoint in trusted workspaces. |
+| `djangoProcessDebugger.mcp.allowControl` | `true` | Allow attach, MCP-owned breakpoint changes, and execution control. Read-only inspection remains available when disabled. |
+| `djangoProcessDebugger.mcp.allowEvaluate` | `false` | Allow conditional/log breakpoints and restricted stopped-frame path inspection. Debugger expressions and property access can execute application code, so enable it only for trusted agents and applications. |
 
 ## How It Works
 

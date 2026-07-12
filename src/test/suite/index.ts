@@ -13,7 +13,26 @@ export async function run(): Promise<void> {
   });
 
   const testsRoot = __dirname;
-  const files = await glob('**/*.test.js', { cwd: testsRoot });
+  const requestedFiles = new Set(
+    (process.env.DPD_TEST_FILES ?? '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean),
+  );
+  const invalidFiles = [...requestedFiles].filter((file) =>
+    path.basename(file) !== file || !file.endsWith('.test.js'));
+  if (invalidFiles.length > 0) {
+    throw new Error(`DPD_TEST_FILES accepts test basenames only: ${invalidFiles.join(', ')}`);
+  }
+  const discoveredFiles = await glob('**/*.test.js', { cwd: testsRoot });
+  const files = requestedFiles.size === 0
+    ? discoveredFiles
+    : discoveredFiles.filter((file) => requestedFiles.has(path.basename(file)));
+  const matchedFiles = new Set(files.map((file) => path.basename(file)));
+  const missingFiles = [...requestedFiles].filter((file) => !matchedFiles.has(file));
+  if (missingFiles.length > 0) {
+    throw new Error(`DPD_TEST_FILES did not match compiled tests: ${missingFiles.join(', ')}`);
+  }
   for (const f of files) {
     mocha.addFile(path.resolve(testsRoot, f));
   }

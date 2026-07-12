@@ -2,7 +2,7 @@
   "name": "django-process-debugger",
   "displayName": "Django Process Debugger",
   "description": "Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase",
-  "version": "0.2.910",
+  "version": "0.2.911",
   "publisher": "newdlops",
   "license": "MIT",
   "icon": "icon.png",
@@ -30,7 +30,9 @@
     "macos",
     "apple-silicon"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "debuggers": [
@@ -123,6 +125,21 @@
           "type": "boolean",
           "default": true,
           "description": "When true, changed Python files are hot-reloaded via importlib.reload() without restarting the Django process, keeping the debug session alive. Django's autoreloader is suppressed while active."
+        },
+        "djangoProcessDebugger.mcp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start a private, workspace-scoped MCP endpoint in each trusted VS Code window for Claude, Codex, and other MCP clients."
+        },
+        "djangoProcessDebugger.mcp.allowControl": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow connected MCP clients to attach, manage MCP-owned breakpoints, and pause, continue, step, or disconnect Django debug sessions. Runtime inspection remains available when disabled."
+        },
+        "djangoProcessDebugger.mcp.allowEvaluate": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow MCP conditional/log breakpoints and django_expression_inspect. Disabled by default because debugger expression and Python property access can execute application code."
         }
       }
     },
@@ -150,6 +167,22 @@
       {
         "command": "djangoProcessDebugger.cleanPythonLanguageServer",
         "title": "Django Debugger: Clean This Workspace"
+      },
+      {
+        "command": "djangoProcessDebugger.installMcp",
+        "title": "Django Debugger: Install MCP for This Workspace"
+      },
+      {
+        "command": "djangoProcessDebugger.showMcpStatus",
+        "title": "Django Debugger: Show MCP Status"
+      },
+      {
+        "command": "djangoProcessDebugger.verifyMcp",
+        "title": "Django Debugger: Verify MCP Connection"
+      },
+      {
+        "command": "djangoProcessDebugger.repairMcp",
+        "title": "Django Debugger: Repair MCP for This Workspace"
       }
     ]
   },

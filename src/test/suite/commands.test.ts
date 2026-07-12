@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import { describe, it, before } from 'mocha';
 import { getPerf } from './perfReporter';
 import type { DjangoProcessDebuggerPublicApiV1 } from '../../publicApi';
+import { mcpToolRequiresEvaluatePermission } from '../../extension';
 
 const EXTENSION_ID = 'newdlops.django-process-debugger';
 
@@ -13,6 +14,10 @@ const EXPECTED_COMMANDS = [
   'djangoProcessDebugger.killProcess',
   'djangoProcessDebugger.reinstallDebugpy',
   'djangoProcessDebugger.cleanPythonLanguageServer',
+  'djangoProcessDebugger.installMcp',
+  'djangoProcessDebugger.showMcpStatus',
+  'djangoProcessDebugger.verifyMcp',
+  'djangoProcessDebugger.repairMcp',
 ];
 
 describe('Feature: command registration', function () {
@@ -72,6 +77,9 @@ describe('Feature: command registration', function () {
       'djangoProcessDebugger.justMyCode',
       'djangoProcessDebugger.redirectOutput',
       'djangoProcessDebugger.hotReload',
+      'djangoProcessDebugger.mcp.enabled',
+      'djangoProcessDebugger.mcp.allowControl',
+      'djangoProcessDebugger.mcp.allowEvaluate',
     ]) {
       assert.ok(props[key], `missing setting: ${key}`);
     }
@@ -80,6 +88,19 @@ describe('Feature: command registration', function () {
     assert.strictEqual(engine.type, 'string');
     assert.strictEqual(engine.default, 'debugpy');
     assert.deepStrictEqual(engine.enum, ['debugpy', 'experimental']);
+  });
+
+  it('gates every MCP surface that can evaluate application code', function () {
+    assert.strictEqual(mcpToolRequiresEvaluatePermission('django_expression_inspect', {}), true);
+    assert.strictEqual(mcpToolRequiresEvaluatePermission('django_breakpoints_update', {
+      breakpoints: [{ path: 'views.py', line: 1 }],
+    }), false);
+    assert.strictEqual(mcpToolRequiresEvaluatePermission('django_breakpoints_update', {
+      breakpoints: [{ path: 'views.py', line: 1, condition: 'danger()' }],
+    }), true);
+    assert.strictEqual(mcpToolRequiresEvaluatePermission('django_breakpoints_update', {
+      breakpoints: [{ path: 'views.py', line: 1, logMessage: '{danger()}' }],
+    }), true);
   });
 
   it('exposes engine selection in the attach configuration schema and snippet', function () {

@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.911] - 2026-07-12
+
+### Added
+- Added a private, authenticated, workspace-scoped MCP endpoint per trusted VS Code window, plus portable Claude Code and Codex project configuration.
+- Added 13 focused debugger tools for target discovery, attach readiness, MCP-owned breakpoints, execution events/control, bounded state and variable inspection, Django request context, failure summaries, and opt-in restricted path inspection.
+- Added **Install MCP**, **Show MCP Status**, **Verify MCP Connection**, and **Repair MCP** commands with copied-runtime/configuration diagnostics.
+- Added real stdio → HTTP MCP → VS Code → debugpy breakpoint E2E coverage and concurrent multi-window/client routing tests.
+
+### Security
+- MCP clients receive only short-lived opaque target/session/stop/frame/variable references; raw PIDs, activation sockets, DAP credentials, and hot-reload capabilities stay private.
+- Project setup, discovery, launcher/runtime verification, and registry ownership fail closed on unsafe paths, stale artifacts, ambiguous windows, ownership races, or cross-project launcher fallback.
+- State-changing tools prompt by default in generated Codex configuration. Expression-capable tools are disabled by default, and debugger control is serialized per session with stop-epoch validation.
+
+### Fixed
+- MCP session readiness now waits for a successful DAP `configurationDone` response instead of treating VS Code's earlier session-start event as adapter readiness.
+- Target references are consumed atomically and their process/workspace identity is revalidated immediately before attach.
+- MCP-owned breakpoints are removed when the endpoint is disabled, restarted for workspace changes, or deactivated.
+
 ## [0.2.910] - 2026-07-11
 
 ### Added

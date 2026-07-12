@@ -11,11 +11,13 @@ Usage:
   auto-publish the private activation control socket because sys.argv matches the pattern.
 """
 import os
+import runpy
 import signal
 import socket
 import sys
 import threading
 import time
+import traceback
 import types
 
 
@@ -180,6 +182,8 @@ def main() -> int:
     sys.stdout.flush()
 
     stop_event = threading.Event()
+    mcp_e2e_trigger = os.environ.get('DPD_MCP_E2E_TRIGGER')
+    mcp_e2e_source = os.environ.get('DPD_MCP_E2E_SOURCE')
 
     def _graceful_stop(signum, frame):  # noqa: ARG001
         stop_event.set()
@@ -189,6 +193,17 @@ def main() -> int:
 
     while not stop_event.is_set():
         _write_hot_reload_lifecycle_state()
+        if mcp_e2e_trigger and mcp_e2e_source and os.path.exists(mcp_e2e_trigger):
+            try:
+                os.unlink(mcp_e2e_trigger)
+                runpy.run_path(mcp_e2e_source, run_name='__dpd_mcp_e2e__')
+                sys.stdout.write('MCP_E2E_COMPLETED\n')
+                sys.stdout.flush()
+            except FileNotFoundError:
+                # The test can remove the one-shot trigger during teardown.
+                pass
+            except BaseException:  # pragma: no cover - surfaced in child stderr
+                traceback.print_exc()
         time.sleep(0.05 if _hot_reload_lifecycle_state_path else 0.2)
 
     s.close()
