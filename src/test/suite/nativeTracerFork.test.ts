@@ -20,6 +20,7 @@ describe('Feature: experimental tracer fork safety', function () {
 
     const script = String.raw`
 import json
+import asyncio
 import os
 import select
 import signal
@@ -39,23 +40,57 @@ class ForkSignal:
         self.lock = threading.Lock()
         self.connect_calls = []
         self.disconnect_calls = []
+        self.receivers = {}
 
-    def connect(self, receiver, weak=True, dispatch_uid=None):
+    @staticmethod
+    def receiver_key(receiver, sender, dispatch_uid):
+        # Django scopes dispatch_uid de-duplication to the sender.
+        receiver_id = dispatch_uid if dispatch_uid is not None else id(receiver)
+        return receiver_id, id(sender)
+
+    def connect(self, receiver, sender=None, weak=True, dispatch_uid=None):
+        key = self.receiver_key(receiver, sender, dispatch_uid)
         with self.lock:
-            self.connect_calls.append((receiver, weak, dispatch_uid))
+            self.connect_calls.append((receiver, sender, weak, dispatch_uid))
+            self.receivers.setdefault(
+                key,
+                (receiver, sender, weak, dispatch_uid),
+            )
 
-    def disconnect(self, receiver=None, dispatch_uid=None):
+    def disconnect(self, receiver=None, sender=None, dispatch_uid=None):
         # This lock is deliberately owned by a vanished thread in the child.
         # Calling disconnect from the at-fork reset would deadlock forever.
+        key = self.receiver_key(receiver, sender, dispatch_uid)
         with self.lock:
-            self.disconnect_calls.append((receiver, dispatch_uid))
-        return True
+            self.disconnect_calls.append((receiver, sender, dispatch_uid))
+            return self.receivers.pop(key, None) is not None
+
+    def has_receiver(self, receiver, sender, dispatch_uid):
+        key = self.receiver_key(receiver, sender, dispatch_uid)
+        registered = self.receivers.get(key)
+        return registered is not None and registered[0] is receiver
+
+    async def asend(self, sender=None, **kwargs):
+        return []
 
 
-fork_signal = ForkSignal()
+exception_signal = ForkSignal()
+request_signal = ForkSignal()
 signals_module = types.ModuleType("django.core.signals")
-signals_module.got_request_exception = fork_signal
+signals_module.got_request_exception = exception_signal
+signals_module.request_started = request_signal
 handler_module = types.ModuleType("django.core.handlers.exception")
+wsgi_module = types.ModuleType("django.core.handlers.wsgi")
+asgi_module = types.ModuleType("django.core.handlers.asgi")
+
+class WSGIHandler:
+    pass
+
+class ASGIHandler:
+    pass
+
+wsgi_module.WSGIHandler = WSGIHandler
+asgi_module.ASGIHandler = ASGIHandler
 
 def response_for_exception(request, exc):
     return request, exc
@@ -63,6 +98,8 @@ def response_for_exception(request, exc):
 handler_module.response_for_exception = response_for_exception
 sys.modules["django.core.signals"] = signals_module
 sys.modules["django.core.handlers.exception"] = handler_module
+sys.modules["django.core.handlers.wsgi"] = wsgi_module
+sys.modules["django.core.handlers.asgi"] = asgi_module
 
 endpoint = tracer_module.start("127.0.0.1", 0, auth_token=PARENT_AUTH_TOKEN)
 inherited = tracer_module._ACTIVE_TRACER
@@ -75,8 +112,30 @@ previous_threading_excepthook = threading.excepthook
 with inherited.condition:
     inherited._install_uncaught_exception_hooks_locked()
     inherited._install_django_exception_signal_locked()
+    request_bridge_installed = inherited._install_django_request_trace_signal_locked()
 inherited.exception_filters = {"uncaught", "djangoRequestUnhandled"}
 inherited_django_receiver = inherited.django_exception_receiver
+inherited_trace_receivers = inherited.django_trace_receivers
+inherited_trace_dispatch_uids = inherited.django_trace_dispatch_uids
+inherited_trace_senders = inherited.django_trace_senders
+inherited_trace_modes = inherited.django_trace_modes
+inherited_trace_generation = inherited.django_trace_generation
+inherited.django_trace_dispatch_count = 7
+inherited.django_trace_enable_count = 5
+inherited.django_trace_last_mode = "asgi-async"
+inherited.django_trace_last_thread_name = "parent-asgi-thread"
+inherited.django_trace_last_sender = "example.ASGIHandler"
+inherited.django_trace_last_outcome = "trace-enabled"
+inherited.django_trace_last_failure_reason = "conflicting-trace-hook"
+inherited_trace_diagnostics = (
+    inherited.django_trace_dispatch_count,
+    inherited.django_trace_enable_count,
+    inherited.django_trace_last_mode,
+    inherited.django_trace_last_thread_name,
+    inherited.django_trace_last_sender,
+    inherited.django_trace_last_outcome,
+    inherited.django_trace_last_failure_reason,
+)
 django_receiver_calls = []
 
 def handle_django_exception(*args):
@@ -86,16 +145,54 @@ inherited._handle_django_request_exception = handle_django_exception
 old_condition = inherited.condition
 old_send_lock = inherited.send_lock
 old_active_lock = tracer_module._ACTIVE_LOCK
+old_trace_enabled_threads = inherited.trace_enabled_threads
+inherited.trace_enabled_threads[threading.get_ident()] = threading.current_thread()
+
+class ForeignHandler:
+    pass
+
+def foreign_receiver(**kwargs):
+    return None
+
+# Django permits the same dispatch_uid for a different sender. Normal bridge
+# cleanup must remove only its own sender-scoped registration.
+request_signal.connect(
+    foreign_receiver,
+    sender=ForeignHandler,
+    weak=False,
+    dispatch_uid=inherited_trace_dispatch_uids[0],
+)
+
+request_bridge_shape_valid = (
+    request_bridge_installed
+    and inherited_trace_modes == ("wsgi-sync", "asgi-sync", "asgi-async")
+    and inherited_trace_senders == (WSGIHandler, ASGIHandler, ASGIHandler)
+    and len(set(inherited_trace_dispatch_uids)) == 3
+    and all(
+        request_signal.has_receiver(receiver, sender, dispatch_uid)
+        for receiver, sender, dispatch_uid in zip(
+            inherited_trace_receivers,
+            inherited_trace_senders,
+            inherited_trace_dispatch_uids,
+        )
+    )
+    and request_signal.has_receiver(
+        foreign_receiver,
+        ForeignHandler,
+        inherited_trace_dispatch_uids[0],
+    )
+)
 
 locks_held = threading.Event()
 release_locks = threading.Event()
 
 def hold_inherited_locks():
-    with fork_signal.lock:
-        with tracer_module._ACTIVE_LOCK:
-            with inherited.condition:
-                locks_held.set()
-                release_locks.wait(10)
+    with exception_signal.lock:
+        with request_signal.lock:
+            with tracer_module._ACTIVE_LOCK:
+                with inherited.condition:
+                    locks_held.set()
+                    release_locks.wait(10)
 
 holder = threading.Thread(target=hold_inherited_locks, daemon=True)
 holder.start()
@@ -111,6 +208,16 @@ if child_pid == 0:
         # The saved inherited receiver must become inert through its lock-free
         # PID guard even though it is still registered in the child's Signal.
         inherited_django_receiver(request=object())
+        trace_before_receivers = sys.gettrace()
+        for receiver, sender, mode in zip(
+            inherited_trace_receivers,
+            inherited_trace_senders,
+            inherited_trace_modes,
+        ):
+            if mode == "asgi-async":
+                asyncio.run(receiver(sender=sender))
+            else:
+                receiver(sender=sender)
         result.update({
             "active_cleared": tracer_module._ACTIVE_TRACER is None,
             "active_lock_replaced": tracer_module._ACTIVE_LOCK is not old_active_lock,
@@ -128,7 +235,7 @@ if child_pid == 0:
                 inherited.sys_exception_hook is None
                 and inherited.threading_exception_hook is None
             ),
-            "django_signal_disconnect_skipped": fork_signal.disconnect_calls == [],
+            "django_signal_disconnect_skipped": exception_signal.disconnect_calls == [],
             "django_signal_state_cleared": (
                 inherited.django_exception_signal is None
                 and inherited.django_exception_receiver is None
@@ -136,6 +243,39 @@ if child_pid == 0:
                 and inherited.django_response_for_exception_code is None
             ),
             "inherited_django_receiver_inert": django_receiver_calls == [],
+            "request_signal_disconnect_skipped": request_signal.disconnect_calls == [],
+            "request_trace_signal_state_cleared": (
+                inherited.django_trace_signal is None
+                and inherited.django_trace_receivers == ()
+                and inherited.django_trace_dispatch_uids == ()
+                and inherited.django_trace_senders == ()
+                and inherited.django_trace_modes == ()
+                and inherited.django_trace_generation is None
+                and inherited.django_trace_dispatch_count == 0
+                and inherited.django_trace_enable_count == 0
+                and inherited.django_trace_last_mode is None
+                and inherited.django_trace_last_thread_name is None
+                and inherited.django_trace_last_sender is None
+                and inherited.django_trace_last_outcome is None
+                and inherited.django_trace_last_failure_reason is None
+            ),
+            "inherited_request_receivers_inert": (
+                trace_before_receivers is None
+                and sys.gettrace() is None
+                and inherited.trace_enabled_threads == {}
+                and inherited.native_threads == {}
+            ),
+            "trace_thread_state_replaced": (
+                inherited.trace_enabled_threads is not old_trace_enabled_threads
+            ),
+            "inherited_request_registrations_preserved": all(
+                request_signal.has_receiver(receiver, sender, dispatch_uid)
+                for receiver, sender, dispatch_uid in zip(
+                    inherited_trace_receivers,
+                    inherited_trace_senders,
+                    inherited_trace_dispatch_uids,
+                )
+            ),
             "condition_replaced": inherited.condition is not old_condition,
             "send_lock_replaced": inherited.send_lock is not old_send_lock,
             "breakpoints_cleared": inherited.breakpoints == {},
@@ -178,12 +318,73 @@ try:
             and threading.excepthook is inherited.threading_exception_hook
         ),
         "parent_django_receiver_preserved": (
-            inherited.django_exception_signal is fork_signal
+            inherited.django_exception_signal is exception_signal
             and inherited.django_exception_receiver is inherited_django_receiver
-            and fork_signal.disconnect_calls == []
+            and exception_signal.disconnect_calls == []
+        ),
+        "parent_request_bridge_preserved": (
+            request_bridge_shape_valid
+            and inherited.django_trace_signal is request_signal
+            and inherited.django_trace_receivers == inherited_trace_receivers
+            and inherited.django_trace_dispatch_uids == inherited_trace_dispatch_uids
+            and inherited.django_trace_senders == inherited_trace_senders
+            and inherited.django_trace_modes == inherited_trace_modes
+            and inherited.django_trace_generation is inherited_trace_generation
+            and (
+                inherited.django_trace_dispatch_count,
+                inherited.django_trace_enable_count,
+                inherited.django_trace_last_mode,
+                inherited.django_trace_last_thread_name,
+                inherited.django_trace_last_sender,
+                inherited.django_trace_last_outcome,
+                inherited.django_trace_last_failure_reason,
+            ) == inherited_trace_diagnostics
+            and request_signal.disconnect_calls == []
         ),
         "child_exited_cleanly": os.WIFEXITED(child_status) and os.WEXITSTATUS(child_status) == 0,
     }
+    inherited._restore_django_request_trace_signal()
+    expected_disconnects = {
+        (id(receiver), id(sender), dispatch_uid)
+        for receiver, sender, dispatch_uid in zip(
+            inherited_trace_receivers,
+            inherited_trace_senders,
+            inherited_trace_dispatch_uids,
+        )
+    }
+    actual_disconnects = {
+        (id(receiver), id(sender), dispatch_uid)
+        for receiver, sender, dispatch_uid in request_signal.disconnect_calls
+    }
+    parent_result["parent_request_bridge_sender_scoped_cleanup"] = (
+        inherited.django_trace_signal is None
+        and inherited.django_trace_receivers == ()
+        and inherited.django_trace_dispatch_uids == ()
+        and inherited.django_trace_senders == ()
+        and inherited.django_trace_modes == ()
+        and inherited.django_trace_generation is None
+        and inherited.django_trace_dispatch_count == 0
+        and inherited.django_trace_enable_count == 0
+        and inherited.django_trace_last_mode is None
+        and inherited.django_trace_last_thread_name is None
+        and inherited.django_trace_last_sender is None
+        and inherited.django_trace_last_outcome is None
+        and inherited.django_trace_last_failure_reason is None
+        and actual_disconnects == expected_disconnects
+        and all(
+            not request_signal.has_receiver(receiver, sender, dispatch_uid)
+            for receiver, sender, dispatch_uid in zip(
+                inherited_trace_receivers,
+                inherited_trace_senders,
+                inherited_trace_dispatch_uids,
+            )
+        )
+        and request_signal.has_receiver(
+            foreign_receiver,
+            ForeignHandler,
+            inherited_trace_dispatch_uids[0],
+        )
+    )
     print(json.dumps({"child": child_result, "parent": parent_result}, sort_keys=True))
 finally:
     os.close(read_fd)

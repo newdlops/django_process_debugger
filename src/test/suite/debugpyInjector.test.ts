@@ -116,6 +116,7 @@ describe('Feature: debugpy injector bootstrap lifecycle', function () {
     assert.ok(content.includes(
       '_experimental_tracer.start("127.0.0.1", _port, auth_token=_auth_token)',
     ));
+    assert.ok(content.includes('_thread.django_debugger_do_not_trace = True'));
     assert.ok(content.includes('owns this PID until restart'));
     assert.ok(content.includes('register_at_fork'));
     assert.ok(content.includes(

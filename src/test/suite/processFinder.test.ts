@@ -5,9 +5,11 @@ import {
   collectPortManagerCeleryScanRoots,
   DjangoProcess,
   DjangoProcessFinder,
+  filterShadowedCommandDerivedDjangoProcesses,
   isCeleryWorkerCommand,
   isIpv4LoopbackEndpoint,
   mergeLoopbackAliasEndpoints,
+  parsePortManagerNetworkNamesTsv,
 } from '../../processFinder';
 import { parseLsofTcpListenLine } from '../../listeningEndpoint';
 import { getPerf } from './perfReporter';
@@ -215,7 +217,7 @@ describe('Feature: process discovery', function () {
       ]);
     });
 
-    it('does not mix endpoints owned by another discovered Django process', function () {
+    it('does not spread an ambiguously owned relay alias across Django processes', function () {
       const processes: DjangoProcess[] = [
         {
           pid: 101,
@@ -248,12 +250,94 @@ describe('Feature: process discovery', function () {
 
       assert.deepStrictEqual(processes[0].endpoints, [
         { host: '127.1.0.1', port: 8004 },
-        { host: '127.135.15.126', port: 8004 },
       ]);
       assert.deepStrictEqual(processes[1].endpoints, [
         { host: '127.97.194.31', port: 8004 },
-        { host: '127.135.15.126', port: 8004 },
       ]);
+    });
+  });
+
+  describe('verified endpoint shadowing', function () {
+    const processInfo = (
+      pid: number,
+      cwd: string,
+      port: number,
+      endpointVerified: boolean,
+    ): DjangoProcess => ({
+      pid,
+      command: `python manage.py runserver ${port}`,
+      pythonPath: 'python',
+      arch: process.arch,
+      type: 'django',
+      cwd,
+      port,
+      endpoints: [{ host: endpointVerified ? '127.92.67.173' : '127.0.0.1', port }],
+      endpointVerified,
+    });
+
+    it('keeps the verified Port Manager listener instead of a same-project command fallback', function () {
+      const commandFallback = processInfo(27048, '/repo/captain/./', 8004, false);
+      const portManagerListener = processInfo(27086, '/repo/captain', 8004, true);
+
+      const filtered = filterShadowedCommandDerivedDjangoProcesses([
+        commandFallback,
+        portManagerListener,
+      ]);
+
+      assert.deepStrictEqual(filtered.map((candidate) => candidate.pid), [27086]);
+    });
+
+    it('keeps unverified candidates from another cwd or an unshadowed port', function () {
+      const verified = processInfo(27086, '/repo/captain', 8004, true);
+      const otherProject = processInfo(2909, '/repo/rtcc', 8004, false);
+      const otherPort = processInfo(27048, '/repo/captain', 8010, false);
+
+      const filtered = filterShadowedCommandDerivedDjangoProcesses([
+        verified,
+        otherProject,
+        otherPort,
+      ]);
+
+      assert.deepStrictEqual(filtered.map((candidate) => candidate.pid), [27086, 2909, 27048]);
+    });
+
+    it('keeps a multi-port fallback while any advertised port remains unshadowed', function () {
+      const verified = processInfo(27086, '/repo/captain', 8004, true);
+      const partlyShadowed = processInfo(27048, '/repo/captain', 8004, false);
+      partlyShadowed.endpoints?.push({ host: '127.0.0.1', port: 8005 });
+
+      const filtered = filterShadowedCommandDerivedDjangoProcesses([
+        verified,
+        partlyShadowed,
+      ]);
+
+      assert.deepStrictEqual(filtered.map((candidate) => candidate.pid), [27086, 27048]);
+    });
+  });
+
+  describe('Port Manager network registry parsing', function () {
+    it('reads bounded network id/name rows and ignores malformed or duplicate entries', function () {
+      const names = parsePortManagerNetworkNamesTsv([
+        'network-alpha\talphac\textra-field',
+        'network-beta\tbetac\r',
+        'network-alpha\treplaced-name',
+        'unsafe id\tignored',
+        'network-gamma\tunsafe name',
+        'missing-tab',
+      ].join('\n'));
+
+      assert.deepStrictEqual([...names], [
+        ['network-alpha', 'alphac'],
+        ['network-beta', 'betac'],
+      ]);
+    });
+
+    it('rejects an oversized registry instead of parsing a prefix', function () {
+      const names = parsePortManagerNetworkNamesTsv(
+        `network-alpha\talphac\n${'x'.repeat(256 * 1024)}`,
+      );
+
+      assert.strictEqual(names.size, 0);
     });
   });
 
@@ -266,6 +350,8 @@ describe('Feature: process discovery', function () {
           name: 'python3',
           command: 'python3',
           cwd: '/Users/lky/project/app',
+          networkId: 'network-alpha',
+          terminalSessionId: 'pm-terminal-alpha',
           processGroupId: 1234,
           requestedPort: 8004,
           actualPort: 8004,
@@ -290,7 +376,7 @@ describe('Feature: process discovery', function () {
           processName: 'python3.11',
           command: 'python3.11',
         }],
-      });
+      }, new Map([['network-alpha', 'alphac']]));
 
       assert.strictEqual(processes.length, 1);
       assert.strictEqual(processes[0].pid, 8288);
@@ -298,6 +384,10 @@ describe('Feature: process discovery', function () {
       assert.strictEqual(processes[0].pythonPath, 'python3');
       assert.strictEqual(processes[0].cwd, '/Users/lky/project/app');
       assert.strictEqual(processes[0].processGroupId, 1234);
+      assert.strictEqual(processes[0].endpointVerified, true);
+      assert.strictEqual(processes[0].networkId, 'network-alpha');
+      assert.strictEqual(processes[0].networkName, 'alphac');
+      assert.strictEqual(processes[0].terminalSessionId, 'pm-terminal-alpha');
       assert.strictEqual(processes[0].command, 'python3 (Port Manager, /Users/lky/project/app, :8004)');
       assert.deepStrictEqual(processes[0].endpoints, [
         { host: '127.103.218.122', port: 8004 },

@@ -60,6 +60,10 @@ describe('Feature: window-scoped Django MCP debug controller', function () {
       cwd: fixturesRoot,
       workerPids: [201, 202],
       endpoints: [{ host: '127.0.0.1', port: 8000 }],
+      endpointVerified: true,
+      networkId: 'internal-network-uuid',
+      networkName: 'alphac',
+      terminalSessionId: 'internal-terminal-session',
     };
     const outside: DjangoProcess = {
       ...processInfo,
@@ -67,10 +71,19 @@ describe('Feature: window-scoped Django MCP debug controller', function () {
       cwd: path.dirname(fixturesRoot),
       workerPids: undefined,
     };
+    const djangoProcesses: DjangoProcess[] = [true, false].map((endpointVerified, index) => ({
+      ...processInfo,
+      pid: 300 + index,
+      command: 'python manage.py runserver',
+      type: 'django',
+      workerPids: undefined,
+      endpointVerified,
+      networkName: index === 0 ? 'alphac' : 'betac',
+    }));
     const resolvedInputs: number[] = [];
     const finder: DjangoProcessFinderLike = {
       async findDjangoProcesses() {
-        return [processInfo, outside];
+        return [processInfo, ...djangoProcesses, outside];
       },
       async resolveDebuggablePid(pid) {
         resolvedInputs.push(pid);
@@ -94,11 +107,22 @@ describe('Feature: window-scoped Django MCP debug controller', function () {
 
     const listed = success(await controller.callTool('django_targets_list', {}));
     const targets = listed.targets as Array<Record<string, unknown>>;
-    assert.strictEqual(targets.length, 2);
-    assert.deepStrictEqual(resolvedInputs, [201, 202]);
+    assert.strictEqual(targets.length, 4);
+    assert.deepStrictEqual(resolvedInputs, [201, 202, 300, 301]);
     assert.strictEqual(listed.excludedOutsideWorkspace, 1);
     assert.match(targets[0].targetRef as string, /^target_[a-f0-9]{32}$/);
-    assert.strictEqual(JSON.stringify(targets).includes('"pid"'), false);
+    assert.strictEqual(targets[0].network, 'alphac');
+    assert.strictEqual('servesTraffic' in targets[0], false);
+    assert.strictEqual(targets[2].network, 'alphac');
+    assert.strictEqual(targets[2].servesTraffic, true);
+    assert.strictEqual(targets[3].network, 'betac');
+    assert.strictEqual(targets[3].servesTraffic, false);
+    const serializedTargets = JSON.stringify(targets);
+    assert.strictEqual(serializedTargets.includes('"pid"'), false);
+    assert.strictEqual(serializedTargets.includes('networkId'), false);
+    assert.strictEqual(serializedTargets.includes('terminalSessionId'), false);
+    assert.strictEqual(serializedTargets.includes('internal-network-uuid'), false);
+    assert.strictEqual(serializedTargets.includes('internal-terminal-session'), false);
 
     const started = success(await controller.callTool('django_session_start', {
       targetRef: targets[0].targetRef,
@@ -357,6 +381,66 @@ describe('Feature: window-scoped Django MCP debug controller', function () {
     assert.strictEqual(started, false);
   });
 
+  it('rejects verified targets when their route or listener identity changes', async function () {
+    const scenarios: Array<{
+      name: string;
+      mutate(processInfo: DjangoProcess): void;
+    }> = [
+      {
+        name: 'traffic ownership is no longer verified',
+        mutate(processInfo) { processInfo.endpointVerified = false; },
+      },
+      {
+        name: 'network identity changes',
+        mutate(processInfo) { processInfo.networkId = 'network-b'; },
+      },
+      {
+        name: 'listener port changes',
+        mutate(processInfo) {
+          processInfo.endpoints = [{ host: '127.92.0.1', port: 8005 }];
+        },
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const processInfo: DjangoProcess = {
+        pid: 413,
+        command: 'python manage.py runserver',
+        pythonPath: 'python',
+        arch: process.arch,
+        type: 'django',
+        cwd: fixturesRoot,
+        endpoints: [{ host: '127.92.0.1', port: 8004 }],
+        endpointVerified: true,
+        networkId: 'network-a',
+        networkName: 'alphac',
+        terminalSessionId: 'terminal-a',
+      };
+      const finder: DjangoProcessFinderLike = {
+        async findDjangoProcesses() { return [processInfo]; },
+        async resolveDebuggablePid(pid) { return { pid, pythonPath: 'python' }; },
+      };
+      let starts = 0;
+      const controller = new DjangoMcpDebugController({
+        processFinder: finder,
+        getWorkspaceFolders: () => [fixtureFolder()],
+        startDebugging: async () => { starts++; return true; },
+      });
+      const listed = success(await controller.callTool('django_targets_list', {}));
+      const targetRef = (listed.targets as Array<Record<string, unknown>>)[0].targetRef;
+
+      scenario.mutate(processInfo);
+
+      const result = await controller.callTool('django_session_start', { targetRef });
+      assert.strictEqual(
+        failureCode(result),
+        'TARGET_CHANGED',
+        `${scenario.name}: ${JSON.stringify(result)}`,
+      );
+      assert.strictEqual(starts, 0, scenario.name);
+    }
+  });
+
   it('snapshots stopped state with opaque refs and invalidates variables on resume', async function () {
     const requests: Array<{ command: string; args?: unknown }> = [];
     const finder: DjangoProcessFinderLike = {
@@ -577,6 +661,209 @@ describe('Feature: window-scoped Django MCP debug controller', function () {
       stopRef: firstStopRef,
       action: 'continue',
     })), 'STALE_STOP');
+  });
+
+  it('reports experimental trace coverage and pauses a trace-enabled thread', async function () {
+    const finder: DjangoProcessFinderLike = {
+      async findDjangoProcesses() { return []; },
+      async resolveDebuggablePid(pid) { return { pid, pythonPath: 'python' }; },
+    };
+    let pausedThreadId: number | undefined;
+    const controller = new DjangoMcpDebugController({
+      processFinder: finder,
+      getWorkspaceFolders: () => [fixtureFolder()],
+    });
+    const session = mockSession(
+      'trace-coverage-session',
+      {
+        type: 'django-process',
+        request: 'attach',
+        name: 'trace coverage',
+        engine: 'experimental',
+      },
+      async (command, args) => {
+        switch (command) {
+          case 'djangoTracerStatus':
+            return {
+              pythonVersion: '3.11.15',
+              allThreadsHookInstalled: false,
+              futureThreadsHookInstalled: true,
+              djangoRequestBridgeInstalled: true,
+              djangoRequestBridgeModes: [
+                'wsgi-sync',
+                'invalid-mode',
+                'asgi-sync',
+                'asgi-async',
+                'asgi-async',
+                42,
+              ],
+              coverage: 'partial',
+              djangoRequestBridgeObserved: true,
+              djangoRequestBridgeDispatchCount: 2,
+              djangoRequestBridgeTraceEnableCount: 1,
+              djangoRequestBridgeLastMode: 'asgi-async',
+              djangoRequestBridgeLastThreadName: 'django-main-thread',
+              djangoRequestBridgeLastSender: 'django.core.handlers.asgi.ASGIHandler',
+              djangoRequestBridgeLastOutcome: 'conflicting-trace-hook',
+              djangoRequestBridgeLastFailureReason: 'conflicting-trace-hook',
+              knownThreadCount: 2,
+              traceEnabledThreadCount: 1,
+              threads: [
+                { name: 'MainThread', traceEnabled: false },
+                { name: 'django-main-thread', traceEnabled: true },
+              ],
+            };
+          case 'threads':
+            return {
+              threads: [
+                { id: 1, name: 'MainThread', djangoTraceEnabled: false },
+                { id: 2, name: 'django-main-thread', djangoTraceEnabled: true },
+              ],
+            };
+          case 'pause':
+            pausedThreadId = (args as { threadId?: number } | undefined)?.threadId;
+            return {};
+          default:
+            throw new Error(`Unexpected DAP command: ${command}`);
+        }
+      },
+    );
+    const sessionRef = controller.handleSessionStarted(session)!;
+
+    const status = success(await controller.callTool('django_breakpoints_status', {
+      sessionRef,
+    }));
+    const sessionStatus = (status.sessions as Array<Record<string, unknown>>)[0];
+    assert.deepStrictEqual(sessionStatus.traceCoverage, {
+      coverage: 'partial',
+      pythonVersion: '3.11.15',
+      allThreadsHookInstalled: false,
+      futureThreadsHookInstalled: true,
+      djangoRequestBridgeInstalled: true,
+      djangoRequestBridgeModes: ['wsgi-sync', 'asgi-sync', 'asgi-async'],
+      djangoRequestBridgeObserved: true,
+      djangoRequestBridgeDispatchCount: 2,
+      djangoRequestBridgeTraceEnableCount: 1,
+      djangoRequestBridgeLastMode: 'asgi-async',
+      djangoRequestBridgeLastThreadName: 'django-main-thread',
+      djangoRequestBridgeLastSender: 'django.core.handlers.asgi.ASGIHandler',
+      djangoRequestBridgeLastOutcome: 'conflicting-trace-hook',
+      djangoRequestBridgeLastFailureReason: 'conflicting-trace-hook',
+      knownThreadCount: 2,
+      traceEnabledThreadCount: 1,
+      untracedThreadNames: ['MainThread'],
+    });
+
+    const pause = success(await controller.callTool('django_execution_control', {
+      sessionRef,
+      action: 'pause',
+    }));
+    assert.strictEqual(pause.accepted, true);
+    assert.strictEqual(pausedThreadId, 2);
+  });
+
+  it('maps an older adapter untraced pause rejection to a specific MCP error', async function () {
+    const finder: DjangoProcessFinderLike = {
+      async findDjangoProcesses() { return []; },
+      async resolveDebuggablePid(pid) { return { pid, pythonPath: 'python' }; },
+    };
+    const controller = new DjangoMcpDebugController({
+      processFinder: finder,
+      getWorkspaceFolders: () => [fixtureFolder()],
+    });
+    let pauseAttempted = false;
+    const session = mockSession(
+      'untraced-pause-session',
+      {
+        type: 'django-process',
+        request: 'attach',
+        name: 'untraced pause',
+        engine: 'experimental',
+      },
+      async (command) => {
+        if (command === 'threads') {
+          return {
+            // Older tracer versions do not publish djangoTraceEnabled.
+            threads: [{ id: 1, name: 'django-main-thread' }],
+          };
+        }
+        if (command === 'pause') {
+          pauseAttempted = true;
+          throw new Error('Thread is not trace-enabled yet');
+        }
+        throw new Error(`Unexpected DAP command: ${command}`);
+      },
+    );
+    const sessionRef = controller.handleSessionStarted(session)!;
+    const result = await controller.callTool('django_execution_control', {
+      sessionRef,
+      action: 'pause',
+    });
+    assert.strictEqual(failureCode(result), 'THREAD_NOT_TRACE_ENABLED');
+    assert.strictEqual(pauseAttempted, true);
+  });
+
+  it('refreshes trace coverage before retrying pause after a request enables a thread', async function () {
+    const finder: DjangoProcessFinderLike = {
+      async findDjangoProcesses() { return []; },
+      async resolveDebuggablePid(pid) { return { pid, pythonPath: 'python' }; },
+    };
+    let threadRequests = 0;
+    const pausedThreadIds: number[] = [];
+    const controller = new DjangoMcpDebugController({
+      processFinder: finder,
+      getWorkspaceFolders: () => [fixtureFolder()],
+    });
+    const session = mockSession(
+      'trace-refresh-session',
+      {
+        type: 'django-process',
+        request: 'attach',
+        name: 'trace refresh',
+        engine: 'experimental',
+      },
+      async (command, args) => {
+        if (command === 'threads') {
+          threadRequests += 1;
+          return threadRequests === 1
+            ? {
+              threads: [
+                { id: 1, name: 'MainThread', djangoTraceEnabled: false },
+              ],
+            }
+            : {
+              threads: [
+                { id: 1, name: 'MainThread', djangoTraceEnabled: false },
+                { id: 2, name: 'django-main-thread', djangoTraceEnabled: true },
+              ],
+            };
+        }
+        if (command === 'pause') {
+          const threadId = (args as { threadId?: unknown } | undefined)?.threadId;
+          assert.strictEqual(typeof threadId, 'number');
+          pausedThreadIds.push(threadId as number);
+          return {};
+        }
+        throw new Error(`Unexpected DAP command: ${command}`);
+      },
+    );
+    const sessionRef = controller.handleSessionStarted(session)!;
+
+    const firstPause = await controller.callTool('django_execution_control', {
+      sessionRef,
+      action: 'pause',
+    });
+    assert.strictEqual(failureCode(firstPause), 'THREAD_NOT_TRACE_ENABLED');
+    assert.strictEqual(threadRequests, 1);
+    assert.deepStrictEqual(pausedThreadIds, []);
+
+    const secondPause = success(await controller.callTool('django_execution_control', {
+      sessionRef,
+      action: 'pause',
+    }));
+    assert.strictEqual(secondPause.accepted, true);
+    assert.strictEqual(threadRequests, 2, 'pause retry must not reuse the untraced thread cache');
+    assert.deepStrictEqual(pausedThreadIds, [2]);
   });
 
   it('does not move a terminated session backwards when disconnect races termination', async function () {

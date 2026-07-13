@@ -29,7 +29,7 @@ from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 
 TRACER_API_VERSION = 2
-TRACER_VERSION = "2026.07.11.4"
+TRACER_VERSION = "2026.07.13.2"
 EXEMPT_THREAD_ATTRIBUTE = "django_debugger_do_not_trace"
 
 _CANONICAL_MODULE_NAME = "django_process_debugger_tracer"
@@ -59,6 +59,8 @@ _MAX_DJANGO_REQUEST_STACK_SCAN = 128
 _MAX_DJANGO_REQUEST_LOCALS_PER_FRAME = 256
 _MAX_DJANGO_REQUEST_LOCALS_SCAN = 4096
 _MAX_DJANGO_REQUEST_FIELD_SCAN = 4096
+_MAX_DJANGO_TRACE_DIAGNOSTIC_CHARS = 256
+_MAX_DJANGO_TRACE_OBSERVATIONS = (1 << 31) - 1
 _MAX_INNER_EXCEPTION_DEPTH = 8
 _MAX_INNER_EXCEPTION_CHILDREN = 32
 _MAX_INNER_EXCEPTION_TOTAL = 64
@@ -558,6 +560,7 @@ class NativeDapTracer:
         self.native_to_dap: Dict[int, int] = {}
         self.dap_to_native: Dict[int, int] = {}
         self.native_threads = weakref.WeakValueDictionary()
+        self.trace_enabled_threads = weakref.WeakValueDictionary()
         self.next_thread_id = 1
         self.next_breakpoint_id = 1
         self.breakpoint_hit_counts: Dict[int, int] = {}
@@ -574,6 +577,19 @@ class NativeDapTracer:
         self.django_exception_receiver = None  # type: Optional[Callable[..., Any]]
         self.django_exception_dispatch_uid = None  # type: Optional[str]
         self.django_response_for_exception_code = None  # type: Optional[types.CodeType]
+        self.django_trace_signal = None  # type: Any
+        self.django_trace_receivers = ()  # type: Tuple[Callable[..., Any], ...]
+        self.django_trace_dispatch_uids = ()  # type: Tuple[str, ...]
+        self.django_trace_senders = ()  # type: Tuple[Any, ...]
+        self.django_trace_modes = ()  # type: Tuple[str, ...]
+        self.django_trace_generation = None  # type: Any
+        self.django_trace_dispatch_count = 0
+        self.django_trace_enable_count = 0
+        self.django_trace_last_mode = None  # type: Optional[str]
+        self.django_trace_last_thread_name = None  # type: Optional[str]
+        self.django_trace_last_sender = None  # type: Optional[str]
+        self.django_trace_last_outcome = None  # type: Optional[str]
+        self.django_trace_last_failure_reason = None  # type: Optional[str]
         self.next_handle = 1
         self.frames: Dict[int, Tuple[int, types.FrameType]] = {}
         self.values: Dict[int, ValueHandle] = {}
@@ -863,6 +879,358 @@ class NativeDapTracer:
         except BaseException:
             # Clearing the filter/configuration still makes a receiver left by
             # an unusual Signal implementation inert through its guards.
+            pass
+
+    @staticmethod
+    def _django_request_trace_sender_label(sender: Any) -> str:
+        """Return bounded type metadata without invoking application repr hooks."""
+        try:
+            if type(sender) is type:
+                sender_meta = type(sender)
+                module = _stored_text(
+                    _TYPE_MODULE_DESCRIPTOR.__get__(sender, sender_meta),
+                    "",
+                    _MAX_DJANGO_TRACE_DIAGNOSTIC_CHARS,
+                )
+                qualname = _stored_text(
+                    _TYPE_QUALNAME_DESCRIPTOR.__get__(sender, sender_meta),
+                    "<sender>",
+                    _MAX_DJANGO_TRACE_DIAGNOSTIC_CHARS,
+                )
+                label = "{}.{}".format(module, qualname) if module else qualname
+            else:
+                label = _type_full_name(sender)
+        except BaseException:
+            label = "<sender>"
+        return label[:_MAX_DJANGO_TRACE_DIAGNOSTIC_CHARS]
+
+    def _django_request_trace_generation_is_active(self, generation: Any) -> bool:
+        return bool(
+            generation is not None
+            and self.owner_pid == os.getpid()
+            and self.enabled
+            and self.django_trace_generation is generation
+        )
+
+    def _reset_django_request_trace_diagnostics(self) -> None:
+        self.django_trace_dispatch_count = 0
+        self.django_trace_enable_count = 0
+        self.django_trace_last_mode = None
+        self.django_trace_last_thread_name = None
+        self.django_trace_last_sender = None
+        self.django_trace_last_outcome = None
+        self.django_trace_last_failure_reason = None
+
+    def _record_django_request_trace_dispatch(
+        self,
+        generation: Any,
+        mode: str,
+        sender: Any,
+        trace_enabled: bool,
+        outcome: str,
+    ) -> None:
+        """Record one current-session bridge callback using bounded metadata."""
+        if not self._django_request_trace_generation_is_active(generation):
+            return
+
+        if mode not in ("wsgi-sync", "asgi-sync", "asgi-async"):
+            mode = "unknown"
+        if outcome not in (
+            "trace-enabled",
+            "process-mismatch",
+            "tracer-disabled",
+            "session-not-configured",
+            "client-detached",
+            "interpreter-finalizing",
+            "thread-exempt",
+            "debugger-internal-thread",
+            "conflicting-trace-hook",
+            "internal-error",
+        ):
+            outcome = "internal-error"
+            trace_enabled = False
+
+        try:
+            current_thread = threading.current_thread()
+            raw_name = object.__getattribute__(current_thread, "_name")
+            thread_name = _stored_text(
+                raw_name,
+                "<thread>",
+                _MAX_DJANGO_TRACE_DIAGNOSTIC_CHARS,
+            )
+        except BaseException:
+            thread_name = "<thread>"
+        sender_label = self._django_request_trace_sender_label(sender)
+
+        with self.condition:
+            if not self._django_request_trace_generation_is_active(generation):
+                return
+            self.django_trace_dispatch_count = min(
+                _MAX_DJANGO_TRACE_OBSERVATIONS,
+                self.django_trace_dispatch_count + 1,
+            )
+            if trace_enabled:
+                self.django_trace_enable_count = min(
+                    _MAX_DJANGO_TRACE_OBSERVATIONS,
+                    self.django_trace_enable_count + 1,
+                )
+            else:
+                self.django_trace_last_failure_reason = outcome
+            self.django_trace_last_mode = mode
+            self.django_trace_last_thread_name = thread_name
+            self.django_trace_last_sender = sender_label
+            self.django_trace_last_outcome = outcome
+
+    def _enable_current_thread_trace(self) -> Tuple[bool, str]:
+        """Install this tracer from a cooperative application-thread boundary.
+
+        Python 3.11 and earlier cannot use a public API to set a trace callback
+        on an arbitrary already-running thread. Django's request-started signal
+        runs inside the actual WSGI request thread or ASGI event-loop thread,
+        so that boundary can safely opt itself in before middleware executes.
+        """
+        if self.owner_pid != os.getpid():
+            return False, "process-mismatch"
+        if not self.enabled:
+            return False, "tracer-disabled"
+        if not self.configured:
+            return False, "session-not-configured"
+        if self.client is None:
+            return False, "client-detached"
+        if sys.is_finalizing():
+            return False, "interpreter-finalizing"
+        if _thread_is_exempt():
+            return False, "thread-exempt"
+
+        native_id = threading.get_ident()
+        if native_id in (self.control_ident, self.log_output_ident):
+            return False, "debugger-internal-thread"
+
+        current_hook = sys.gettrace()
+        owns_hook = _is_tracer_trace_hook(current_hook, self)
+        if current_hook is not None and not owns_hook:
+            # Never replace coverage, a profiler, or another debugger that was
+            # installed on this specific thread after process activation.
+            return False, "conflicting-trace-hook"
+
+        if not owns_hook:
+            sys.settrace(self.trace)
+
+        current_thread = threading.current_thread()
+        self._mark_thread_trace_enabled(native_id, current_thread)
+
+        frame = sys._getframe(1)
+        while frame is not None:
+            frame.f_trace = self.trace
+            frame = frame.f_back
+        return True, "trace-enabled"
+
+    def _install_django_request_trace_signal_locked(self) -> bool:
+        """Bridge pre-existing Django request threads into the native tracer."""
+        self._restore_django_request_trace_signal()
+
+        signals_namespace = self._loaded_module_namespace(
+            "django.core.signals"
+        )
+        if signals_namespace is None:
+            return False
+        signal = signals_namespace.get("request_started")
+        if signal is None:
+            return False
+
+        try:
+            connect = object.__getattribute__(signal, "connect")
+        except BaseException:
+            return False
+
+        tracer_ref = weakref.ref(self)
+        uid_prefix = "django-process-debugger-request-trace:{}:{}".format(
+            self.owner_pid,
+            id(self),
+        )
+        handlers = []  # type: list
+        for module_name, class_name, mode in (
+            ("django.core.handlers.wsgi", "WSGIHandler", "wsgi"),
+            ("django.core.handlers.asgi", "ASGIHandler", "asgi"),
+        ):
+            namespace = self._loaded_module_namespace(module_name)
+            handler = namespace.get(class_name) if namespace is not None else None
+            if type(handler) is type:
+                handlers.append((handler, mode))
+        if not handlers:
+            return False
+
+        generation = object()
+        self.django_trace_generation = generation
+
+        def request_trace_mode(sender: Any, suffix: str) -> str:
+            for handler, mode in handlers:
+                if sender is handler:
+                    return mode + "-" + suffix
+            return "unknown"
+
+        def django_sync_request_trace_receiver(
+            sender: Any = None,
+            **_kwargs: Any,
+        ) -> None:
+            tracer = tracer_ref()
+            trace_enabled = False
+            outcome = "internal-error"
+            try:
+                if (
+                    tracer is None
+                    or not tracer._django_request_trace_generation_is_active(
+                        generation
+                    )
+                ):
+                    return None
+                trace_enabled, outcome = tracer._enable_current_thread_trace()
+            except BaseException:
+                # Debugger integration must never alter request dispatch.
+                pass
+            try:
+                if tracer is not None:
+                    tracer._record_django_request_trace_dispatch(
+                        generation,
+                        request_trace_mode(sender, "sync"),
+                        sender,
+                        trace_enabled,
+                        outcome,
+                    )
+            except BaseException:
+                pass
+            return None
+
+        async def django_async_request_trace_receiver(
+            sender: Any = None,
+            **_kwargs: Any,
+        ) -> None:
+            tracer = tracer_ref()
+            trace_enabled = False
+            outcome = "internal-error"
+            try:
+                if (
+                    tracer is None
+                    or not tracer._django_request_trace_generation_is_active(
+                        generation
+                    )
+                ):
+                    return None
+                trace_enabled, outcome = tracer._enable_current_thread_trace()
+            except BaseException:
+                pass
+            try:
+                if tracer is not None:
+                    tracer._record_django_request_trace_dispatch(
+                        generation,
+                        request_trace_mode(sender, "async"),
+                        sender,
+                        trace_enabled,
+                        outcome,
+                    )
+            except BaseException:
+                pass
+            return None
+
+        connected = []  # type: list
+        try:
+            for handler, mode in handlers:
+                sync_uid = uid_prefix + ":{}:sync".format(mode)
+                connect(
+                    django_sync_request_trace_receiver,
+                    sender=handler,
+                    weak=False,
+                    dispatch_uid=sync_uid,
+                )
+                connected.append(
+                    (
+                        django_sync_request_trace_receiver,
+                        sync_uid,
+                        handler,
+                        mode + "-sync",
+                    )
+                )
+
+                # Django 5+ natively awaits async receivers on the ASGI
+                # event-loop thread. Restrict it to ASGIHandler so WSGI
+                # Signal.send() never creates an event loop solely for this
+                # debugger bridge.
+                if mode == "asgi" and callable(getattr(signal, "asend", None)):
+                    async_uid = uid_prefix + ":asgi:async"
+                    connect(
+                        django_async_request_trace_receiver,
+                        sender=handler,
+                        weak=False,
+                        dispatch_uid=async_uid,
+                    )
+                    connected.append(
+                        (
+                            django_async_request_trace_receiver,
+                            async_uid,
+                            handler,
+                            "asgi-async",
+                        )
+                    )
+        except BaseException:
+            try:
+                disconnect = object.__getattribute__(signal, "disconnect")
+                for receiver, dispatch_uid, sender, _mode in connected:
+                    disconnect(
+                        receiver=receiver,
+                        sender=sender,
+                        dispatch_uid=dispatch_uid,
+                    )
+            except BaseException:
+                pass
+            self.django_trace_generation = None
+            self._reset_django_request_trace_diagnostics()
+            return False
+
+        self.django_trace_signal = signal
+        self.django_trace_receivers = tuple(
+            receiver for receiver, _dispatch_uid, _sender, _mode in connected
+        )
+        self.django_trace_dispatch_uids = tuple(
+            dispatch_uid
+            for _receiver, dispatch_uid, _sender, _mode in connected
+        )
+        self.django_trace_senders = tuple(
+            sender for _receiver, _dispatch_uid, sender, _mode in connected
+        )
+        self.django_trace_modes = tuple(
+            mode for _receiver, _dispatch_uid, _sender, mode in connected
+        )
+        return True
+
+    def _restore_django_request_trace_signal(self) -> None:
+        signal = self.django_trace_signal
+        receivers = self.django_trace_receivers
+        dispatch_uids = self.django_trace_dispatch_uids
+        senders = self.django_trace_senders
+        self.django_trace_generation = None
+        self._reset_django_request_trace_diagnostics()
+        self.django_trace_signal = None
+        self.django_trace_receivers = ()
+        self.django_trace_dispatch_uids = ()
+        self.django_trace_senders = ()
+        self.django_trace_modes = ()
+        if signal is None:
+            return
+        try:
+            disconnect = object.__getattribute__(signal, "disconnect")
+            for receiver, dispatch_uid, sender in zip(
+                receivers,
+                dispatch_uids,
+                senders,
+            ):
+                disconnect(
+                    receiver=receiver,
+                    sender=sender,
+                    dispatch_uid=dispatch_uid,
+                )
+        except BaseException:
+            # Guards on a receiver left by an unusual Signal implementation
+            # make it inert after the session is no longer configured.
             pass
 
     def _clear_exception_stop(
@@ -1428,6 +1796,12 @@ class NativeDapTracer:
             return None
         if _thread_is_exempt():
             return None
+        current_thread = threading.current_thread()
+        if (
+            self.trace_enabled_threads.get(native_id) is not current_thread
+            and _is_tracer_trace_hook(sys.gettrace(), self)
+        ):
+            self._mark_thread_trace_enabled(native_id, current_thread)
         if not self.configured:
             # Remove local line tracing while detached. The process-wide call
             # hook remains installed, so new Django request frames are traced
@@ -1436,7 +1810,6 @@ class NativeDapTracer:
         active_client = self.client
         if active_client is None:
             return None
-        self._ensure_thread_identity(native_id, threading.current_thread())
         if event == "exception":
             try:
                 self._handle_raised_exception(
@@ -1951,11 +2324,26 @@ class NativeDapTracer:
                 self._discard_thread_identity_locked(native_id)
             self.native_threads[native_id] = thread
 
+    def _mark_thread_trace_enabled(
+        self,
+        native_id: int,
+        thread: threading.Thread,
+    ) -> None:
+        # This method is called from the trace hot path. Once a thread is
+        # recorded, the common case must remain a lock-free identity lookup.
+        if self.trace_enabled_threads.get(native_id) is thread:
+            return
+        self._ensure_thread_identity(native_id, thread)
+        with self.condition:
+            if self.trace_enabled_threads.get(native_id) is not thread:
+                self.trace_enabled_threads[native_id] = thread
+
     def _discard_thread_identity_locked(self, native_id: int) -> None:
         old_dap_id = self.native_to_dap.pop(native_id, None)
         if old_dap_id is not None:
             self.dap_to_native.pop(old_dap_id, None)
         self.native_threads.pop(native_id, None)
+        self.trace_enabled_threads.pop(native_id, None)
         self.steps.pop(native_id, None)
         self.call_breakpoint_locations.pop(native_id, None)
         self.pause_requests.discard(native_id)
@@ -2033,6 +2421,93 @@ class NativeDapTracer:
                 self.native_to_dap[native_id] = result
                 self.dap_to_native[result] = native_id
             return result
+
+    def _thread_trace_enabled(
+        self,
+        native_id: int,
+        thread: threading.Thread,
+    ) -> bool:
+        if (
+            not thread.is_alive()
+            or thread.ident != native_id
+            or _thread_is_exempt(thread)
+        ):
+            return False
+        if self.all_threads_hook_installed:
+            return True
+        with self.condition:
+            return self.trace_enabled_threads.get(native_id) is thread
+
+    def _tracer_status(self, request: Dict[str, Any]) -> None:
+        known_threads = []
+        for item in threading.enumerate():
+            native_id = item.ident
+            if native_id is None or native_id in (
+                self.control_ident,
+                self.log_output_ident,
+            ) or _thread_is_exempt(item):
+                continue
+            if self._thread_id_for_snapshot(native_id, item) is None:
+                continue
+            known_threads.append(
+                {
+                    "name": str(item.name)[:512],
+                    "traceEnabled": self._thread_trace_enabled(native_id, item),
+                }
+            )
+
+        trace_enabled_count = sum(
+            1 for item in known_threads if item["traceEnabled"]
+        )
+        known_count = len(known_threads)
+        try:
+            future_threads_hook_installed = (
+                self.threading_hook_installed
+                and _is_tracer_trace_hook(
+                    _existing_thread_trace_hook(),
+                    self,
+                )
+            )
+        except BaseException:
+            future_threads_hook_installed = False
+        with self.condition:
+            bridge_dispatch_count = self.django_trace_dispatch_count
+            bridge_enable_count = self.django_trace_enable_count
+            bridge_last_mode = self.django_trace_last_mode
+            bridge_last_thread_name = self.django_trace_last_thread_name
+            bridge_last_sender = self.django_trace_last_sender
+            bridge_last_outcome = self.django_trace_last_outcome
+            bridge_last_failure_reason = (
+                self.django_trace_last_failure_reason
+            )
+        self._response(
+            request,
+            {
+                "pythonVersion": "{}.{}.{}".format(*sys.version_info[:3]),
+                "allThreadsHookInstalled": self.all_threads_hook_installed,
+                "futureThreadsHookInstalled": future_threads_hook_installed,
+                "djangoRequestBridgeInstalled": self.django_trace_signal is not None,
+                "djangoRequestBridgeModes": list(self.django_trace_modes),
+                "djangoRequestBridgeObserved": bridge_dispatch_count > 0,
+                "djangoRequestBridgeDispatchCount": bridge_dispatch_count,
+                "djangoRequestBridgeTraceEnableCount": bridge_enable_count,
+                "djangoRequestBridgeLastMode": bridge_last_mode,
+                "djangoRequestBridgeLastThreadName": bridge_last_thread_name,
+                "djangoRequestBridgeLastSender": bridge_last_sender,
+                "djangoRequestBridgeLastOutcome": bridge_last_outcome,
+                "djangoRequestBridgeLastFailureReason": (
+                    bridge_last_failure_reason
+                ),
+                "coverage": (
+                    "all"
+                    if known_count == trace_enabled_count
+                    else "partial"
+                ),
+                "knownThreadCount": known_count,
+                "traceEnabledThreadCount": trace_enabled_count,
+                "threads": known_threads[:128],
+            },
+        )
 
     def _pause(
         self,
@@ -2804,6 +3279,11 @@ class NativeDapTracer:
         elif command == "configurationDone":
             with self.condition:
                 self.configured = True
+                # Best-effort cooperative bridge for Python 3.11 and earlier:
+                # an already-running WSGI/ASGI request thread can install its
+                # own trace hook before executing middleware. A non-Django
+                # process remains fully usable through the ordinary hooks.
+                self._install_django_request_trace_signal_locked()
                 self._response(request)
                 if self.pending_attach is not None:
                     self._response(self.pending_attach)
@@ -2823,12 +3303,23 @@ class NativeDapTracer:
                 if item.ident is None or item.ident in (
                     self.control_ident,
                     self.log_output_ident,
-                ):
+                ) or _thread_is_exempt(item):
                     continue
                 dap_thread_id = self._thread_id_for_snapshot(item.ident, item)
                 if dap_thread_id is not None:
-                    threads.append({"id": dap_thread_id, "name": item.name})
+                    threads.append(
+                        {
+                            "id": dap_thread_id,
+                            "name": item.name,
+                            "djangoTraceEnabled": self._thread_trace_enabled(
+                                item.ident,
+                                item,
+                            ),
+                        }
+                    )
             self._response(request, {"threads": threads})
+        elif command == "djangoTracerStatus":
+            self._tracer_status(request)
         elif command == "stackTrace":
             self._stack_trace(request, args)
         elif command == "scopes":
@@ -2849,6 +3340,7 @@ class NativeDapTracer:
             with self.condition:
                 self.configured = False
                 self.disconnect_requested = True
+                self._restore_django_request_trace_signal()
                 self._response(request)
                 self._event("terminated")
                 for context in self.stops.values():
@@ -4733,10 +5225,33 @@ class NativeDapTracer:
         dap_id = int(args.get("threadId", 0))
         with self.condition:
             native_id = self.dap_to_native.get(dap_id)
-            if native_id is not None:
+            thread = (
+                self.native_threads.get(native_id)
+                if native_id is not None
+                else None
+            )
+            trace_enabled = bool(
+                native_id is not None
+                and thread is not None
+                and thread.is_alive()
+                and thread.ident == native_id
+                and self._thread_trace_enabled(native_id, thread)
+            )
+            if native_id is not None and trace_enabled:
                 self.pause_requests.add(native_id)
         if native_id is None:
             self._response(request, success=False, message="Unknown thread")
+            return
+        if not trace_enabled:
+            self._response(
+                request,
+                success=False,
+                message=(
+                    "Thread is not trace-enabled yet; on Python 3.11 and "
+                    "earlier, an existing Django request thread becomes "
+                    "traceable at its next supported request boundary"
+                ),
+            )
             return
         self._response(request)
 
@@ -4755,6 +5270,7 @@ class NativeDapTracer:
             self.last_exception_stops.clear()
             self._restore_uncaught_exception_hooks()
             self._restore_django_exception_signal()
+            self._restore_django_request_trace_signal()
             with self.log_drop_lock:
                 self.dropped_log_events = 0
                 self.dropped_log_summaries.clear()
@@ -4794,6 +5310,7 @@ class NativeDapTracer:
             self.last_exception_stops.clear()
             self._restore_uncaught_exception_hooks()
             self._restore_django_exception_signal()
+            self._restore_django_request_trace_signal()
             for context in self.stops.values():
                 context.paused = False
                 self._cancel_pending_operation_locked(context)
@@ -4847,6 +5364,13 @@ class NativeDapTracer:
         self.django_exception_receiver = None
         self.django_exception_dispatch_uid = None
         self.django_response_for_exception_code = None
+        self.django_trace_signal = None
+        self.django_trace_receivers = ()
+        self.django_trace_dispatch_uids = ()
+        self.django_trace_senders = ()
+        self.django_trace_modes = ()
+        self.django_trace_generation = None
+        self._reset_django_request_trace_diagnostics()
 
         inherited_client = self.client
         inherited_server = self.server
@@ -4899,6 +5423,7 @@ class NativeDapTracer:
         self.native_to_dap = {}
         self.dap_to_native = {}
         self.native_threads = weakref.WeakValueDictionary()
+        self.trace_enabled_threads = weakref.WeakValueDictionary()
         self.next_thread_id = 1
         self.next_breakpoint_id = 1
         self.next_handle = 1
@@ -5018,14 +5543,27 @@ def trace_this_thread(enabled: bool) -> None:
         raise RuntimeError("Current thread already has a different trace hook")
 
     thread = threading.current_thread()
+    if enabled:
+        try:
+            pydev_exempt = bool(getattr(thread, "pydev_do_not_trace", False))
+        except BaseException:
+            pydev_exempt = True
+        if pydev_exempt:
+            raise RuntimeError(
+                "Current thread is excluded by pydev_do_not_trace"
+            )
     try:
         setattr(thread, EXEMPT_THREAD_ATTRIBUTE, not enabled)
     except BaseException:
         pass
+    if enabled and _thread_is_exempt(thread):
+        raise RuntimeError("Current thread could not be opted into tracing")
 
     frame = sys._getframe(1)
     if enabled:
         sys.settrace(tracer.trace)
+        native_id = threading.get_ident()
+        tracer._mark_thread_trace_enabled(native_id, thread)
         while frame is not None:
             frame.f_trace = tracer.trace
             frame = frame.f_back
@@ -5033,6 +5571,10 @@ def trace_this_thread(enabled: bool) -> None:
 
     if owns_hook:
         sys.settrace(None)
+    native_id = threading.get_ident()
+    with tracer.condition:
+        if tracer.trace_enabled_threads.get(native_id) is thread:
+            tracer.trace_enabled_threads.pop(native_id, None)
     while frame is not None:
         if _is_tracer_trace_hook(frame.f_trace, tracer):
             frame.f_trace = None

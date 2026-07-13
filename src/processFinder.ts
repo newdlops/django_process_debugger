@@ -14,6 +14,8 @@ import {
 
 const execFileAsync = promisify(execFile);
 const PORT_MANAGER_AGENT_REQUEST_TIMEOUT_MS = 1_000;
+const PORT_MANAGER_NETWORKS_FILE_MAX_BYTES = 256 * 1024;
+const PORT_MANAGER_NETWORKS_MAX_ROWS = 512;
 const CELERY_PIDFILE_SCAN_LIMIT = 64;
 
 export type ProcessType = 'django' | 'celery';
@@ -30,6 +32,11 @@ export interface DjangoProcess {
   host?: string;
   port?: number;
   endpoints?: TcpListeningEndpoint[];
+  /** True only when a listener/route, rather than the command line, proved the endpoint. */
+  endpointVerified?: boolean;
+  networkId?: string;
+  networkName?: string;
+  terminalSessionId?: string;
 }
 
 export interface OwnedTcpListeningEndpoint {
@@ -62,6 +69,9 @@ export interface PortManagerRouteRow {
   processName?: string;
   status?: string;
   source?: string;
+  cwd?: string;
+  networkId?: string;
+  terminalSessionId?: string;
 }
 
 export interface PortManagerListenerRow {
@@ -87,6 +97,33 @@ interface PortManagerResponseMessage {
 
 function endpointKey(endpoint: TcpListeningEndpoint): string {
   return `${endpoint.host}:${endpoint.port}`;
+}
+
+/** Parse the Port Manager `networkId<TAB>name...` registry defensively. */
+export function parsePortManagerNetworkNamesTsv(content: string): Map<string, string> {
+  const names = new Map<string, string>();
+  if (Buffer.byteLength(content, 'utf8') > PORT_MANAGER_NETWORKS_FILE_MAX_BYTES) {
+    return names;
+  }
+
+  const safeField = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+  for (const line of content.split(/\r?\n/).slice(0, PORT_MANAGER_NETWORKS_MAX_ROWS)) {
+    const fields = line.split('\t');
+    if (fields.length < 2) {
+      continue;
+    }
+    const networkId = fields[0].trim();
+    const networkName = fields[1].trim();
+    if (
+      !safeField.test(networkId) ||
+      !safeField.test(networkName) ||
+      names.has(networkId)
+    ) {
+      continue;
+    }
+    names.set(networkId, networkName);
+  }
+  return names;
 }
 
 function mergeEndpoints(
@@ -347,7 +384,11 @@ function portManagerCommand(processRow: PortManagerProcessRow, route: PortManage
       : route.processName && route.processName.length > 0
         ? route.processName
         : 'python3';
-  const cwd = processRow.cwd && processRow.cwd.length > 0 ? processRow.cwd : undefined;
+  const cwd = processRow.cwd && processRow.cwd.length > 0
+    ? processRow.cwd
+    : route.cwd && route.cwd.length > 0
+      ? route.cwd
+      : undefined;
   const endpoint = endpointFromRoute(route);
   const details = [
     'Port Manager',
@@ -439,7 +480,10 @@ function findPortManagerWorkerPids(
   return uniqueSortedPids(siblingProcessPids, listenerPids);
 }
 
-export function buildPortManagerDjangoProcesses(snapshot: PortManagerSnapshot): DjangoProcess[] {
+export function buildPortManagerDjangoProcesses(
+  snapshot: PortManagerSnapshot,
+  networkNames?: ReadonlyMap<string, string>,
+): DjangoProcess[] {
   const processRows = snapshot.processes ?? [];
   const routeRows = snapshot.routes ?? [];
   const listenerRows = snapshot.listeners ?? [];
@@ -499,9 +543,19 @@ export function buildPortManagerDjangoProcesses(snapshot: PortManagerSnapshot): 
       continue;
     }
 
+    const cwd = processRow.cwd ?? route.cwd;
+    const networkId = processRow.networkId ?? route.networkId;
+    const networkName = networkId ? networkNames?.get(networkId) : undefined;
+    const terminalSessionId = processRow.terminalSessionId ?? route.terminalSessionId;
+
     const existing = candidatesByPid.get(processRow.pid);
     if (existing) {
       existing.endpoints = mergeEndpoints(existing.endpoints, endpoints);
+      existing.endpointVerified = true;
+      existing.cwd = existing.cwd ?? cwd;
+      existing.networkId = existing.networkId ?? networkId;
+      existing.networkName = existing.networkName ?? networkName;
+      existing.terminalSessionId = existing.terminalSessionId ?? terminalSessionId;
       existing.workerPids = uniqueSortedPids(
         existing.workerPids,
         findPortManagerWorkerPids(processRow, route, processRows, listenerRows),
@@ -515,23 +569,103 @@ export function buildPortManagerDjangoProcesses(snapshot: PortManagerSnapshot): 
       pythonPath: portManagerPythonPath(processRow, route, processListeners),
       arch: process.arch,
       type: 'django',
-      cwd: processRow.cwd,
+      cwd,
       processGroupId: processRow.processGroupId,
       workerPids: findPortManagerWorkerPids(processRow, route, processRows, listenerRows),
       host: endpoints[0].host,
       port: endpoints[0].port,
       endpoints,
+      endpointVerified: true,
+      networkId,
+      networkName,
+      terminalSessionId,
     });
   }
 
   return [...candidatesByPid.values()];
 }
 
+function normalizedCwdKey(cwd: string | undefined): string | undefined {
+  if (!cwd || cwd.trim().length === 0) {
+    return undefined;
+  }
+  const resolved = path.resolve(cwd);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function djangoProcessPorts(processInfo: DjangoProcess): number[] {
+  const ports = new Set<number>();
+  if (isValidPort(processInfo.port)) {
+    ports.add(processInfo.port);
+  }
+  for (const endpoint of processInfo.endpoints ?? []) {
+    if (isValidPort(endpoint.port)) {
+      ports.add(endpoint.port);
+    }
+  }
+  return [...ports];
+}
+
+/**
+ * A command line only suggests where a server ought to listen. When a second
+ * candidate in the same project has a listener-backed endpoint on that port,
+ * retain the proven owner and discard the command-derived duplicate.
+ */
+export function filterShadowedCommandDerivedDjangoProcesses(
+  processes: ReadonlyArray<DjangoProcess>,
+): DjangoProcess[] {
+  const verifiedCwdPorts = new Set<string>();
+
+  for (const processInfo of processes) {
+    if (processInfo.type !== 'django' || processInfo.endpointVerified !== true) {
+      continue;
+    }
+    const cwd = normalizedCwdKey(processInfo.cwd);
+    if (!cwd) {
+      continue;
+    }
+    for (const port of djangoProcessPorts(processInfo)) {
+      verifiedCwdPorts.add(`${cwd}\0${port}`);
+    }
+  }
+
+  return processes.filter((processInfo) => {
+    if (processInfo.type !== 'django' || processInfo.endpointVerified !== false) {
+      return true;
+    }
+    const cwd = normalizedCwdKey(processInfo.cwd);
+    if (!cwd) {
+      return true;
+    }
+    const ports = djangoProcessPorts(processInfo);
+    return ports.length === 0 || !ports.every((port) =>
+      verifiedCwdPorts.has(`${cwd}\0${port}`),
+    );
+  });
+}
+
 export function mergeLoopbackAliasEndpoints(
   processes: DjangoProcess[],
   aliasesByPort: ReadonlyMap<number, ReadonlyArray<OwnedTcpListeningEndpoint>>,
 ): void {
-  const discoveredDjangoPids = new Set(processes.map((p) => p.pid));
+  const candidatesByPort = new Map<number, DjangoProcess[]>();
+  const ownersByPid = new Map<number, Set<DjangoProcess>>();
+
+  for (const processInfo of processes) {
+    if (processInfo.type !== 'django') {
+      continue;
+    }
+    for (const pid of uniqueSortedPids([processInfo.pid], processInfo.workerPids)) {
+      const owners = ownersByPid.get(pid) ?? new Set<DjangoProcess>();
+      owners.add(processInfo);
+      ownersByPid.set(pid, owners);
+    }
+    for (const port of djangoProcessPorts(processInfo)) {
+      const candidates = candidatesByPort.get(port) ?? [];
+      candidates.push(processInfo);
+      candidatesByPort.set(port, candidates);
+    }
+  }
 
   for (const processInfo of processes) {
     if (processInfo.type !== 'django' || !processInfo.endpoints?.length) {
@@ -540,11 +674,19 @@ export function mergeLoopbackAliasEndpoints(
 
     const aliases = processInfo.endpoints.flatMap((endpoint) =>
       (aliasesByPort.get(endpoint.port) ?? [])
-        .filter((alias) =>
-          alias.pid === processInfo.pid ||
-          alias.pid === undefined ||
-          !discoveredDjangoPids.has(alias.pid),
-        )
+        .filter((alias) => {
+          const candidates = candidatesByPort.get(endpoint.port) ?? [];
+          const owners = alias.pid === undefined ? undefined : ownersByPid.get(alias.pid);
+          if (owners?.has(processInfo)) {
+            return true;
+          }
+          if (owners && owners.size > 0) {
+            return false;
+          }
+          // A relay/router PID does not identify which Django instance it
+          // forwards to. It is safe to add only when the port is unambiguous.
+          return candidates.length === 1;
+        })
         .map((alias) => alias.endpoint),
     );
     processInfo.endpoints = mergeEndpoints(processInfo.endpoints, aliases);
@@ -584,6 +726,7 @@ export class DjangoProcessFinder {
           this.findProcessCwd(p.pid),
         ]);
         p.cwd = p.cwd ?? cwd;
+        p.endpointVerified = lsofEndpoints.length > 0;
         p.endpoints = lsofEndpoints.length > 0
           ? mergeEndpoints(lsofEndpoints)
           : mergeEndpoints(commandEndpoint ? [commandEndpoint] : undefined);
@@ -591,6 +734,16 @@ export class DjangoProcessFinder {
 
       const portManagerProcesses = await this.findPortManagerDjangoProcesses();
       this.mergeDiscoveredProcesses(processes, portManagerProcesses);
+
+      const filteredProcesses = filterShadowedCommandDerivedDjangoProcesses(processes);
+      if (filteredProcesses.length !== processes.length) {
+        const retained = new Set(filteredProcesses);
+        const removedPids = processes
+          .filter((processInfo) => !retained.has(processInfo))
+          .map((processInfo) => processInfo.pid);
+        log(`[ProcessFinder] Removed ${removedPids.length} command-derived Django candidate(s) shadowed by verified listeners: ${removedPids.join(', ')}`);
+        processes.splice(0, processes.length, ...filteredProcesses);
+      }
 
       await this.addLoopbackAliasEndpoints(processes);
 
@@ -631,6 +784,12 @@ export class DjangoProcessFinder {
       existing.cwd = existing.cwd ?? discovered.cwd;
       existing.processGroupId = existing.processGroupId ?? discovered.processGroupId;
       existing.workerPids = uniqueSortedPids(existing.workerPids, discovered.workerPids);
+      if (existing.endpointVerified !== true && discovered.endpointVerified !== undefined) {
+        existing.endpointVerified = discovered.endpointVerified;
+      }
+      existing.networkId = existing.networkId ?? discovered.networkId;
+      existing.networkName = existing.networkName ?? discovered.networkName;
+      existing.terminalSessionId = existing.terminalSessionId ?? discovered.terminalSessionId;
       if (!existing.pythonPath || existing.pythonPath === 'python') {
         existing.pythonPath = discovered.pythonPath;
       }
@@ -643,13 +802,36 @@ export class DjangoProcessFinder {
       return [];
     }
 
-    const processes = buildPortManagerDjangoProcesses(snapshot);
+    const networkNames = await this.readPortManagerNetworkNames();
+    const processes = buildPortManagerDjangoProcesses(snapshot, networkNames);
     const celeryPidfileProcesses = await this.findPortManagerCeleryPidfileProcesses(snapshot);
     this.mergeDiscoveredProcesses(processes, celeryPidfileProcesses);
     if (processes.length > 0) {
       log(`[ProcessFinder] Port Manager snapshot contributed ${processes.length} runtime process candidate(s)`);
     }
     return processes;
+  }
+
+  private async readPortManagerNetworkNames(): Promise<Map<string, string>> {
+    const networksFile = process.env.PORT_MANAGER_NETWORKS_FILE;
+    if (!networksFile || !path.isAbsolute(networksFile)) {
+      return new Map();
+    }
+
+    try {
+      const stat = await fs.lstat(networksFile);
+      if (
+        !stat.isFile() ||
+        stat.isSymbolicLink() ||
+        stat.size > PORT_MANAGER_NETWORKS_FILE_MAX_BYTES
+      ) {
+        return new Map();
+      }
+      const content = await fs.readFile(networksFile, 'utf8');
+      return parsePortManagerNetworkNamesTsv(content);
+    } catch {
+      return new Map();
+    }
   }
 
   private async findPortManagerCeleryPidfileProcesses(snapshot: PortManagerSnapshot): Promise<DjangoProcess[]> {

@@ -22,6 +22,23 @@ const MAX_ACTIVE_FRAME_REFS = 4_096;
 const MAX_ACTIVE_VARIABLE_REFS = 4_096;
 const MAX_INSPECTION_EXPRESSION_LENGTH = 256;
 const DEFAULT_SESSION_READY_TIMEOUT_MS = 10_000;
+const DJANGO_REQUEST_BRIDGE_MODES = new Set([
+  'wsgi-sync',
+  'asgi-sync',
+  'asgi-async',
+]);
+const DJANGO_REQUEST_BRIDGE_OUTCOMES = new Set([
+  'trace-enabled',
+  'process-mismatch',
+  'tracer-disabled',
+  'session-not-configured',
+  'client-detached',
+  'interpreter-finalizing',
+  'thread-exempt',
+  'debugger-internal-thread',
+  'conflicting-trace-hook',
+  'internal-error',
+]);
 
 export interface McpToolDefinition {
   name: string;
@@ -204,7 +221,7 @@ const TOOL_DEFINITIONS: readonly McpToolDefinition[] = Object.freeze([
   },
   {
     name: 'django_targets_list',
-    description: 'List attachable Django and Celery targets in this workspace.',
+    description: 'List attachable Django and Celery targets, including verified Django listener ownership and network labels when available.',
     inputSchema: noArgumentsSchema(),
     annotations: readOnlyAnnotations(),
   },
@@ -262,7 +279,7 @@ const TOOL_DEFINITIONS: readonly McpToolDefinition[] = Object.freeze([
   },
   {
     name: 'django_breakpoints_status',
-    description: 'Read adapter verification and relocated positions for MCP-owned breakpoints.',
+    description: 'Read adapter verification, relocated positions, and experimental thread-trace coverage.',
     inputSchema: objectSchema({
       sessionRef: { type: 'string', minLength: 1 },
     }, []),
@@ -442,6 +459,14 @@ function truncate(value: unknown, maximum = MAX_TEXT_LENGTH): string | undefined
   return value.length <= maximum
     ? value
     : `${value.slice(0, Math.max(0, maximum - 1))}\u2026`;
+}
+
+function snapshotDjangoProcess(processInfo: DjangoProcess): DjangoProcess {
+  return {
+    ...processInfo,
+    workerPids: processInfo.workerPids ? [...processInfo.workerPids] : undefined,
+    endpoints: processInfo.endpoints?.map((endpoint) => ({ ...endpoint })),
+  };
 }
 
 function isPathInside(root: string, candidate: string): boolean {
@@ -736,7 +761,7 @@ export class DjangoMcpDebugController {
           sourcePid: candidatePid,
           pid: resolved.pid,
           pythonPath: resolved.pythonPath,
-          process: processInfo,
+          process: snapshotDjangoProcess(processInfo),
           folder: scope.folder,
           canonicalCwd: scope.canonicalCwd,
           isWorker,
@@ -754,6 +779,13 @@ export class DjangoMcpDebugController {
           architecture: processInfo.arch,
           isWorker,
           endpoints: this.publicEndpoints(processInfo),
+          ...(truncate(processInfo.networkName, 256)
+            ? { network: truncate(processInfo.networkName, 256) }
+            : {}),
+          ...(processInfo.type === 'django'
+            && typeof processInfo.endpointVerified === 'boolean'
+            ? { servesTraffic: processInfo.endpointVerified }
+            : {}),
           expiresAt: new Date(this.now() + this.targetTtlMs).toISOString(),
         });
       }
@@ -1076,6 +1108,14 @@ export class DjangoMcpDebugController {
         && (record.state === 'running' || record.state === 'stopped'));
     }
 
+    const traceCoverageBySession = new Map<string, Record<string, unknown>>();
+    for (const record of records) {
+      const coverage = await this.experimentalTraceCoverage(record);
+      if (coverage) {
+        traceCoverageBySession.set(record.sessionRef, coverage);
+      }
+    }
+
     const breakpoints: Array<Record<string, unknown>> = [];
     for (const entry of this.ownedBreakpoints) {
       const sessionStatuses: Array<Record<string, unknown>> = [];
@@ -1127,6 +1167,9 @@ export class DjangoMcpDebugController {
       sessions: records.map((record) => ({
         sessionRef: record.sessionRef,
         state: record.state,
+        ...(traceCoverageBySession.has(record.sessionRef)
+          ? { traceCoverage: traceCoverageBySession.get(record.sessionRef) }
+          : {}),
       })),
     };
   }
@@ -1612,8 +1655,9 @@ export class DjangoMcpDebugController {
       }
 
       const threadId = record.stoppedThreadId
-        ?? record.threadIds[0]
-        ?? await this.availableThreadId(record);
+        ?? (action === 'pause'
+          ? await this.availableThreadId(record, true, true)
+          : record.threadIds[0] ?? await this.availableThreadId(record));
       if (!threadId) {
         throw new McpControllerError(
           'THREAD_NOT_AVAILABLE',
@@ -1637,7 +1681,17 @@ export class DjangoMcpDebugController {
 
       try {
         await session.customRequest(action, { threadId });
-      } catch {
+      } catch (error) {
+        if (action === 'pause') {
+          record.threadIds = [];
+        }
+        const adapterMessage = error instanceof Error ? error.message : '';
+        if (action === 'pause' && /not trace-enabled/i.test(adapterMessage)) {
+          throw new McpControllerError(
+            'THREAD_NOT_TRACE_ENABLED',
+            'The selected thread is not trace-enabled yet. On Python 3.11 and earlier, retry after a Django request reaches the session.',
+          );
+        }
         throw new McpControllerError(
           'EXECUTION_CONTROL_FAILED',
           `The debugger rejected the ${action} request.`,
@@ -2020,6 +2074,23 @@ export class DjangoMcpDebugController {
       if (!scope
         || scope.folder.uri.toString() !== target.folder.uri.toString()
         || scope.canonicalCwd !== target.canonicalCwd) {
+        continue;
+      }
+      if (target.process.endpointVerified === true
+        && processInfo.endpointVerified !== true) {
+        continue;
+      }
+      if (target.process.networkId
+        && processInfo.networkId !== target.process.networkId) {
+        continue;
+      }
+      const originalPorts = new Set(
+        this.publicEndpoints(target.process).map((endpoint) => endpoint.port),
+      );
+      const currentPorts = new Set(
+        this.publicEndpoints(processInfo).map((endpoint) => endpoint.port),
+      );
+      if ([...originalPorts].some((port) => !currentPorts.has(port))) {
         continue;
       }
       try {
@@ -2479,17 +2550,115 @@ export class DjangoMcpDebugController {
     };
   }
 
-  private async availableThreadId(record: SessionRecord): Promise<number | undefined> {
-    if (record.threadIds.length > 0) {
+  private async availableThreadId(
+    record: SessionRecord,
+    refresh = false,
+    requireTraceEnabled = false,
+  ): Promise<number | undefined> {
+    if (!refresh && record.threadIds.length > 0) {
       return record.threadIds[0];
     }
     const response = await this.dapRequest(record, 'threads');
     const threads = isRecord(response) && Array.isArray(response.threads)
       ? response.threads
       : [];
-    record.threadIds = threads.flatMap((thread) =>
-      isRecord(thread) && isPositiveInteger(thread.id) ? [thread.id] : []);
+    const rows = threads.filter((thread): thread is Record<string, unknown> =>
+      isRecord(thread) && isPositiveInteger(thread.id));
+    const preferred = rows.filter((thread) => thread.djangoTraceEnabled === true);
+    const fallback = rows.filter((thread) => thread.djangoTraceEnabled !== true);
+    record.threadIds = [...preferred, ...fallback].map((thread) => thread.id as number);
+    const hasTraceMetadata = rows.some((thread) =>
+      typeof thread.djangoTraceEnabled === 'boolean');
+    if (requireTraceEnabled
+      && record.engine === 'experimental'
+      && hasTraceMetadata
+      && preferred.length === 0) {
+      throw new McpControllerError(
+        'THREAD_NOT_TRACE_ENABLED',
+        'No current debugger thread is trace-enabled yet. On Python 3.11 and earlier, retry after a Django request reaches the session.',
+      );
+    }
     return record.threadIds[0];
+  }
+
+  private async experimentalTraceCoverage(
+    record: SessionRecord,
+  ): Promise<Record<string, unknown> | undefined> {
+    if (record.engine !== 'experimental' || !record.session) {
+      return undefined;
+    }
+    let raw: unknown;
+    try {
+      raw = await record.session.customRequest('djangoTracerStatus') as unknown;
+    } catch {
+      return undefined;
+    }
+    if (!isRecord(raw)) {
+      return undefined;
+    }
+    const rawThreads = Array.isArray(raw.threads)
+      ? raw.threads.filter(isRecord).slice(0, MAX_THREADS)
+      : [];
+    const untracedThreadNames = rawThreads.flatMap((thread) =>
+      thread.traceEnabled === true
+        ? []
+        : [truncate(thread.name, 512) ?? '<thread>']);
+    const coverage = raw.coverage === 'all' || raw.coverage === 'partial'
+      ? raw.coverage
+      : undefined;
+    const knownThreadCount = this.optionalPublicCount(raw.knownThreadCount);
+    const traceEnabledThreadCount = this.optionalPublicCount(raw.traceEnabledThreadCount);
+    const bridgeDispatchCount = this.optionalPublicCount(
+      raw.djangoRequestBridgeDispatchCount,
+    );
+    const bridgeTraceEnableCount = this.optionalPublicCount(
+      raw.djangoRequestBridgeTraceEnableCount,
+    );
+    const djangoRequestBridgeModes = Array.isArray(raw.djangoRequestBridgeModes)
+      ? [...new Set(raw.djangoRequestBridgeModes
+        .slice(0, MAX_THREADS)
+        .filter((mode): mode is string =>
+          typeof mode === 'string' && DJANGO_REQUEST_BRIDGE_MODES.has(mode)))]
+        .slice(0, DJANGO_REQUEST_BRIDGE_MODES.size)
+      : [];
+    return {
+      ...(coverage ? { coverage } : {}),
+      ...(truncate(raw.pythonVersion, 128)
+        ? { pythonVersion: truncate(raw.pythonVersion, 128) }
+        : {}),
+      allThreadsHookInstalled: raw.allThreadsHookInstalled === true,
+      futureThreadsHookInstalled: raw.futureThreadsHookInstalled === true,
+      djangoRequestBridgeInstalled: raw.djangoRequestBridgeInstalled === true,
+      djangoRequestBridgeModes,
+      djangoRequestBridgeObserved: raw.djangoRequestBridgeObserved === true,
+      ...(bridgeDispatchCount === undefined
+        ? {}
+        : { djangoRequestBridgeDispatchCount: bridgeDispatchCount }),
+      ...(bridgeTraceEnableCount === undefined
+        ? {}
+        : { djangoRequestBridgeTraceEnableCount: bridgeTraceEnableCount }),
+      ...(typeof raw.djangoRequestBridgeLastMode === 'string'
+        && DJANGO_REQUEST_BRIDGE_MODES.has(raw.djangoRequestBridgeLastMode)
+        ? { djangoRequestBridgeLastMode: raw.djangoRequestBridgeLastMode }
+        : {}),
+      ...(truncate(raw.djangoRequestBridgeLastThreadName, 256)
+        ? { djangoRequestBridgeLastThreadName: truncate(raw.djangoRequestBridgeLastThreadName, 256) }
+        : {}),
+      ...(truncate(raw.djangoRequestBridgeLastSender, 256)
+        ? { djangoRequestBridgeLastSender: truncate(raw.djangoRequestBridgeLastSender, 256) }
+        : {}),
+      ...(typeof raw.djangoRequestBridgeLastOutcome === 'string'
+        && DJANGO_REQUEST_BRIDGE_OUTCOMES.has(raw.djangoRequestBridgeLastOutcome)
+        ? { djangoRequestBridgeLastOutcome: raw.djangoRequestBridgeLastOutcome }
+        : {}),
+      ...(typeof raw.djangoRequestBridgeLastFailureReason === 'string'
+        && DJANGO_REQUEST_BRIDGE_OUTCOMES.has(raw.djangoRequestBridgeLastFailureReason)
+        ? { djangoRequestBridgeLastFailureReason: raw.djangoRequestBridgeLastFailureReason }
+        : {}),
+      ...(knownThreadCount === undefined ? {} : { knownThreadCount }),
+      ...(traceEnabledThreadCount === undefined ? {} : { traceEnabledThreadCount }),
+      untracedThreadNames,
+    };
   }
 
   private sessionSummaries(): Array<Record<string, unknown>> {

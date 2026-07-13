@@ -81,9 +81,24 @@ assert active["clientAttached"] is False
 tracer_module.trace_this_thread(False)
 assert sys.gettrace() is None
 assert getattr(thread, tracer_module.EXEMPT_THREAD_ATTRIBUTE) is True
+setattr(thread, "pydev_do_not_trace", True)
+try:
+    tracer_module.trace_this_thread(True)
+except RuntimeError as error:
+    assert "pydev_do_not_trace" in str(error)
+else:
+    raise AssertionError("pydev-exempt thread was marked trace-enabled")
+assert sys.gettrace() is None
+assert getattr(thread, tracer_module.EXEMPT_THREAD_ATTRIBUTE) is True
+delattr(thread, "pydev_do_not_trace")
 tracer_module.trace_this_thread(True)
 assert getattr(sys.gettrace(), "__self__", None) is tracer_module._ACTIVE_TRACER
 assert getattr(thread, tracer_module.EXEMPT_THREAD_ATTRIBUTE) is False
+native_id = threading.get_ident()
+assert tracer_module._ACTIVE_TRACER._thread_trace_enabled(native_id, thread)
+setattr(thread, "pydev_do_not_trace", True)
+assert not tracer_module._ACTIVE_TRACER._thread_trace_enabled(native_id, thread)
+delattr(thread, "pydev_do_not_trace")
 tracer_module.trace_this_thread(False)
 
 try:

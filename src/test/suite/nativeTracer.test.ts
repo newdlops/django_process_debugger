@@ -1140,6 +1140,253 @@ describe('Feature: dependency-free experimental DAP tracer', function () {
     assert.ok(outputLines.includes('RESULT=200'));
   });
 
+  it('traces a pre-existing ASGI loop from the Django request boundary', async function () {
+    this.timeout(25_000);
+    const python = await findSystemPython();
+    if (!python) {
+      this.skip();
+      return;
+    }
+
+    const fixture = path.join(fixturesDir(), 'native_dap_existing_asgi_target.py');
+    const source = await fs.readFile(fixture, 'utf8');
+    const breakpointLine = source.split(/\r?\n/)
+      .findIndex((line) => line.includes('# ASGI_BREAKPOINT')) + 1;
+    assert.ok(breakpointLine > 0);
+
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      PORT_MANAGER_HOOK: '0',
+      PORT_MANAGER_HOOK_DISABLED: '1',
+    };
+    delete env.DYLD_INSERT_LIBRARIES;
+    delete env.LD_PRELOAD;
+    target = spawn(python, [fixture, path.join(projectRoot(), 'python')], {
+      env,
+      cwd: fixturesDir(),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let targetErrors = '';
+    target.stderr.on('data', (chunk: Buffer) => {
+      targetErrors += chunk.toString();
+    });
+    const output = readline.createInterface({ input: target.stdout });
+    const info = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('ASGI target did not publish endpoint')), 8_000);
+      output.once('line', (line) => {
+        clearTimeout(timer);
+        resolve(JSON.parse(line) as Record<string, unknown>);
+      });
+      target?.once('exit', (code, signal) => {
+        clearTimeout(timer);
+        reject(new Error(
+          `ASGI target exited early: code=${code} signal=${signal}`
+            + (targetErrors ? ` stderr=${targetErrors.trim()}` : ''),
+        ));
+      });
+    });
+    const outputLines: string[] = [];
+    output.on('line', (line) => outputLines.push(line));
+    const waitForOutput = async (expected: string): Promise<void> => {
+      const deadline = Date.now() + 10_000;
+      while (!outputLines.includes(expected)) {
+        if (target?.exitCode !== null || target?.signalCode) {
+          throw new Error(
+            `ASGI target exited before ${expected}`
+              + (targetErrors ? `: ${targetErrors.trim()}` : ''),
+          );
+        }
+        if (Date.now() >= deadline) {
+          throw new Error(
+            `Timed out waiting for ${expected}; output=${outputLines.join(' | ')}`,
+          );
+        }
+        await sleep(10);
+      }
+    };
+
+    client = await RawDapClient.connect(String(info.host), Number(info.port));
+    const initialize = client.request('initialize', { adapterID: 'django-process' });
+    assert.strictEqual((await client.response(initialize)).success, true);
+    const attach = client.request('attach', {
+      request: 'attach',
+      [DAP_AUTH_TOKEN_KEY]: String(info.authToken),
+    });
+    await client.event('initialized');
+
+    const setBreakpoints = client.request('setBreakpoints', {
+      source: { path: fixture },
+      breakpoints: [{ line: breakpointLine }],
+    });
+    const breakpointResponse = await client.response(setBreakpoints);
+    const breakpoint = (breakpointResponse.body?.breakpoints as Array<Record<string, unknown>>)[0];
+    assert.strictEqual(breakpoint.verified, true);
+    assert.strictEqual(breakpoint.line, breakpointLine);
+    const breakpointId = Number(breakpoint.id);
+    assert.ok(breakpointId > 0);
+
+    const exceptions = client.request('setExceptionBreakpoints', { filters: [] });
+    assert.strictEqual((await client.response(exceptions)).success, true);
+    const configurationDone = client.request('configurationDone');
+    assert.strictEqual((await client.response(configurationDone)).success, true);
+    assert.strictEqual((await client.response(attach)).success, true);
+
+    const initialStatusRequest = client.request('djangoTracerStatus');
+    const initialStatus = (await client.response(initialStatusRequest)).body as Record<string, unknown>;
+    assert.strictEqual(initialStatus.djangoRequestBridgeInstalled, true);
+    assert.strictEqual(initialStatus.allThreadsHookInstalled, false);
+    assert.strictEqual(initialStatus.futureThreadsHookInstalled, true);
+    assert.deepStrictEqual(initialStatus.djangoRequestBridgeModes, ['asgi-sync', 'asgi-async']);
+    assert.strictEqual(initialStatus.djangoRequestBridgeObserved, false);
+    assert.strictEqual(initialStatus.djangoRequestBridgeDispatchCount, 0);
+    assert.strictEqual(initialStatus.djangoRequestBridgeTraceEnableCount, 0);
+    assert.strictEqual(initialStatus.djangoRequestBridgeLastMode, null);
+    assert.strictEqual(initialStatus.djangoRequestBridgeLastThreadName, null);
+    assert.strictEqual(initialStatus.djangoRequestBridgeLastSender, null);
+    assert.strictEqual(initialStatus.djangoRequestBridgeLastOutcome, null);
+    assert.strictEqual(initialStatus.djangoRequestBridgeLastFailureReason, null);
+    const initialThreads = initialStatus.threads as Array<Record<string, unknown>>;
+    const existingLoop = initialThreads.find((thread) => thread.name === 'preexisting-asgi-loop');
+    assert.ok(existingLoop, 'pre-existing ASGI loop must be visible before its first request');
+    assert.strictEqual(existingLoop.traceEnabled, false);
+
+    const threadsRequest = client.request('threads');
+    const threads = (await client.response(threadsRequest)).body
+      ?.threads as Array<Record<string, unknown>>;
+    const existingDapThread = threads.find((thread) => thread.name === 'preexisting-asgi-loop');
+    assert.ok(existingDapThread);
+    assert.strictEqual(existingDapThread.djangoTraceEnabled, false);
+    const prematurePause = client.request('pause', { threadId: existingDapThread.id });
+    const pauseResponse = await client.response(prematurePause);
+    assert.strictEqual(pauseResponse.success, false);
+    assert.match(String(pauseResponse.message), /not trace-enabled/i);
+
+    // Reconfiguring exception filters must not orphan or clear the unrelated
+    // request bridge. This caught a lifecycle bug hidden by simplistic signal
+    // fakes that replaced duplicate dispatch UIDs.
+    const reconfigureExceptions = client.request('setExceptionBreakpoints', { filters: [] });
+    assert.strictEqual((await client.response(reconfigureExceptions)).success, true);
+    const reconfiguredStatusRequest = client.request('djangoTracerStatus');
+    const reconfiguredStatus = (await client.response(reconfiguredStatusRequest)).body as
+      Record<string, unknown>;
+    assert.strictEqual(reconfiguredStatus.djangoRequestBridgeInstalled, true);
+    assert.deepStrictEqual(reconfiguredStatus.djangoRequestBridgeModes, ['asgi-sync', 'asgi-async']);
+
+    target.stdin.write('CONFLICT\n');
+    await waitForOutput('DONE=conflict');
+    const conflictStatusRequest = client.request('djangoTracerStatus');
+    const conflictStatus = (await client.response(conflictStatusRequest)).body as
+      Record<string, unknown>;
+    assert.strictEqual(conflictStatus.djangoRequestBridgeObserved, true);
+    assert.strictEqual(conflictStatus.djangoRequestBridgeDispatchCount, 2);
+    assert.strictEqual(conflictStatus.djangoRequestBridgeTraceEnableCount, 1);
+    assert.strictEqual(conflictStatus.djangoRequestBridgeLastMode, 'asgi-async');
+    assert.strictEqual(
+      conflictStatus.djangoRequestBridgeLastThreadName,
+      'preexisting-asgi-loop',
+    );
+    assert.strictEqual(
+      conflictStatus.djangoRequestBridgeLastSender,
+      '__main__.ASGIHandler',
+    );
+    assert.strictEqual(
+      conflictStatus.djangoRequestBridgeLastOutcome,
+      'conflicting-trace-hook',
+    );
+    assert.strictEqual(
+      conflictStatus.djangoRequestBridgeLastFailureReason,
+      'conflicting-trace-hook',
+    );
+
+    target.stdin.write('GO\n');
+
+    const stopped = await client.event('stopped');
+    assert.strictEqual(stopped.body?.reason, 'breakpoint');
+    assert.strictEqual(stopped.body?.allThreadsStopped, false);
+    assert.deepStrictEqual(stopped.body?.hitBreakpointIds, [breakpointId]);
+    const threadId = Number(stopped.body?.threadId);
+    assert.ok(threadId > 0);
+
+    const threadsAfterStopRequest = client.request('threads');
+    const threadsAfterStop = (await client.response(threadsAfterStopRequest)).body
+      ?.threads as Array<Record<string, unknown>>;
+    const tracedLoop = threadsAfterStop.find((thread) => thread.id === threadId);
+    assert.strictEqual(tracedLoop?.name, 'preexisting-asgi-loop');
+    assert.strictEqual(tracedLoop?.djangoTraceEnabled, true);
+
+    const observedStatusRequest = client.request('djangoTracerStatus');
+    const observedStatus = (await client.response(observedStatusRequest)).body as
+      Record<string, unknown>;
+    assert.strictEqual(observedStatus.djangoRequestBridgeObserved, true);
+    assert.strictEqual(observedStatus.djangoRequestBridgeDispatchCount, 4);
+    assert.strictEqual(observedStatus.djangoRequestBridgeTraceEnableCount, 3);
+    assert.strictEqual(observedStatus.djangoRequestBridgeLastMode, 'asgi-async');
+    assert.strictEqual(
+      observedStatus.djangoRequestBridgeLastThreadName,
+      'preexisting-asgi-loop',
+    );
+    assert.strictEqual(
+      observedStatus.djangoRequestBridgeLastSender,
+      '__main__.ASGIHandler',
+    );
+    assert.strictEqual(observedStatus.djangoRequestBridgeLastOutcome, 'trace-enabled');
+    assert.strictEqual(
+      observedStatus.djangoRequestBridgeLastFailureReason,
+      'conflicting-trace-hook',
+    );
+
+    const stackRequest = client.request('stackTrace', { threadId });
+    const stack = (await client.response(stackRequest)).body
+      ?.stackFrames as Array<Record<string, unknown>>;
+    assert.strictEqual(stack[0].line, breakpointLine);
+    assert.strictEqual((stack[0].source as Record<string, unknown>).path, fixture);
+
+    const continueRequest = client.request('continue', { threadId });
+    assert.strictEqual((await client.response(continueRequest)).success, true);
+    await waitForOutput('DONE=pass');
+
+    const disconnect = client.request('disconnect');
+    assert.strictEqual((await client.response(disconnect)).success, true);
+    await client.event('terminated');
+    target.stdin.write('STATUS\n');
+    await waitForOutput('RECEIVERS=0');
+
+    client.close();
+    client = await RawDapClient.connect(String(info.host), Number(info.port));
+    const reinitialize = client.request('initialize', { adapterID: 'django-process' });
+    assert.strictEqual((await client.response(reinitialize)).success, true);
+    const reattach = client.request('attach', {
+      request: 'attach',
+      [DAP_AUTH_TOKEN_KEY]: String(info.authToken),
+    });
+    await client.event('initialized');
+    const secondExceptions = client.request('setExceptionBreakpoints', { filters: [] });
+    assert.strictEqual((await client.response(secondExceptions)).success, true);
+    const secondConfigurationDone = client.request('configurationDone');
+    assert.strictEqual((await client.response(secondConfigurationDone)).success, true);
+    assert.strictEqual((await client.response(reattach)).success, true);
+
+    const resetStatusRequest = client.request('djangoTracerStatus');
+    const resetStatus = (await client.response(resetStatusRequest)).body as
+      Record<string, unknown>;
+    assert.strictEqual(resetStatus.djangoRequestBridgeInstalled, true);
+    assert.strictEqual(resetStatus.futureThreadsHookInstalled, true);
+    assert.strictEqual(resetStatus.djangoRequestBridgeObserved, false);
+    assert.strictEqual(resetStatus.djangoRequestBridgeDispatchCount, 0);
+    assert.strictEqual(resetStatus.djangoRequestBridgeTraceEnableCount, 0);
+    assert.strictEqual(resetStatus.djangoRequestBridgeLastMode, null);
+    assert.strictEqual(resetStatus.djangoRequestBridgeLastThreadName, null);
+    assert.strictEqual(resetStatus.djangoRequestBridgeLastSender, null);
+    assert.strictEqual(resetStatus.djangoRequestBridgeLastOutcome, null);
+    assert.strictEqual(resetStatus.djangoRequestBridgeLastFailureReason, null);
+
+    const secondDisconnect = client.request('disconnect');
+    assert.strictEqual((await client.response(secondDisconnect)).success, true);
+    await client.event('terminated');
+    target.stdin.write('QUIT\n');
+  });
+
   it('stops on raised and uncaught exceptions and serves safe exception details', async function () {
     this.timeout(40_000);
     const python = await findSystemPython();

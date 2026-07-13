@@ -78,7 +78,7 @@ The generated configuration executes the project-local `.django-process-debugger
 The MCP server exposes a deliberately debugger-specific surface:
 
 - inspect the window, setup, and active-session status
-- list only Django/Celery targets whose working directory belongs to this workspace
+- list only Django/Celery targets whose working directory belongs to this workspace, preferring verified traffic listeners over duplicate command-only runserver processes
 - attach through the normal `django-process` debug-session path
 - add and remove MCP-owned breakpoints without replacing user breakpoints
 - wait for session readiness or stops, and report breakpoint verification per live session
@@ -88,7 +88,7 @@ The MCP server exposes a deliberately debugger-specific surface:
 
 MCP clients never receive the target control socket, DAP authentication credential, or hot-reload lease token. Target selection uses short-lived opaque references instead of accepting arbitrary PIDs, and frame/variable references expire as soon as execution resumes. Runtime setup, process killing, cleanup, `Set Variable`, and arbitrary DAP requests are not exposed. By default, conditional/log breakpoints and expression inspection are also blocked. If `mcp.allowEvaluate` is enabled, breakpoint conditions and log messages may use general debugger expressions; `django_expression_inspect` remains limited to identifier/attribute/literal-index paths and still rejects calls, operators, assignments, and dunder access.
 
-A typical client flow is `django_targets_list` → `django_breakpoints_update` → `django_session_start` → `django_session_wait_ready` → `django_execution_wait` → `django_state_snapshot` or `django_request_context` → `django_execution_control`. `django_breakpoints_status` verifies live adapter breakpoints, `django_failure_snapshot` summarizes a stopped failure, and `django_variables_expand` traverses opaque variable references. In total, the endpoint publishes 13 focused tools.
+A typical client flow is `django_targets_list` → `django_breakpoints_update` → `django_session_start` → `django_session_wait_ready` → `django_execution_wait` → `django_state_snapshot` or `django_request_context` → `django_execution_control`. Target rows report verified traffic-listener state and a Port Manager network label when one is available, without exposing a PID. `django_breakpoints_status` verifies live adapter breakpoints, `django_failure_snapshot` summarizes a stopped failure, and `django_variables_expand` traverses opaque variable references. In total, the endpoint publishes 13 focused tools.
 
 If the same project is open in more than one VS Code window, launch the agent from the desired window's integrated terminal so the bridge receives that window's identity. The bridge fails rather than choosing an ambiguous window. Multi-root windows use all workspace folders as their access boundary.
 
@@ -144,7 +144,9 @@ Changing the setting affects new sessions only. Both engines retain process-leve
 
 The experimental DAP listener requires a random 256-bit process credential in its `attach` request. The credential is carried only through private runtime files/session configuration, is compared using a fixed-size digest, and is omitted from debugger logs and the tracer status API. The stable debugpy protocol is unchanged.
 
-On Python 3.11 and earlier, pure `sys.settrace` cannot immediately install tracing into every already-running non-main thread. The experimental backend guarantees the current/main thread that handles activation and threads created after activation; broader existing-thread support is still under development. It also refuses activation when another coverage/debug/profiling trace hook is already installed instead of replacing that hook.
+On Python 3.11 and earlier, `sys.settrace` cannot retrofit arbitrary already-running threads. Threads created after activation are covered. For threads that already exist, the experimental backend cooperatively enables standard WSGI request threads at the next `request_started` boundary on Django 4.x/5.x, and persistent ASGI event-loop threads on Django 5+ where asynchronous signal dispatch is available. On Django 4.x ASGI, synchronous worker code may be covered, but an event-loop thread created before activation can remain untraced. Other pre-existing service threads may also remain untraced. `django_breakpoints_status.sessions[].traceCoverage` is a bounded snapshot of currently known live threads, separate from source-line verification. The tracer also refuses to replace another coverage/debug/profiling trace hook.
+
+Within `traceCoverage`, `coverage: "all"` means all threads known in that snapshot are believed trace-enabled; it is not a lifetime guarantee for future, native, or subsequently modified threads. `knownThreadCount` and `traceEnabledThreadCount` are snapshot counts. `djangoRequestBridgeModes` reports installed receiver paths such as `wsgi-sync` and `asgi-async`; the request-bridge observation fields separately report whether a receiver actually ran and enabled tracing. `untracedThreadNames` is bounded and may be incomplete.
 
 ### Debug Attach
 
@@ -240,7 +242,8 @@ You can select **any** process in the tree — the extension walks down to the d
 - `justMyCode` filtering and Debug Console output redirection are not implemented by the experimental tracer yet.
 - Stop the current session before changing engines, then restart the target process before attaching it with the other engine.
 - The experimental trace hook remains installed for same-engine reattach after disconnect. Restart the target process to remove its tracing overhead completely.
-- On Python 3.11 and earlier, a thread that was already running before attach may not be traced until broader existing-thread support is implemented.
+- On Python 3.11 and earlier, standard WSGI request threads become trace-enabled at their next request-started boundary. Persistent ASGI event-loop threads receive the same bridge on Django 5+; a Django 4.x ASGI loop that predates activation may remain untraced. Inspect `django_breakpoints_status.sessions[].traceCoverage` when using MCP.
+- A breakpoint marked `verified` has resolved to an executable source line. It does not by itself prove that every process thread is trace-enabled.
 - The experimental backend will not replace an existing `sys.settrace`/`threading.settrace` hook. Stop the other coverage, profiler, or debugger integration and restart the target first.
 
 ### Hot reload not reflecting changes

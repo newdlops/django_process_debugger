@@ -24,7 +24,7 @@ const TRACER_SOURCE_PATH = path.resolve(
   'python',
   'django_process_debugger_tracer.py',
 );
-export const BOOTSTRAP_VERSION = '2026.07.11.4';
+export const BOOTSTRAP_VERSION = '2026.07.13.2';
 export type DebugpyEndpoint = TcpListeningEndpoint & { authToken?: string };
 const ACTIVE_ENDPOINT_RECORD_VERSION = 3;
 type BootstrapRuntimeState = {
@@ -1244,6 +1244,7 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                daemon=True,',
     '                name="django-debug-activation",',
     '            )',
+    '            _thread.django_debugger_do_not_trace = True',
     '            _thread.start()',
     '            _dbg_log(f"Private activation control socket listening: {_control_socket_path}")',
     '',

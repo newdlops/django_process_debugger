@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.2.914] - 2026-07-13
+
+### Fixed
+- Django target discovery now distinguishes verified listeners from command-derived endpoints. When an autoreload or duplicate runserver candidate does not own traffic and a verified listener exists for the same project and port, only the traffic-serving target is offered for attach.
+- Loopback relay endpoints are no longer copied by port alone across ambiguous Django targets from different Port Manager networks. Network identity is retained internally, exposed as a bounded target label, and revalidated with listener and port provenance immediately before an MCP attach.
+
+### Added
+- Experimental trace coverage now distinguishes a future-thread hook and an installed Django request bridge from request-boundary dispatches and successful per-thread trace activation.
+
+### Tests
+- Added regressions for duplicate same-project runservers, cross-network relay ambiguity, Port Manager network metadata, MCP route revalidation, and request-bridge observation diagnostics.
+
+### Runtime
+- Bootstrap/tracer version bumped to `2026.07.13.2`; running Django, Daphne, Celery, and shell targets must restart after setup to load the expanded tracer diagnostics.
+
+## [0.2.913] - 2026-07-13
+
+### Fixed
+- On Python 3.11 and earlier, the experimental tracer now opts already-running standard WSGI request threads into tracing at `request_started`; on Django 5+, an ASGI-scoped async receiver also covers persistent Daphne/ASGI event-loop threads before middleware and views execute. Django 4.x ASGI event loops created before activation remain an explicit limitation.
+- Experimental pause now rejects a known untraced thread instead of returning a success that can never produce a stopped event. MCP prefers trace-enabled threads and reports `THREAD_NOT_TRACE_ENABLED` when no selected thread can currently honor pause.
+- The bootstrap activation service thread is explicitly excluded from application tracing.
+
+### Added
+- `django_breakpoints_status` now includes a bounded known-live-thread snapshot: Python version, all-thread-hook/request-bridge state and modes, traced and known thread counts, and untraced thread names without exposing DAP thread IDs.
+
+### Tests
+- Added a forced Python 3.11-style regression target with a Django 5-style ASGI event loop created before tracer activation, proving sender-scoped request-boundary installation and cleanup, source verification, breakpoint halt, stack inspection, continue, and explicit pre-boundary pause rejection.
+
+### Runtime
+- Bootstrap/tracer version bumped to `2026.07.13.1`; running Django, Daphne, Celery, and shell targets must restart after setup so the request-boundary integration is loaded.
+
 ## [0.2.912] - 2026-07-13
 
 ### Fixed
