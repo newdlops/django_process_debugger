@@ -156,6 +156,140 @@ describe('Feature: window-scoped Django MCP debug controller', function () {
     assert.strictEqual(failureCode(expired), 'TARGET_EXPIRED');
   });
 
+  it('terminates an MCP session immediately when DAP attach is rejected before ready', async function () {
+    const processInfo: DjangoProcess = {
+      pid: 401,
+      command: 'python manage.py runserver',
+      pythonPath: 'python',
+      arch: process.arch,
+      type: 'django',
+      cwd: fixturesRoot,
+    };
+    const finder: DjangoProcessFinderLike = {
+      async findDjangoProcesses() { return [processInfo]; },
+      async resolveDebuggablePid(pid) { return { pid, pythonPath: 'python' }; },
+    };
+    let failedSession!: vscode.DebugSession;
+    const controller = new DjangoMcpDebugController({
+      processFinder: finder,
+      getWorkspaceFolders: () => [fixtureFolder()],
+      startDebugging: async (_folder, configuration) => {
+        failedSession = mockSession('pre-start-attach-failure', configuration, async () => ({}));
+        controller.handleDapMessage(failedSession, {
+          type: 'response',
+          command: 'initialize',
+          success: true,
+        });
+        controller.handleDapMessage(failedSession, {
+          type: 'response',
+          command: 'attach',
+          success: false,
+        });
+        return true;
+      },
+    });
+
+    const listed = success(await controller.callTool('django_targets_list', {}));
+    const targetRef = (listed.targets as Array<Record<string, unknown>>)[0].targetRef;
+    const started = success(await controller.callTool('django_session_start', { targetRef }));
+    assert.strictEqual(started.state, 'terminated');
+
+    const ready = success(await controller.callTool('django_session_wait_ready', {
+      sessionRef: started.sessionRef,
+      timeoutMs: 10_000,
+    }));
+    assert.strictEqual(ready.ready, false);
+    assert.strictEqual(ready.terminated, true);
+    assert.strictEqual(ready.timedOut, false);
+
+    // Late lifecycle delivery must not move the failed session back to running.
+    controller.handleSessionStarted(failedSession);
+    controller.handleDapMessage(failedSession, {
+      type: 'event',
+      event: 'stopped',
+      body: { reason: 'late-breakpoint', threadId: 99 },
+    });
+    const afterLateStart = success(await controller.callTool('django_session_wait_ready', {
+      sessionRef: started.sessionRef,
+      timeoutMs: 0,
+    }));
+    assert.strictEqual(afterLateStart.state, 'terminated');
+  });
+
+  it('removes reentrantly bound MCP indexes when VS Code rejects or throws during start', async function () {
+    for (const outcome of ['false', 'throw'] as const) {
+      const processInfo: DjangoProcess = {
+        pid: outcome === 'false' ? 402 : 403,
+        command: 'python manage.py runserver',
+        pythonPath: 'python',
+        arch: process.arch,
+        type: 'django',
+        cwd: fixturesRoot,
+      };
+      const finder: DjangoProcessFinderLike = {
+        async findDjangoProcesses() { return [processInfo]; },
+        async resolveDebuggablePid(pid) { return { pid, pythonPath: 'python' }; },
+      };
+      let reentrantSession!: vscode.DebugSession;
+      let rejectedWaiterNotified = false;
+      const controller = new DjangoMcpDebugController({
+        processFinder: finder,
+        getWorkspaceFolders: () => [fixtureFolder()],
+        startDebugging: async (_folder, configuration) => {
+          reentrantSession = mockSession(`reentrant-${outcome}`, configuration, async () => ({}));
+          controller.handleDapMessage(reentrantSession, {
+            type: 'response',
+            command: 'initialize',
+            success: true,
+          });
+          controller.handleDapMessage(reentrantSession, {
+            type: 'event',
+            event: 'stopped',
+            body: { reason: 'reentrant-breakpoint', threadId: 7 },
+          });
+          const boundRecord = [...(controller as unknown as {
+            sessionsById: Map<string, { waiters: Set<() => void> }>;
+          }).sessionsById.values()][0];
+          assert.ok(boundRecord);
+          boundRecord.waiters.add(() => { rejectedWaiterNotified = true; });
+          if (outcome === 'throw') {
+            throw new Error('synthetic VS Code rejection');
+          }
+          return false;
+        },
+      });
+
+      const listed = success(await controller.callTool('django_targets_list', {}));
+      const targetRef = (listed.targets as Array<Record<string, unknown>>)[0].targetRef;
+      const rejected = await controller.callTool('django_session_start', { targetRef });
+      assert.strictEqual(
+        failureCode(rejected),
+        outcome === 'throw' ? 'SESSION_START_FAILED' : 'SESSION_START_REJECTED',
+      );
+      const internals = controller as unknown as {
+        sessions: Map<string, unknown>;
+        sessionsById: Map<string, unknown>;
+        stops: Map<string, unknown>;
+        frames: Map<string, unknown>;
+        variables: Map<string, unknown>;
+      };
+      assert.strictEqual(internals.sessions.size, 0);
+      assert.strictEqual(internals.sessionsById.size, 0);
+      assert.strictEqual(internals.stops.size, 0);
+      assert.strictEqual(internals.frames.size, 0);
+      assert.strictEqual(internals.variables.size, 0);
+      assert.strictEqual(rejectedWaiterNotified, true);
+      controller.handleDapMessage(reentrantSession, {
+        type: 'event',
+        event: 'stopped',
+        body: { reason: 'late-breakpoint', threadId: 99 },
+      });
+      assert.strictEqual(internals.sessions.size, 0);
+      assert.strictEqual(internals.sessionsById.size, 0);
+      assert.strictEqual(internals.stops.size, 0);
+    }
+  });
+
   it('consumes target refs atomically and revalidates workspace identity before attach', async function () {
     const processInfo: DjangoProcess = {
       pid: 411,

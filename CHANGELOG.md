@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.912] - 2026-07-13
+
+### Fixed
+- Experimental sessions now activate and publish their private DAP credential during debug-configuration resolution, before VS Code snapshots the attach arguments. MCP and direct `launch.json` sessions no longer reach the tracer with a missing credential, and descriptor creation rejects a target generation that changes between configuration and connection.
+- Failed `initialize`, `attach`, or `configurationDone` startup now permanently abandons the exact PID-lock generation instead of leaving a pending in-window claim. Tracker error/exit and late lifecycle events share an idempotent cleanup path, and an immediate retry on the same live PID waits for guarded cleanup rather than the pending-lock TTL.
+- MCP sessions whose adapter rejects startup now transition to `terminated` immediately instead of timing out in `starting`; reentrant `startDebugging` rejection/throw paths remove both session indexes, and late DAP messages cannot revive retired session references.
+- Dynamic `port: 0` activation is logged as a newly selected endpoint instead of misleadingly claiming that an existing endpoint was reused.
+
+### Tests
+- Added a real VS Code experimental-session E2E covering authenticated attach, forced post-descriptor authentication failure, lock cleanup, immediate same-PID retry, disconnect, and existing-endpoint reuse.
+
 ## [0.2.911] - 2026-07-12
 
 ### Added

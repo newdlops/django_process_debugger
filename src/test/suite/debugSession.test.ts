@@ -5,6 +5,7 @@ import {
   DEBUG_SESSION_AUTH_TOKEN_KEY,
   DEBUG_SESSION_LOCK_TOKEN_KEY,
   DebugSessionLockGuard,
+  DjangoDebugConfigurationProvider,
   DjangoDebugSessionFactory,
   parseDebugSessionPid,
 } from '../../debugSession';
@@ -51,6 +52,76 @@ describe('Feature: debug session configuration', function () {
     assert.strictEqual(activateCalled, false);
   });
 
+  it('publishes experimental DAP authentication before VS Code snapshots the session', async function () {
+    const injector = {
+      async activateEndpoint(pid: number, port: number, engine: string) {
+        assert.deepStrictEqual([pid, port, engine], [43210, 0, 'experimental']);
+        return {
+          host: '127.0.0.7',
+          port: 45678,
+          authToken: EXPERIMENTAL_AUTH_TOKEN,
+        };
+      },
+    } as unknown as DebugpyInjector;
+    const provider = new DjangoDebugConfigurationProvider(injector, () => 'experimental');
+    const configuration: vscode.DebugConfiguration = {
+      type: 'django-process',
+      request: 'attach',
+      name: 'MCP experimental attach',
+      pid: 43210,
+      port: 0,
+    };
+
+    const resolved = await provider.resolveDebugConfigurationWithSubstitutedVariables(
+      undefined,
+      configuration,
+    );
+
+    assert.strictEqual(resolved, configuration);
+    assert.strictEqual(configuration.engine, 'experimental');
+    assert.strictEqual(configuration.host, '127.0.0.7');
+    assert.strictEqual(configuration.port, 45678);
+    assert.strictEqual(
+      configuration[DEBUG_SESSION_AUTH_TOKEN_KEY],
+      EXPERIMENTAL_AUTH_TOKEN,
+    );
+    assert.match(configuration[DEBUG_SESSION_LOCK_TOKEN_KEY], /^config:/);
+    const mainThreadSnapshot = JSON.parse(JSON.stringify(configuration));
+    assert.strictEqual(
+      mainThreadSnapshot[DEBUG_SESSION_AUTH_TOKEN_KEY],
+      EXPERIMENTAL_AUTH_TOKEN,
+      'the credential must exist before the descriptor-factory RPC copy is made',
+    );
+  });
+
+  it('prepares stable sessions with durable lock ownership and no DAP credential', async function () {
+    let activateCalled = false;
+    const injector = {
+      async activateEndpoint() {
+        activateCalled = true;
+        throw new Error('debugpy must remain descriptor-activated');
+      },
+    } as unknown as DebugpyInjector;
+    const provider = new DjangoDebugConfigurationProvider(injector, () => 'debugpy');
+    const configuration: vscode.DebugConfiguration = {
+      type: 'django-process',
+      request: 'attach',
+      name: 'debugpy attach',
+      pid: 43210,
+      [DEBUG_SESSION_AUTH_TOKEN_KEY]: EXPERIMENTAL_AUTH_TOKEN,
+    };
+
+    const resolved = await provider.resolveDebugConfigurationWithSubstitutedVariables(
+      undefined,
+      configuration,
+    );
+
+    assert.strictEqual(resolved, configuration);
+    assert.strictEqual(activateCalled, false);
+    assert.strictEqual(configuration[DEBUG_SESSION_AUTH_TOKEN_KEY], undefined);
+    assert.match(configuration[DEBUG_SESSION_LOCK_TOKEN_KEY], /^config:/);
+  });
+
   it('activates the selected engine and uses the configured default when omitted', async function () {
     let activation: unknown[] | undefined;
     const injector = {
@@ -68,7 +139,11 @@ describe('Feature: debug session configuration', function () {
       id: 'experimental-engine-test',
       type: 'django-process',
       name: 'Experimental PID',
-      configuration: { pid: 43210, port: 0 },
+      configuration: {
+        pid: 43210,
+        port: 0,
+        [DEBUG_SESSION_AUTH_TOKEN_KEY]: EXPERIMENTAL_AUTH_TOKEN,
+      },
     } as unknown as vscode.DebugSession;
 
     const descriptor = await factory.createDebugAdapterDescriptor(session);
@@ -135,6 +210,7 @@ describe('Feature: debug session configuration', function () {
         pid: 43210,
         port: 0,
         [DEBUG_SESSION_LOCK_TOKEN_KEY]: ownerToken,
+        [DEBUG_SESSION_AUTH_TOKEN_KEY]: EXPERIMENTAL_AUTH_TOKEN,
       },
     } as unknown as vscode.DebugSession;
 
@@ -167,13 +243,56 @@ describe('Feature: debug session configuration', function () {
       id: 'missing-experimental-auth-test',
       type: 'django-process',
       name: 'Missing Auth',
-      configuration: { pid: 43210, port: 0 },
+      configuration: {
+        pid: 43210,
+        port: 0,
+        [DEBUG_SESSION_AUTH_TOKEN_KEY]: EXPERIMENTAL_AUTH_TOKEN,
+      },
     } as unknown as vscode.DebugSession;
 
     assert.strictEqual(await factory.createDebugAdapterDescriptor(session), null);
     assert.strictEqual(
       session.configuration[DEBUG_SESSION_AUTH_TOKEN_KEY],
-      undefined,
+      EXPERIMENTAL_AUTH_TOKEN,
+    );
+  });
+
+  it('releases the PID lock when the endpoint generation changes after configuration', async function () {
+    let released = false;
+    const injector = {
+      async activateEndpoint() {
+        return {
+          host: '127.0.0.2',
+          port: 45678,
+          authToken: 'b'.repeat(64),
+        };
+      },
+    } as unknown as DebugpyInjector;
+    const guard: DebugSessionLockGuard = {
+      async claim() {
+        return {
+          allowed: true,
+          release() { released = true; },
+        };
+      },
+    };
+    const factory = new DjangoDebugSessionFactory(injector, () => 'experimental', guard);
+    const session = {
+      id: 'changed-endpoint-generation-test',
+      type: 'django-process',
+      name: 'Changed endpoint generation',
+      configuration: {
+        pid: 43210,
+        port: 0,
+        [DEBUG_SESSION_AUTH_TOKEN_KEY]: EXPERIMENTAL_AUTH_TOKEN,
+      },
+    } as unknown as vscode.DebugSession;
+
+    assert.strictEqual(await factory.createDebugAdapterDescriptor(session), null);
+    assert.strictEqual(released, true);
+    assert.strictEqual(
+      session.configuration[DEBUG_SESSION_AUTH_TOKEN_KEY],
+      EXPERIMENTAL_AUTH_TOKEN,
     );
   });
 

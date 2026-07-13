@@ -31,6 +31,7 @@ import {
   DEBUG_SESSION_LOCK_TOKEN_KEY,
   DebugSessionLockGuard,
   DebugSessionLockTarget,
+  DjangoDebugConfigurationProvider,
   DjangoDebugSessionFactory,
   ensureDebugSessionLockToken,
 } from './debugSession';
@@ -336,6 +337,114 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
     ownerToken: string;
   }
   const claimedSessionsByPid = new Map<number, InMemorySessionClaim>();
+  const pendingPidOwnershipFinalizations = new Map<number, Promise<void>>();
+  const pausedSessions = new Set<string>();
+  const effectiveSessionEngines = new Map<string, DebugEngine>();
+  const adapterReadySessions = new WeakSet<vscode.DebugSession>();
+  const adapterStartupFailedSessions = new WeakSet<vscode.DebugSession>();
+  const debugSessionFinalizations = new WeakMap<vscode.DebugSession, Promise<void>>();
+
+  async function waitForPendingPidOwnershipFinalization(pid: number): Promise<void> {
+    await pendingPidOwnershipFinalizations.get(pid);
+  }
+
+  /**
+   * Permanently abandon one exact owner generation. Unlike the claim guard's
+   * activation rollback, this never restores a provisional lock after DAP
+   * startup has failed.
+   */
+  function abandonPidOwnership(
+    pid: number,
+    sessionId: string | undefined,
+    ownerToken: string | undefined,
+    reason: string,
+  ): Promise<boolean> {
+    if (!ownerToken) {
+      return Promise.resolve(false);
+    }
+
+    const memoryClaim = claimedSessionsByPid.get(pid);
+    if (memoryClaim?.ownerToken === ownerToken
+      && (sessionId === undefined || memoryClaim.sessionId === sessionId)) {
+      // Remove the in-window rejection synchronously. A subsequent claimant
+      // still waits below for the guarded disk cleanup to finish.
+      claimedSessionsByPid.delete(pid);
+    }
+
+    const previous = pendingPidOwnershipFinalizations.get(pid) ?? Promise.resolve();
+    const removal = previous
+      .catch(() => {})
+      .then(() => removePidLockIf(
+        pid,
+        (activeLock) => activeLock.ownerToken === ownerToken
+          && (sessionId === undefined
+            || activeLock.sessionId === undefined
+            || activeLock.sessionId === sessionId),
+      ))
+      .catch((error) => {
+        logError(`[DebugSession] Failed to abandon PID=${pid} ownership (${reason})`, error);
+        return false;
+      });
+    const pending = removal.then(() => undefined);
+    pendingPidOwnershipFinalizations.set(pid, pending);
+    void pending.finally(() => {
+      if (pendingPidOwnershipFinalizations.get(pid) === pending) {
+        pendingPidOwnershipFinalizations.delete(pid);
+      }
+    });
+    return removal;
+  }
+
+  async function finalizeDebugSession(
+    session: vscode.DebugSession,
+    reason: string,
+  ): Promise<void> {
+    // The tracker feeds the failing DAP response to the MCP controller before
+    // calling this function, so a pre-start session is bound and can be
+    // transitioned to terminated instead of timing out forever.
+    mcpController.handleSessionTerminated(session);
+    if (session.type !== 'django-process') {
+      return;
+    }
+
+    pausedSessions.delete(session.id);
+    const lifecycleToken = hotReloadTokenBySession.get(session);
+    const hotReloadRelease = revokeHotReloadSession(session.id, lifecycleToken);
+    const sessionPid = targetPidFromSession(session);
+    const engine = effectiveSessionEngines.get(session.id) ?? targetEngineFromSession(session);
+    effectiveSessionEngines.delete(session.id);
+    const configuredOwnerToken = session.configuration[DEBUG_SESSION_LOCK_TOKEN_KEY];
+    const ownerToken = typeof configuredOwnerToken === 'string'
+      && configuredOwnerToken.length > 0
+      ? configuredOwnerToken
+      : undefined;
+    const lockRemoved = sessionPid === undefined
+      ? false
+      : await abandonPidOwnership(sessionPid, session.id, ownerToken, reason);
+    await hotReloadRelease;
+    log(
+      `[DebugSession] ${lockRemoved ? `Lock file removed for PID=${sessionPid}` : 'No PID lock to remove'} ` +
+      `(engine=${engine}, reason=${reason}), hot reload lease released`
+    );
+  }
+
+  function queueDebugSessionFinalization(
+    session: vscode.DebugSession,
+    reason: string,
+  ): Promise<void> {
+    const current = debugSessionFinalizations.get(session);
+    if (current) {
+      return current;
+    }
+    const operation = finalizeDebugSession(session, reason);
+    debugSessionFinalizations.set(session, operation);
+    void operation.finally(() => {
+      if (debugSessionFinalizations.get(session) === operation) {
+        debugSessionFinalizations.delete(session);
+      }
+    });
+    return operation;
+  }
 
   function isTargetProcessAlive(pid: number): boolean {
     try {
@@ -493,6 +602,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
     | { acquired: false; conflict: LockInfo | null };
 
   async function reservePidLock(info: LockInfo): Promise<LockReservation> {
+    await waitForPendingPidOwnershipFinalization(info.pid);
     const releaseClaimGuard = await acquirePidClaimGuard(info.pid);
     try {
       for (let attempt = 0; attempt < 8; attempt++) {
@@ -578,6 +688,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
 
   const sessionLockGuard: DebugSessionLockGuard = {
     async claim(session, target) {
+      await waitForPendingPidOwnershipFinalization(target.pid);
       const previousClaim = claimedSessionsByPid.get(target.pid);
       const claimMatches = previousClaim
         && (previousClaim.sessionId === session.id
@@ -647,6 +758,14 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
     },
   };
 
+  // Experimental DAP credentials must be resolved before VS Code snapshots
+  // the attach arguments. Descriptor-factory mutations happen across an RPC
+  // copy and cannot update that main-thread request.
+  const configurationProvider = vscode.debug.registerDebugConfigurationProvider(
+    'django-process',
+    new DjangoDebugConfigurationProvider(injector, getConfiguredDebugEngine),
+  );
+
   // Register our own debug adapter factory.
   // This connects directly to debugpy's DAP server via TCP —
   // no dependency on ms-python.python or ms-python.debugpy extensions.
@@ -658,15 +777,20 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
 
   // Sessions currently paused at a breakpoint. Some adapters report a
   // thread-local stop while others suspend every Python thread.
-  const pausedSessions = new Set<string>();
-  interface DapEvent { type?: string; event?: string; body?: { allThreadsStopped?: boolean } }
+  interface TrackedDapMessage {
+    type?: string;
+    event?: string;
+    command?: string;
+    success?: boolean;
+    body?: { allThreadsStopped?: boolean };
+  }
+  const dapStartupCommands = new Set(['initialize', 'attach', 'configurationDone']);
 
   // DAP message tracker for debugging the debug protocol itself
   const tracker = vscode.debug.registerDebugAdapterTrackerFactory(
     'django-process',
     {
       createDebugAdapterTracker(session: vscode.DebugSession) {
-        const hotReloadLifecycleToken = ensureHotReloadLifecycleToken(session);
         return {
           onWillStartSession() {
             log(`[DAP] Session starting`);
@@ -676,7 +800,21 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
           },
           onDidSendMessage(message: unknown) {
             mcpController.handleDapMessage(session, message);
-            const msg = message as DapEvent;
+            const msg = message as TrackedDapMessage;
+            if (msg?.type === 'response') {
+              if (msg.command === 'configurationDone' && msg.success === true) {
+                adapterReadySessions.add(session);
+              } else if (msg.success === false
+                && typeof msg.command === 'string'
+                && dapStartupCommands.has(msg.command)) {
+                adapterStartupFailedSessions.add(session);
+                log(`[DAP] Startup request rejected: ${msg.command}`);
+                void queueDebugSessionFinalization(
+                  session,
+                  `DAP ${msg.command} rejected`,
+                );
+              }
+            }
             if (msg?.type === 'event') {
               if (msg.event === 'stopped') {
                 pausedSessions.add(session.id);
@@ -685,20 +823,26 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
                 pausedSessions.delete(session.id);
                 log(`[HotReload] Session ${session.id} resumed`);
               } else if (msg.event === 'terminated' || msg.event === 'exited') {
-                pausedSessions.delete(session.id);
-                effectiveSessionEngines.delete(session.id);
-                void revokeHotReloadSession(session.id, hotReloadLifecycleToken);
+                if (!adapterReadySessions.has(session)) {
+                  adapterStartupFailedSessions.add(session);
+                }
+                void queueDebugSessionFinalization(session, `DAP ${msg.event} event`);
               }
             }
             log(`[DAP] <- recv: ${summarizeDapMessage(message)}`);
           },
           onError(error: Error) {
             logError(`[DAP] Error`, error);
+            if (!adapterReadySessions.has(session)) {
+              adapterStartupFailedSessions.add(session);
+              void queueDebugSessionFinalization(session, 'DAP startup error');
+            }
           },
           onExit(code: number | undefined, signal: string | undefined) {
-            pausedSessions.delete(session.id);
-            effectiveSessionEngines.delete(session.id);
-            void revokeHotReloadSession(session.id, hotReloadLifecycleToken);
+            if (!adapterReadySessions.has(session)) {
+              adapterStartupFailedSessions.add(session);
+            }
+            void queueDebugSessionFinalization(session, 'DAP adapter exit');
             log(`[DAP] Exit: code=${code} signal=${signal}`);
           },
         };
@@ -1412,7 +1556,19 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         return;
       }
 
-      const started = await vscode.debug.startDebugging(undefined, debugConfig);
+      let started: boolean;
+      try {
+        started = await vscode.debug.startDebugging(undefined, debugConfig);
+      } catch (error) {
+        await abandonPidOwnership(pid, undefined, ownerToken, 'startDebugging threw');
+        logError('[DebugSession] VS Code startDebugging threw', error);
+        const message = error instanceof Error ? error.message : String(error);
+        void vscode.window.showErrorMessage(
+          `Failed to start debug session: ${message}`,
+          'Show Logs',
+        ).then((choice) => { if (choice === 'Show Logs') { getLogger().show(); } });
+        return;
+      }
       log(`Debug session started: ${started}`);
 
       if (started) {
@@ -1420,7 +1576,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
           `$(debug-alt) ${sessionLabel} (PID: ${pid}) attached with ${engineName} on ${formatEndpoint(debugEndpoint)}`
         );
       } else {
-        await removePidLockIf(pid, (failedLock) => failedLock.ownerToken === ownerToken);
+        await abandonPidOwnership(pid, undefined, ownerToken, 'startDebugging rejected');
         vscode.window.showErrorMessage(
           'Failed to start debug session. Check logs for details.',
           'Show Logs',
@@ -1850,7 +2006,6 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
   let hotReloadShutdownPromise: Promise<void> | undefined;
   const hotReloadBatches = new Map<number, HotReloadPidBatch>();
   const hotReloadBacklogs = new Map<number, Set<string>>();
-  const effectiveSessionEngines = new Map<string, DebugEngine>();
   const hotReloadStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
 
   function activeLeaseForPid(pid: number, leaseId?: string) {
@@ -2259,6 +2414,10 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
   // Debug session lifecycle logging
   context.subscriptions.push(
     vscode.debug.onDidStartDebugSession(async (session) => {
+      if (adapterStartupFailedSessions.has(session)) {
+        await finalizeDebugSession(session, 'start event after DAP startup failure');
+        return;
+      }
       mcpController.handleSessionStarted(session);
       const engine = session.type === 'django-process' ? targetEngineFromSession(session) : undefined;
       const sessionPid = session.type === 'django-process' ? targetPidFromSession(session) : undefined;
@@ -2297,6 +2456,10 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
           await vscode.debug.stopDebugging(session);
           return;
         }
+        if (adapterStartupFailedSessions.has(session)) {
+          await finalizeDebugSession(session, 'DAP startup failed while claiming PID lock');
+          return;
+        }
 
         // The attach command reserves the lock before session startup. Refresh it
         // here as well because VS Code's Restart flow bypasses that command.
@@ -2323,6 +2486,11 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         }
         log(`[DebugSession] Lock file active for PID=${sessionPid} (engine=${engine})`);
 
+        if (adapterStartupFailedSessions.has(session)) {
+          await finalizeDebugSession(session, 'DAP startup failed while promoting PID lock');
+          return;
+        }
+
         if (
           supportsHotReload(engine)
           && hotReloadLifecycleToken
@@ -2344,47 +2512,8 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       );
     }),
     vscode.debug.onDidTerminateDebugSession(async (session) => {
-      mcpController.handleSessionTerminated(session);
       log(`[DebugSession] Terminated: ${session.name}`);
-      if (session.type === 'django-process') {
-        // Revoke the capability and abort local polls before waiting on lock I/O.
-        const hotReloadRelease = revokeHotReloadSession(
-          session.id,
-          hotReloadTokenBySession.get(session),
-        );
-        const sessionPid = targetPidFromSession(session);
-        const engine = effectiveSessionEngines.get(session.id) ?? targetEngineFromSession(session);
-        effectiveSessionEngines.delete(session.id);
-        const sessionOwnerToken = session.configuration[DEBUG_SESSION_LOCK_TOKEN_KEY];
-        let lockRemoved = false;
-        if (sessionPid !== undefined) {
-          try {
-            lockRemoved = await removePidLockIf(
-              sessionPid,
-              (activeLock) => activeLock.sessionId === session.id
-                || (activeLock.sessionId === undefined
-                  && typeof sessionOwnerToken === 'string'
-                  && sessionOwnerToken.length > 0
-                  && activeLock.ownerToken === sessionOwnerToken),
-            );
-          } catch (err) {
-            logError(`[DebugSession] Failed to release PID=${sessionPid} lock`, err);
-          }
-        }
-        if (sessionPid !== undefined) {
-          const inMemoryClaim = claimedSessionsByPid.get(sessionPid);
-          if (inMemoryClaim?.sessionId === session.id
-            && typeof sessionOwnerToken === 'string'
-            && inMemoryClaim.ownerToken === sessionOwnerToken) {
-            claimedSessionsByPid.delete(sessionPid);
-          }
-        }
-        await hotReloadRelease;
-        log(
-          `[DebugSession] ${lockRemoved ? `Lock file removed for PID=${sessionPid}` : 'No PID lock to remove'} ` +
-          '(engine=' + engine + '), hot reload lease released'
-        );
-      }
+      await queueDebugSessionFinalization(session, 'VS Code terminate event');
     }),
   );
 
@@ -2601,6 +2730,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
   void queueMcpReconcile();
 
   context.subscriptions.push(
+    configurationProvider,
     factory,
     tracker,
     attachCmd,

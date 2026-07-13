@@ -2219,7 +2219,12 @@ export class DebugpyInjector {
     while (Date.now() < deadline) {
       const endpoint = await this.getActiveEndpoint(pid, engine);
       if (endpoint) {
-        if (endpoint.port !== expectedPort) {
+        if (expectedPort === 0) {
+          log(
+            `[Injector] ${engine} selected dynamic endpoint ${formatEndpoint(endpoint)} ` +
+            `for PID=${pid}`
+          );
+        } else if (endpoint.port !== expectedPort) {
           log(
             `[Injector] Reusing existing ${engine} endpoint ${formatEndpoint(endpoint)} ` +
             `for PID=${pid}; requested port was ${expectedPort}`

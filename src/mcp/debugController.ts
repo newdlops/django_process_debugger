@@ -193,6 +193,8 @@ interface DapResponseMessage {
   success: boolean;
 }
 
+const DAP_STARTUP_COMMANDS = new Set(['initialize', 'attach', 'configurationDone']);
+
 const TOOL_DEFINITIONS: readonly McpToolDefinition[] = Object.freeze([
   {
     name: 'django_debugger_status',
@@ -825,14 +827,14 @@ export class DjangoMcpDebugController {
     try {
       started = await this.startDebugging!(target.folder, configuration);
     } catch {
-      this.sessions.delete(sessionRef);
+      this.discardRejectedSession(record);
       throw new McpControllerError(
         'SESSION_START_FAILED',
         'VS Code could not start the django-process debug session.',
       );
     }
     if (!started) {
-      this.sessions.delete(sessionRef);
+      this.discardRejectedSession(record);
       throw new McpControllerError(
         'SESSION_START_REJECTED',
         'VS Code rejected the django-process debug session.',
@@ -1658,10 +1660,18 @@ export class DjangoMcpDebugController {
       return undefined;
     }
     const configuredRef = session.configuration[DJANGO_MCP_SESSION_REF_CONFIG_KEY];
-    let record = typeof configuredRef === 'string'
-      ? this.sessions.get(configuredRef)
-      : undefined;
-    record ??= this.sessionsById.get(session.id);
+    let record: SessionRecord | undefined;
+    if (typeof configuredRef === 'string') {
+      record = this.sessions.get(configuredRef);
+      // An MCP capability that was rejected, cancelled, or otherwise removed
+      // must stay dead. A late tracker message cannot mint an unrelated
+      // replacement session around the retired hidden reference.
+      if (!record) {
+        return undefined;
+      }
+    } else {
+      record = this.sessionsById.get(session.id);
+    }
     if (!record) {
       const sessionRef = this.newRef('session');
       record = {
@@ -1681,6 +1691,9 @@ export class DjangoMcpDebugController {
       };
       this.sessions.set(sessionRef, record);
     }
+    if (record.state === 'terminated') {
+      return record.sessionRef;
+    }
     const alreadyBound = record.sessionId === session.id && record.session === session;
     record.session = session;
     record.sessionId = session.id;
@@ -1698,13 +1711,22 @@ export class DjangoMcpDebugController {
   }
 
   handleSessionTerminated(session: vscode.DebugSession): void {
-    const record = this.sessionsById.get(session.id);
+    const configuredRef = session.configuration[DJANGO_MCP_SESSION_REF_CONFIG_KEY];
+    const record = this.sessionsById.get(session.id)
+      ?? (typeof configuredRef === 'string' ? this.sessions.get(configuredRef) : undefined);
     if (!record) {
       return;
     }
-    this.invalidateStop(record, 'terminated');
-    this.appendEvent(record, 'terminated', { state: 'terminated' });
-    this.sessionsById.delete(session.id);
+    if (record.sessionId !== undefined && record.sessionId !== session.id) {
+      return;
+    }
+    if (record.state !== 'terminated') {
+      this.invalidateStop(record, 'terminated');
+      this.appendEvent(record, 'terminated', { state: 'terminated' });
+    }
+    if (this.sessionsById.get(session.id) === record) {
+      this.sessionsById.delete(session.id);
+    }
     record.session = undefined;
   }
 
@@ -1721,11 +1743,17 @@ export class DjangoMcpDebugController {
     if (!record) {
       return;
     }
+    if (record.state === 'terminated') {
+      return;
+    }
     if (isDapResponseMessage(message)) {
+      if (!message.success && DAP_STARTUP_COMMANDS.has(message.command)) {
+        this.handleSessionTerminated(session);
+        return;
+      }
       if (message.command === 'configurationDone'
         && message.success
         && record.state !== 'terminating'
-        && record.state !== 'terminated'
         && !record.adapterReady) {
         record.adapterReady = true;
         if (record.state === 'starting') {
@@ -1785,6 +1813,19 @@ export class DjangoMcpDebugController {
       default:
         break;
     }
+  }
+
+  private discardRejectedSession(record: SessionRecord): void {
+    this.invalidateStop(record, 'terminated');
+    if (record.sessionId && this.sessionsById.get(record.sessionId) === record) {
+      this.sessionsById.delete(record.sessionId);
+    }
+    this.sessions.delete(record.sessionRef);
+    record.session = undefined;
+    for (const waiter of [...record.waiters]) {
+      waiter();
+    }
+    record.waiters.clear();
   }
 
   private expectArguments(
