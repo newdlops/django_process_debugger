@@ -182,6 +182,29 @@ describe('Feature: bootstrap gating on non-target processes', function () {
       `expected an activation socket for celery worker, got:\n${delta || '(empty)'}`,
     );
   });
+
+  it('Django module and absolute worktree forms trigger bootstrap gating', async function () {
+    if (!venv) { this.skip(); return; }
+    this.timeout(20_000);
+    const managePy = path.join(fixturesDir(), 'manage.py');
+    const djangoAdmin = path.join(path.dirname(venv.python), 'django-admin');
+    await fs.writeFile(djangoAdmin, `#!${venv.python}\nraise SystemExit(0)\n`, 'utf-8');
+    await fs.chmod(djangoAdmin, 0o755);
+    for (const args of [
+      ['-m', 'django', 'runserver'],
+      [managePy, 'runserver'],
+    ]) {
+      const snapshot = await readLogSafe(bootstrapLog);
+      await execFileAsync(venv.python, args, { timeout: 10_000 }).catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const delta = stripBefore(await readLogSafe(bootstrapLog), snapshot);
+      assert.ok(delta.includes('Bootstrap module loaded'), `expected target gate for ${args.join(' ')}`);
+    }
+    const snapshot = await readLogSafe(bootstrapLog);
+    await execFileAsync(djangoAdmin, ['runserver'], { timeout: 10_000 });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.ok(stripBefore(await readLogSafe(bootstrapLog), snapshot).includes('Bootstrap module loaded'));
+  });
 });
 
 async function timeSamples(python: string, n: number): Promise<{ median: number; all: number[] }> {

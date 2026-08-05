@@ -11,12 +11,14 @@ import {
   normalizeListeningHost,
   parseLsofTcpListenLine,
 } from './listeningEndpoint';
+import { BOOTSTRAP_VERSION } from './debugpyInjector';
 
 const execFileAsync = promisify(execFile);
 const PORT_MANAGER_AGENT_REQUEST_TIMEOUT_MS = 1_000;
 const PORT_MANAGER_NETWORKS_FILE_MAX_BYTES = 256 * 1024;
 const PORT_MANAGER_NETWORKS_MAX_ROWS = 512;
 const CELERY_PIDFILE_SCAN_LIMIT = 64;
+const BOOTSTRAP_STATE_DIR = '/tmp/django-process-debugger';
 
 export type ProcessType = 'django' | 'celery';
 
@@ -42,6 +44,21 @@ export interface DjangoProcess {
 export interface OwnedTcpListeningEndpoint {
   pid?: number;
   endpoint: TcpListeningEndpoint;
+}
+
+export function isCurrentBootstrapRecoveryState(
+  state: Record<string, unknown>,
+  pid: number,
+  controlSocket: string,
+): boolean {
+  return state.pid === pid
+    && state.version === BOOTSTRAP_VERSION
+    && state.activationVersion === 2
+    && typeof state.pythonExecutable === 'string'
+    && path.isAbsolute(state.pythonExecutable)
+    && typeof state.runtimeId === 'string'
+    && /^[0-9a-f]{64}$/i.test(state.runtimeId)
+    && state.controlSocket === controlSocket;
 }
 
 export interface PortManagerProcessRow {
@@ -146,6 +163,12 @@ function mergeEndpoints(
 export function isIpv4LoopbackEndpoint(endpoint: TcpListeningEndpoint): boolean {
   const host = normalizeListeningHost(endpoint.host).toLowerCase();
   return /^127(?:\.\d{1,3}){3}$/.test(host);
+}
+
+/** Covers normalized IPv4/mapped loopback plus IPv6 loopback aliases. */
+export function isLoopbackEndpoint(endpoint: TcpListeningEndpoint): boolean {
+  const host = normalizeListeningHost(endpoint.host).toLowerCase();
+  return isIpv4LoopbackEndpoint(endpoint) || host === '::1';
 }
 
 function parseLsofPid(line: string): number | undefined {
@@ -732,6 +755,11 @@ export class DjangoProcessFinder {
           : mergeEndpoints(commandEndpoint ? [commandEndpoint] : undefined);
       }));
 
+      // Bootstrap state is only a recovery source for targets that still prove
+      // their live PID, private control socket, recognized command/CWD, and
+      // listener ownership. It never promotes an arbitrary Python listener.
+      this.mergeDiscoveredProcesses(processes, await this.findValidatedBootstrapCandidates());
+
       const portManagerProcesses = await this.findPortManagerDjangoProcesses();
       this.mergeDiscoveredProcesses(processes, portManagerProcesses);
 
@@ -794,6 +822,55 @@ export class DjangoProcessFinder {
         existing.pythonPath = discovered.pythonPath;
       }
     }
+  }
+
+  private async findValidatedBootstrapCandidates(): Promise<DjangoProcess[]> {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(BOOTSTRAP_STATE_DIR);
+    } catch {
+      return [];
+    }
+
+    const candidates: DjangoProcess[] = [];
+    for (const entry of entries) {
+      const match = entry.match(/^(\d+)\.bootstrap\.json$/);
+      const pid = match ? Number(match[1]) : NaN;
+      if (!Number.isInteger(pid) || pid <= 0) { continue; }
+      try {
+        process.kill(pid, 0);
+        const statePath = path.join(BOOTSTRAP_STATE_DIR, entry);
+        const stateStat = await fs.lstat(statePath);
+        const uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+        if (!stateStat.isFile() || stateStat.isSymbolicLink() || (stateStat.mode & 0o077) !== 0 || (uid !== undefined && stateStat.uid !== uid)) { continue; }
+        const state = JSON.parse(await fs.readFile(statePath, 'utf-8')) as {
+          pid?: unknown; version?: unknown; activationVersion?: unknown;
+          pythonExecutable?: unknown; runtimeId?: unknown; controlSocket?: unknown;
+        };
+        const expectedSocket = path.join(BOOTSTRAP_STATE_DIR, `${pid}.control.sock`);
+        if (!isCurrentBootstrapRecoveryState(state, pid, expectedSocket)) { continue; }
+        const socket = await fs.lstat(expectedSocket);
+        if (!socket.isSocket() || socket.isSymbolicLink() || (socket.mode & 0o077) !== 0 || (uid !== undefined && socket.uid !== uid)) { continue; }
+        const command = await this.findProcessCommand(pid);
+        if (!command || !this.isDjangoProcess(command)) { continue; }
+        const [cwd, endpoints] = await Promise.all([
+          this.findProcessCwd(pid),
+          this.findListeningEndpoints(pid),
+        ]);
+        const type = this.classifyProcess(command);
+        if (!type || !cwd || !path.isAbsolute(cwd)) { continue; }
+        // Server candidates require a PID-owned listener; workers/shells are
+        // long-running targets without TCP listeners by design.
+        if (type === 'django' && endpoints.length === 0) { continue; }
+        candidates.push({
+          pid, command, pythonPath: this.extractPythonPath(command), arch: process.arch,
+          type, cwd, endpoints, endpointVerified: endpoints.length > 0,
+        });
+      } catch {
+        // State, PID, socket, command, and listener all fail closed.
+      }
+    }
+    return candidates;
   }
 
   private async findPortManagerDjangoProcesses(): Promise<DjangoProcess[]> {
@@ -1156,14 +1233,18 @@ export class DjangoProcessFinder {
       return 'celery';
     }
 
+    const tokens = line.split(/\s+/).map((token) => path.basename(token).toLowerCase());
     const djangoPatterns = [
       /manage\.py\s+runserver/,
-      /django.*runserver/i,
       /uvicorn.*\.asgi/,
       /gunicorn.*\.wsgi/,
       /daphne.*\.asgi/,
     ];
-    if (djangoPatterns.some((p) => p.test(line))) {
+    if (
+      (tokens.includes('runserver')
+        && (tokens.includes('manage.py') || tokens.includes('django') || tokens.includes('django-admin')))
+      || djangoPatterns.some((p) => p.test(line))
+    ) {
       return 'django';
     }
 
@@ -1356,7 +1437,7 @@ export class DjangoProcessFinder {
       ]);
       for (const line of stdout.split('\n')) {
         const endpoint = parseLsofTcpListenLine(line);
-        if (!endpoint || !ports.has(endpoint.port) || !isIpv4LoopbackEndpoint(endpoint)) {
+        if (!endpoint || !ports.has(endpoint.port) || !isLoopbackEndpoint(endpoint)) {
           continue;
         }
 

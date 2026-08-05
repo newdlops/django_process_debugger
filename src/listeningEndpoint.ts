@@ -4,12 +4,16 @@ export interface TcpListeningEndpoint {
 }
 
 export function normalizeListeningHost(host: string): string {
-  const trimmed = host.trim();
+  const trimmed = host.trim().replace(/^\[|\]$/g, '');
   if (trimmed === '*' || trimmed === '0.0.0.0') {
     return '127.0.0.1';
   }
   if (trimmed === '::' || trimmed === '[::]') {
     return '::1';
+  }
+  const mappedLoopback = trimmed.match(/^::ffff:(127(?:\.\d{1,3}){3})$/i);
+  if (mappedLoopback) {
+    return mappedLoopback[1];
   }
   return trimmed;
 }

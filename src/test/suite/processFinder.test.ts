@@ -8,10 +8,13 @@ import {
   filterShadowedCommandDerivedDjangoProcesses,
   isCeleryWorkerCommand,
   isIpv4LoopbackEndpoint,
+  isLoopbackEndpoint,
+  isCurrentBootstrapRecoveryState,
   mergeLoopbackAliasEndpoints,
   parsePortManagerNetworkNamesTsv,
 } from '../../processFinder';
 import { parseLsofTcpListenLine } from '../../listeningEndpoint';
+import { BOOTSTRAP_VERSION } from '../../debugpyInjector';
 import { getPerf } from './perfReporter';
 import {
   allocateLoopbackPort,
@@ -30,6 +33,16 @@ describe('Feature: process discovery', function () {
         finder.classifyProcess('python /app/manage.py runserver 0.0.0.0:8000'),
         'django',
       );
+    });
+
+    it('recognizes absolute worktree, module, and console runserver forms', function () {
+      for (const command of [
+        'python /worktree/app/manage.py runserver 8000',
+        'python -m django runserver 8000',
+        '/worktree/.venv/bin/django-admin runserver 8000',
+      ]) {
+        assert.strictEqual(finder.classifyProcess(command), 'django', command);
+      }
     });
 
     it('classifies uvicorn asgi as django', function () {
@@ -100,6 +113,27 @@ describe('Feature: process discovery', function () {
     });
   });
 
+  describe('bootstrap-state recovery validation', function () {
+    const pid = 4242;
+    const socket = `/tmp/django-process-debugger/${pid}.control.sock`;
+    const current = {
+      pid,
+      version: BOOTSTRAP_VERSION,
+      activationVersion: 2,
+      pythonExecutable: '/worktree/.venv/bin/python',
+      runtimeId: 'a'.repeat(64),
+      controlSocket: socket,
+    };
+
+    it('accepts only current PID-bound private state shape', function () {
+      assert.strictEqual(isCurrentBootstrapRecoveryState(current, pid, socket), true);
+      assert.strictEqual(isCurrentBootstrapRecoveryState({ ...current, version: 'old' }, pid, socket), false);
+      assert.strictEqual(isCurrentBootstrapRecoveryState({ ...current, pid: 9 }, pid, socket), false);
+      assert.strictEqual(isCurrentBootstrapRecoveryState({ ...current, controlSocket: '/tmp/spoof.sock' }, pid, socket), false);
+      assert.strictEqual(isCurrentBootstrapRecoveryState({ ...current, runtimeId: 'spoofed' }, pid, socket), false);
+    });
+  });
+
   describe('port extraction', function () {
     const cases: Array<[string, number | undefined]> = [
       ['python manage.py runserver 8080', 8080],
@@ -165,6 +199,8 @@ describe('Feature: process discovery', function () {
       assert.strictEqual(isIpv4LoopbackEndpoint({ host: '127.0.0.1', port: 8004 }), true);
       assert.strictEqual(isIpv4LoopbackEndpoint({ host: '127.125.100.191', port: 8004 }), true);
       assert.strictEqual(isIpv4LoopbackEndpoint({ host: '::1', port: 8004 }), false);
+      assert.strictEqual(isLoopbackEndpoint({ host: '::1', port: 8004 }), true);
+      assert.strictEqual(isLoopbackEndpoint({ host: '::ffff:127.0.0.1', port: 8004 }), true);
     });
   });
 
