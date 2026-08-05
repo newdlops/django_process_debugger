@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- The built-in experimental tracer is now the default for new setup, snippets, direct attaches, and MCP attaches. It installs a usable bootstrap without debugpy or pip; selecting debugpy explicitly still provisions it and requires a process restart after bootstrap changes.
+- Discovery preserves worktree-launched targets and normalized loopback listener forms. Attach failures now provide a specific setup, status, log, or restart remedy instead of continuing after runtime inspection/update failures.
+
 ## [0.2.914] - 2026-07-13
 
 ### Fixed

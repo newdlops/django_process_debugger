@@ -5,8 +5,8 @@ Attach a debugger to a running Django or Celery process without modifying your c
 ## Features
 
 - Detect running Django and Celery processes with PID and port info
-- Attach debugpy at runtime through a private PID-owned control socket — no lldb, process signal, or code changes
-- Opt in to a fully independent native tracer with conditional and hit-count breakpoints, logpoints, expression evaluation, and controlled value changes while keeping debugpy as the stable default
+- Attach the built-in native tracer at runtime through a private PID-owned control socket — no lldb, process signal, or code changes
+- Use the independent native tracer by default, or explicitly select debugpy when you need its compatibility features
 - **Hot Reload** — edit Python files with either debug engine and see changes immediately without restarting Django or losing your debug session
 - Smart process tree resolution — select any process (uv wrapper, autoreloader, or child) and the debugger attaches to the right one
 - Vendored debugpy bundle shipped with the extension — no target-runtime pip install required
@@ -35,7 +35,7 @@ This installs a lightweight bootstrap into the target runtime's `site-packages` 
 
 Restart your Django server through your normal workflow (`manage.py runserver`, `uv run python manage.py runserver`, etc.). The bootstrap loads automatically.
 
-To try the native tracer, set `djangoProcessDebugger.engine` to `experimental` before attaching. No setting change is needed for the stable debugpy backend.
+The native tracer is the default and needs no debugpy bundle or target-runtime pip. Set `djangoProcessDebugger.engine` to `debugpy` before setup/attach only when you need the debugpy backend.
 
 ### 3. Attach
 
@@ -104,11 +104,11 @@ Settings:
 
 ### Debug Engines
 
-`debugpy` remains the default and recommended backend. The `experimental` backend is a new tracer implemented independently of debugpy and is available as an explicit opt-in:
+`experimental` is the default built-in backend and works without debugpy provisioning. Select `debugpy` explicitly when you need its compatibility features:
 
 ```json
 {
-  "djangoProcessDebugger.engine": "experimental"
+  "djangoProcessDebugger.engine": "debugpy"
 }
 ```
 
@@ -225,10 +225,22 @@ You can select **any** process in the tree — the extension walks down to the d
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `djangoProcessDebugger.engine` | `debugpy` | Debug backend for new attach sessions. Restart an already-activated target before switching engines. |
+| `djangoProcessDebugger.engine` | `experimental` | Debug backend for new attach sessions. Restart an already-activated target before switching engines. |
 | `djangoProcessDebugger.justMyCode` | `true` | Only debug user-written code. Set to `false` to step into Django/Celery internals. Currently debugpy-only. |
 | `djangoProcessDebugger.redirectOutput` | `true` | Redirect `print()` / stdout / stderr to the VS Code Debug Console. Currently debugpy-only. |
 | `djangoProcessDebugger.hotReload` | `true` | Hot-reload changed `.py` files without restarting Django. Supported by both debug engines. |
+
+## Telemetry
+
+Release builds can use the official [`@vscode/extension-telemetry`](https://github.com/microsoft/vscode-extension-telemetry) package to send a deliberately small set of usage events to the publisher's Application Insights resource. The reporter follows VS Code's global telemetry level automatically; set `telemetry.telemetryLevel` to `off` to disable transmission.
+
+The extension records successful activation with coarse feature settings, invocation of one of its fixed command identifiers, and Django debugger session start/termination with the selected engine, boolean debugger options, and elapsed duration. The telemetry package also supplies common product metadata such as the extension and VS Code versions, OS/architecture, a VS Code session identifier, and VS Code's pseudonymous machine identifier.
+
+It does **not** send workspace names or paths, process IDs or ports, process command lines, Python/Django application data, source or breakpoint contents, evaluated expressions, debug values, error messages, or stack traces. The complete machine-readable event classification is in [`telemetry.json`](./telemetry.json).
+
+Telemetry remains disabled when no publisher connection string is configured. A release manifest may provide it as `telemetry.connectionString`; local extension-host and CI runs may instead set `DJANGO_PROCESS_DEBUGGER_TELEMETRY_CONNECTION_STRING`. Application Insights connection strings identify the destination and are [not treated as secrets by the telemetry package](https://github.com/microsoft/vscode-extension-telemetry#setup).
+
+Publisher-side Application Insights diagnostics and usage queries are collected in [`TELEMETRY_QUERIES.md`](./TELEMETRY_QUERIES.md).
 
 ## Troubleshooting
 
