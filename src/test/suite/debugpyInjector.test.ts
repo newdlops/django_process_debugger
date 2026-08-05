@@ -13,6 +13,7 @@ import {
   BootstrapRuntimeIdentityError,
   BootstrapRuntimeVersionError,
   DebugEngineConflictError,
+  DebugEngineUnavailableError,
   DebugpyInjector,
   BOOTSTRAP_VERSION,
 } from '../../debugpyInjector';
@@ -47,6 +48,42 @@ describe('Feature: debugpy injector bootstrap lifecycle', function () {
     await assert.doesNotReject(fs.access(path.join(sitePackages, 'django_process_debugger.pth')));
     await assert.doesNotReject(fs.access(path.join(sitePackages, '_django_debug_bootstrap.py')));
     await assert.doesNotReject(fs.access(path.join(sitePackages, '_django_debug_tracer.py')));
+  });
+
+  it('installs an experimental-only bootstrap when debugpy was not provisioned', async function () {
+    const experimentalOnly = new DebugpyInjector();
+    const destination = path.join(tmpDir, 'experimental-only-site-packages');
+    await fs.mkdir(destination, { recursive: true });
+    await experimentalOnly.installBootstrap(destination);
+    const bootstrap = await fs.readFile(path.join(destination, '_django_debug_bootstrap.py'), 'utf-8');
+    assert.ok(bootstrap.includes('"engines": ["experimental"]'));
+    assert.ok(!bootstrap.includes('"engines": ["debugpy", "experimental"]'));
+  });
+
+  it('fails explicit debugpy before control or endpoint waiting when state omits it', async function () {
+    const capabilityInjector = new DebugpyInjector() as unknown as {
+      getLoadedBootstrapState(pid: number): Promise<unknown>;
+      getActiveEndpoint(pid: number, engine: string): Promise<null>;
+      verifyBootstrapLoaded(path: string): Promise<boolean>;
+      activateEndpoint(pid: number, port: number, engine: 'debugpy'): Promise<unknown>;
+    };
+    capabilityInjector.getActiveEndpoint = async () => null;
+    capabilityInjector.getLoadedBootstrapState = async () => ({
+      pid: process.pid,
+      version: BOOTSTRAP_VERSION,
+      engines: ['experimental'],
+      activationVersion: 2,
+      pythonExecutable: '/tmp/example-venv/bin/python',
+      runtimeId: 'a'.repeat(64),
+      controlSocket: `/tmp/django-process-debugger/${process.pid}.control.sock`,
+    });
+    capabilityInjector.verifyBootstrapLoaded = async () => {
+      throw new Error('must not verify/import bootstrap after capability rejection');
+    };
+    await assert.rejects(
+      capabilityInjector.activateEndpoint(process.pid, 5678, 'debugpy'),
+      DebugEngineUnavailableError,
+    );
   });
 
   it('isBootstrapInstalled returns true after install', async function () {
@@ -199,6 +236,7 @@ describe('Feature: debugpy injector bootstrap lifecycle', function () {
       getLoadedBootstrapState(pid: number): Promise<{
         pid: number;
         version: string;
+        engines: ('debugpy' | 'experimental')[];
         activationVersion: number;
         runtimeId: string;
         controlSocket: string;
@@ -213,6 +251,7 @@ describe('Feature: debugpy injector bootstrap lifecycle', function () {
     internals.getLoadedBootstrapState = async (pid: number) => ({
       pid,
       version: BOOTSTRAP_VERSION,
+      engines: ['debugpy', 'experimental'],
       activationVersion: 2,
       runtimeId,
       controlSocket: path.join(stateDir, `${pid}.control.sock`),
@@ -273,6 +312,7 @@ describe('Feature: debugpy injector bootstrap lifecycle', function () {
       getLoadedBootstrapState(pid: number): Promise<{
         pid: number;
         version: string;
+        engines: ('debugpy' | 'experimental')[];
         activationVersion: number;
         runtimeId: string;
         controlSocket: string;
@@ -293,6 +333,7 @@ describe('Feature: debugpy injector bootstrap lifecycle', function () {
     internals.getLoadedBootstrapState = async (pid: number) => ({
       pid,
       version: BOOTSTRAP_VERSION,
+      engines: ['debugpy', 'experimental'],
       activationVersion: 2,
       runtimeId,
       controlSocket: path.join(stateDir, `${pid}.control.sock`),
@@ -360,6 +401,7 @@ describe('Feature: debugpy injector bootstrap lifecycle', function () {
       getLoadedBootstrapState(pid: number): Promise<{
         pid: number;
         version: string;
+        engines: ('debugpy' | 'experimental')[];
         activationVersion: number;
         pythonExecutable: string;
         runtimeId: string;
@@ -382,6 +424,7 @@ describe('Feature: debugpy injector bootstrap lifecycle', function () {
     internals.getLoadedBootstrapState = async (pid: number) => ({
       pid,
       version: BOOTSTRAP_VERSION,
+      engines: ['debugpy', 'experimental'],
       activationVersion: 2,
       pythonExecutable: process.execPath,
       runtimeId,

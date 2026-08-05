@@ -2,7 +2,8 @@ export const DEBUG_ENGINES = ['debugpy', 'experimental'] as const;
 
 export type DebugEngine = typeof DEBUG_ENGINES[number];
 
-export const DEFAULT_DEBUG_ENGINE: DebugEngine = 'debugpy';
+/** The native tracer is the default for newly-created configurations. */
+export const DEFAULT_DEBUG_ENGINE: DebugEngine = 'experimental';
 
 export function isDebugEngine(value: unknown): value is DebugEngine {
   return typeof value === 'string' && (DEBUG_ENGINES as readonly string[]).includes(value);

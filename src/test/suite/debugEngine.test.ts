@@ -10,11 +10,11 @@ import {
 } from '../../debugEngine';
 
 describe('Feature: debug engine selection', function () {
-  it('keeps debugpy as the stable default', function () {
-    assert.strictEqual(DEFAULT_DEBUG_ENGINE, 'debugpy');
+  it('uses the native tracer as the default for new sessions', function () {
+    assert.strictEqual(DEFAULT_DEBUG_ENGINE, 'experimental');
     assert.deepStrictEqual([...DEBUG_ENGINES], ['debugpy', 'experimental']);
-    assert.strictEqual(normalizeDebugEngine(undefined), 'debugpy');
-    assert.strictEqual(normalizeDebugEngine('unknown'), 'debugpy');
+    assert.strictEqual(normalizeDebugEngine(undefined), 'experimental');
+    assert.strictEqual(normalizeDebugEngine('unknown'), 'experimental');
   });
 
   it('accepts the explicit experimental opt-in', function () {

@@ -29,7 +29,7 @@ const execFileAsync = promisify(execFile);
  *   2. Install the bootstrap there via DebugpyInjector.installBootstrap().
  *   3. Spawn the fake manage.py through that venv's python so the bootstrap
  *      loads automatically via the .pth file on startup.
- *   4. Call injector.activate(pid, port) through the PID-owned private control
+ *   4. Call injector.activate(pid, port, 'debugpy') through the PID-owned private control
  *      socket and make debugpy listen on `port`.
  *   5. Verify the TCP listener is up.
  *
@@ -111,12 +111,12 @@ describe('Feature: end-to-end attach flow', function () {
 
     debugPort = await allocateLoopbackPort();
     const actualPort = await perf.measure('injector.activate (full)', async () =>
-      injector.activate(server!.pid, debugPort),
+      injector.activate(server!.pid, debugPort, 'debugpy'),
     { group: 'attach-e2e', meta: { pid: server.pid, requested: debugPort } });
 
     assert.strictEqual(actualPort, debugPort, 'activate should return the requested port');
 
-    const endpoint = await injector.getActiveEndpoint(server.pid);
+    const endpoint = await injector.getActiveEndpoint(server.pid, 'debugpy');
     assert.ok(endpoint, 'debugpy active endpoint should be discoverable');
     assert.strictEqual(endpoint.port, debugPort);
     assert.strictEqual(endpoint.authToken, undefined);
@@ -180,7 +180,7 @@ describe('Feature: end-to-end attach flow', function () {
 
     const alternatePort = await allocateLoopbackPort();
     const secondPort = await perf.measure('injector.activate (idempotent)', async () =>
-      injector.activate(server!.pid, alternatePort),
+      injector.activate(server!.pid, alternatePort, 'debugpy'),
     { group: 'attach-e2e' });
 
     assert.strictEqual(secondPort, debugPort,
@@ -189,13 +189,13 @@ describe('Feature: end-to-end attach flow', function () {
 
   it('getActivePort reflects the active state', async function () {
     if (!server) { this.skip(); return; }
-    const port = await injector.getActivePort(server.pid);
+    const port = await injector.getActivePort(server.pid, 'debugpy');
     assert.strictEqual(port, debugPort);
   });
 
   it('getActiveEndpoint reflects the active host and port', async function () {
     if (!server) { this.skip(); return; }
-    const endpoint = await injector.getActiveEndpoint(server.pid);
+    const endpoint = await injector.getActiveEndpoint(server.pid, 'debugpy');
     assert.ok(endpoint);
     assert.ok(endpoint.host.length > 0);
     assert.strictEqual(endpoint.port, debugPort);
@@ -221,7 +221,7 @@ describe('Feature: end-to-end attach flow', function () {
     );
 
     try {
-      const endpoint = await injector.getActiveEndpoint(process.pid);
+      const endpoint = await injector.getActiveEndpoint(process.pid, 'debugpy');
       assert.strictEqual(endpoint, null);
       await assert.rejects(fs.access(synthetic.activeFile));
     } finally {
@@ -246,7 +246,7 @@ describe('Feature: end-to-end attach flow', function () {
     );
 
     try {
-      const endpoint = await injector.getActiveEndpoint(process.pid);
+      const endpoint = await injector.getActiveEndpoint(process.pid, 'debugpy');
       assert.ok(endpoint);
       assert.strictEqual(endpoint.port, address.port);
       assert.strictEqual(endpoint.host, '127.0.0.1');
@@ -270,6 +270,7 @@ async function publishSyntheticActiveRecord(
   await fs.writeFile(bootstrapStateFile, JSON.stringify({
     pid,
     version: BOOTSTRAP_VERSION,
+    engines: ['debugpy', 'experimental'],
     activationVersion: 2,
     runtimeId,
     controlSocket: path.join(artifactDirectory, `${pid}.control.sock`),

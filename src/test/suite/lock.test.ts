@@ -4,7 +4,6 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { getPerf } from './perfReporter';
-import { normalizeDebugEngine } from '../../debugEngine';
 
 /**
  * Lock-file behavior is currently inlined in extension.ts (readLock/writeLock/removeLock).
@@ -78,7 +77,10 @@ describe('Feature: debug session lock-file contract', function () {
 
     const legacy = await readLockForPid(pid);
     assert.ok(legacy);
-    assert.strictEqual(normalizeDebugEngine(legacy.engine), 'debugpy');
+    // Engine-less lock files were written before the new-session default
+    // changed and retain their historical debugpy meaning.
+    const legacyEngine = legacy.engine === undefined ? 'debugpy' : legacy.engine;
+    assert.strictEqual(legacyEngine, 'debugpy');
 
     const experimentalPayload = { ...legacyPayload, engine: 'experimental' };
     await fs.writeFile(lockFile, JSON.stringify(experimentalPayload), 'utf-8');

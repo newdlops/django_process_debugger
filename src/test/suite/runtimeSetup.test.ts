@@ -40,7 +40,7 @@ describe('Feature: runtime discovery', function () {
 
     assert.strictEqual(
       config.get<string>('engine') ?? defaults['djangoProcessDebugger.engine'].default,
-      'debugpy',
+      'experimental',
     );
     assert.strictEqual(
       config.get<boolean>('justMyCode') ?? defaults['djangoProcessDebugger.justMyCode'].default,

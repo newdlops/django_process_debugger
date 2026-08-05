@@ -513,7 +513,7 @@ export class DjangoMcpDebugController {
   constructor(options: DjangoMcpDebugControllerOptions) {
     this.processFinder = options.processFinder;
     this.getWorkspaceFolders = options.getWorkspaceFolders;
-    this.getEngine = options.getEngine ?? (() => 'debugpy');
+    this.getEngine = options.getEngine ?? (() => 'experimental');
     this.getJustMyCode = options.getJustMyCode ?? (() => true);
     this.getRedirectOutput = options.getRedirectOutput ?? (() => true);
     this.getRuntimeStatus = options.getRuntimeStatus;

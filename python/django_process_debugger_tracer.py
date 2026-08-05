@@ -29,7 +29,7 @@ from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 
 TRACER_API_VERSION = 2
-TRACER_VERSION = "2026.07.13.2"
+TRACER_VERSION = "2026.08.05.1"
 EXEMPT_THREAD_ATTRIBUTE = "django_debugger_do_not_trace"
 
 _CANONICAL_MODULE_NAME = "django_process_debugger_tracer"

@@ -24,7 +24,7 @@ const TRACER_SOURCE_PATH = path.resolve(
   'python',
   'django_process_debugger_tracer.py',
 );
-export const BOOTSTRAP_VERSION = '2026.07.13.2';
+export const BOOTSTRAP_VERSION = '2026.08.05.1';
 export type DebugpyEndpoint = TcpListeningEndpoint & { authToken?: string };
 const ACTIVE_ENDPOINT_RECORD_VERSION = 3;
 type BootstrapRuntimeState = {
@@ -172,7 +172,7 @@ function bootstrapStateFilePath(pid: number): string {
   return `${PORT_FILE_DIR}/${pid}.bootstrap.json`;
 }
 
-function makeBootstrapScript(bundledDebugpyPath: string): string {
+function makeBootstrapScript(bundledDebugpyPath: string | null): string {
   // Build Python source as plain string concatenation to avoid
   // JS template literal ${} clashing with Python f-string {}.
   //
@@ -199,6 +199,7 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '            return False',
     '        _orig = getattr(_sys, "orig_argv", None) or _sys.argv',
     '        _parts = [str(_a).lower() for _a in _orig]',
+    '        _names = [_os.path.basename(_part) for _part in _parts]',
     '        _argv0 = _parts[0] if _parts else ""',
     '        _cmd = " ".join(_parts)',
     '        # Block tool commands. With orig_argv the "-m pip"/"-m pytest"',
@@ -214,7 +215,7 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '        # `celery` console script. The module name and the `worker`',
     '        # subcommand may be separated by options (-A app), so test for',
     '        # both tokens rather than a fixed "celery worker" substring.',
-    '        if "worker" in _parts and ("celery" in _parts or _os.path.basename(_argv0) == "celery"):',
+    '        if "worker" in _parts and ("celery" in _names or _os.path.basename(_argv0) == "celery"):',
     '            return True',
     '        if _os.path.basename(_argv0) == "celeryd" or " celeryd" in _cmd:',
     '            return True',
@@ -228,6 +229,11 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '        for _index, _part in enumerate(_parts[:-1]):',
     '            if _os.path.basename(_part) == "manage.py" and _parts[_index + 1] in ("shell", "shell_plus"):',
     '                return True',
+    '        # Django module and console-script forms are target servers too.',
+    '        # Basename-aware tokens retain absolute worktree paths and wrappers',
+    '        # without treating arbitrary Python scripts as targets.',
+    '        if "runserver" in _parts and ("django" in _names or "django-admin" in _names or "manage.py" in _names):',
+    '            return True',
     '        # Other long-running servers (script form, or "<name> " in cmd).',
     '        _server_patterns = (',
     '            "manage.py runserver",',
@@ -239,7 +245,7 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '        if any(_p in _cmd for _p in _server_patterns):',
     '            return True',
     '        # ASGI/WSGI servers launched via `-m` (bare tokens in argv).',
-    '        if "-m" in _parts and any(_s in _parts for _s in ("uvicorn", "gunicorn", "daphne")):',
+    '        if "-m" in _parts and any(_s in _names for _s in ("uvicorn", "gunicorn", "daphne")):',
     '            return True',
     '        return False',
     '',
@@ -274,7 +280,9 @@ function makeBootstrapScript(bundledDebugpyPath: string): string {
     '                    _f.write(_json.dumps({',
     '                        "version": ' + JSON.stringify(BOOTSTRAP_VERSION) + ',',
     '                        "pid": _os.getpid(),',
-    '                        "engines": ["debugpy", "experimental"],',
+    '                        "engines": ' + JSON.stringify(
+      bundledDebugpyPath ? ['debugpy', 'experimental'] : ['experimental'],
+    ) + ',',
     '                        "activationVersion": 2,',
     '                        "pythonExecutable": _sys.executable,',
     '                        "runtimeId": _runtime_id,',
@@ -1279,10 +1287,6 @@ export class DebugpyInjector {
    * Requires restarting the Django server after installation.
    */
   async installBootstrap(venvSitePackages: string): Promise<void> {
-    if (!this.bundledDebugpyPath) {
-      throw new Error('Bundled debugpy path not set');
-    }
-
     // Warn (but allow) installing into global/system site-packages
     const parentDir = path.resolve(venvSitePackages, '..', '..', '..');
     const isVenv = await this.isVenvDir(parentDir);
@@ -1300,6 +1304,8 @@ export class DebugpyInjector {
     log(`[Injector]   tracer: ${tracerModulePath}`);
 
     await fs.copyFile(TRACER_SOURCE_PATH, tracerModulePath);
+    // The tracer is self-contained. A null debugpy path deliberately leaves
+    // explicit debugpy activation unavailable until it is provisioned later.
     await fs.writeFile(modulePath, makeBootstrapScript(this.bundledDebugpyPath), 'utf-8');
     await fs.writeFile(pthPath, PTH_CONTENT, 'utf-8');
 
@@ -1955,6 +1961,9 @@ export class DebugpyInjector {
     ) {
       throw new BootstrapRuntimeIdentityError(pid);
     }
+    if (!loadedBootstrapState.engines?.includes(engine)) {
+      throw new DebugEngineUnavailableError(pid, engine);
+    }
     log(`[Injector] Target PID=${pid} published a current private activation identity`);
 
     // Verify the exact interpreter published by the live target. In particular,
@@ -2261,6 +2270,17 @@ export class DebugEngineConflictError extends Error {
     );
     this.name = 'DebugEngineConflictError';
     this.activeEndpoint = { host: activeEndpoint.host, port: activeEndpoint.port };
+  }
+}
+
+export class DebugEngineUnavailableError extends Error {
+  constructor(public readonly pid: number, public readonly engine: DebugEngine) {
+    super(
+      engine === 'debugpy'
+        ? `Target PID ${pid} does not have debugpy available in its installed bootstrap. Select debugpy, run Django Debugger: Setup, then restart the target process.`
+        : `Target PID ${pid} does not support the selected debug engine. Run Django Debugger: Setup, then restart the target process.`,
+    );
+    this.name = 'DebugEngineUnavailableError';
   }
 }
 

@@ -37,7 +37,7 @@ export interface SetupProfile {
   sourceLabel: string;
   pythonVersion: string;
   bootstrapVersion: string;
-  debugpySource: DebugpyProvisioningInfo['source'];
+  debugpySource?: DebugpyProvisioningInfo['source'];
   debugpyVersion?: string;
   lastSetupAt: string;
   lastReason?: string;
@@ -66,7 +66,7 @@ export interface RuntimePreflight {
   isWorkspaceLocal: boolean;
   isWritable: boolean;
   canImportPip: boolean;
-  debugpySource: DebugpyProvisioningInfo['source'];
+  debugpySource?: DebugpyProvisioningInfo['source'];
   debugpyVersion?: string;
   warnings: string[];
   errors: string[];
@@ -590,10 +590,6 @@ export async function inspectRuntimePreflight(
     warnings.push(`The selected interpreter resolves to ${resolvedPythonPath}.`);
   }
 
-  if (debugpyInfo.source === 'pip' && !inspection?.canImportPip) {
-    errors.push('pip is not available in this interpreter, and vendored debugpy is unavailable.');
-  }
-
   return {
     pythonPath,
     resolvedPythonPath,
@@ -613,7 +609,7 @@ export async function inspectRuntimePreflight(
 export function createSetupProfile(
   candidate: Pick<RuntimeCandidate, 'process' | 'sourceKind' | 'sourceLabel'>,
   preflight: RuntimePreflight,
-  debugpyInfo: DebugpyProvisioningInfo,
+  debugpyInfo: DebugpyProvisioningInfo | undefined,
   reason: string,
 ): SetupProfile {
   return {
@@ -624,8 +620,8 @@ export function createSetupProfile(
     sourceLabel: candidate.sourceLabel,
     pythonVersion: preflight.pythonVersion,
     bootstrapVersion: BOOTSTRAP_VERSION,
-    debugpySource: debugpyInfo.source,
-    debugpyVersion: debugpyInfo.version,
+    debugpySource: debugpyInfo?.source,
+    debugpyVersion: debugpyInfo?.version,
     lastSetupAt: new Date().toISOString(),
     lastReason: reason,
     processCommand: candidate.process?.command,
@@ -668,7 +664,7 @@ export function formatPreflightForConfirmation(preflight: RuntimePreflight): str
     `Python ${preflight.pythonVersion}`,
     `Interpreter: ${preflight.resolvedPythonPath}`,
     `site-packages: ${preflight.sitePackages}`,
-    `debugpy source: ${preflight.debugpySource}${preflight.debugpyVersion ? ` ${preflight.debugpyVersion}` : ''}`,
+    `debugpy source: ${preflight.debugpySource ?? 'not provisioned'}${preflight.debugpyVersion ? ` ${preflight.debugpyVersion}` : ''}`,
   ];
 
   if (preflight.warnings.length > 0) {
