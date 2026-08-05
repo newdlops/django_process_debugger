@@ -1,0 +1,141 @@
+{
+  "commonProperties": {
+    "common.os": {
+      "classification": "SystemMetaData",
+      "purpose": "FeatureInsight"
+    },
+    "common.nodeArch": {
+      "classification": "SystemMetaData",
+      "purpose": "FeatureInsight"
+    },
+    "common.platformversion": {
+      "classification": "SystemMetaData",
+      "purpose": "FeatureInsight"
+    },
+    "common.extname": {
+      "classification": "PublicNonPersonalData",
+      "purpose": "FeatureInsight"
+    },
+    "common.extversion": {
+      "classification": "PublicNonPersonalData",
+      "purpose": "FeatureInsight"
+    },
+    "common.vscodemachineid": {
+      "classification": "EndUserPseudonymizedInformation",
+      "purpose": "FeatureInsight",
+      "endPoint": "MacAddressHash"
+    },
+    "common.vscodesessionid": {
+      "classification": "SystemMetaData",
+      "purpose": "FeatureInsight"
+    },
+    "common.vscodecommithash": {
+      "classification": "SystemMetaData",
+      "purpose": "FeatureInsight"
+    },
+    "common.vscodeversion": {
+      "classification": "SystemMetaData",
+      "purpose": "FeatureInsight"
+    },
+    "common.uikind": {
+      "classification": "SystemMetaData",
+      "purpose": "FeatureInsight"
+    },
+    "common.remotename": {
+      "classification": "SystemMetaData",
+      "purpose": "FeatureInsight"
+    },
+    "common.isnewappinstall": {
+      "classification": "SystemMetaData",
+      "purpose": "FeatureInsight"
+    },
+    "common.product": {
+      "classification": "SystemMetaData",
+      "purpose": "FeatureInsight"
+    },
+    "common.telemetryclientversion": {
+      "classification": "SystemMetaData",
+      "purpose": "FeatureInsight"
+    }
+  },
+  "events": {
+    "extensionActivated": {
+      "owner": "newdlops",
+      "comment": "Reports coarse extension configuration at successful activation so feature adoption can be understood without workspace or process identifiers.",
+      "engine": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "The configured debug engine: debugpy or experimental."
+      },
+      "hotReloadEnabled": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "Whether hot reload is enabled."
+      },
+      "mcpEnabled": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "Whether the workspace-scoped MCP endpoint is enabled."
+      },
+      "workspaceTrusted": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "Whether VS Code marks the current workspace as trusted."
+      },
+      "workspaceFolderCount": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "The number of folders open in the VS Code window.",
+        "isMeasurement": true
+      }
+    },
+    "commandInvoked": {
+      "owner": "newdlops",
+      "comment": "Reports which fixed extension command was invoked to understand feature usage.",
+      "command": {
+        "classification": "PublicNonPersonalData",
+        "purpose": "FeatureInsight",
+        "comment": "One of the command identifiers declared by this extension."
+      }
+    },
+    "debugSessionStarted": {
+      "owner": "newdlops",
+      "comment": "Reports the categorical options of a Django Process Debugger session when VS Code starts it.",
+      "engine": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "The session debug engine: debugpy or experimental."
+      },
+      "hotReloadEnabled": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "Whether hot reload is enabled for the selected engine."
+      },
+      "justMyCode": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "Whether the session is configured to debug only user code."
+      },
+      "redirectOutput": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "Whether the session redirects process output to the Debug Console."
+      }
+    },
+    "debugSessionTerminated": {
+      "owner": "newdlops",
+      "comment": "Reports the coarse duration of a Django Process Debugger session without sending the VS Code session identifier.",
+      "engine": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "The session debug engine: debugpy or experimental."
+      },
+      "durationMs": {
+        "classification": "SystemMetaData",
+        "purpose": "PerformanceAndHealth",
+        "comment": "Elapsed session duration in milliseconds.",
+        "isMeasurement": true
+      }
+    }
+  }
+}

@@ -113,6 +113,9 @@ describe('Feature: live MCP-to-Django debugger vertical flow', function () {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
     assert.ok(workspaceFolder?.uri.scheme === 'file', 'live MCP E2E requires a local workspace');
     const workspacePath = workspaceFolder.uri.fsPath;
+    const engineConfiguration = vscode.workspace.getConfiguration('djangoProcessDebugger');
+    const previousGlobalEngine = engineConfiguration.inspect<unknown>('engine')?.globalValue;
+    let engineOverrideApplied = false;
     const sourcePath = path.join(workspacePath, 'mcp_breakpoint_target.py');
     const source = await fs.readFile(sourcePath, 'utf8');
     const breakpointLine = source.split(/\r?\n/)
@@ -126,6 +129,15 @@ describe('Feature: live MCP-to-Django debugger vertical flow', function () {
     });
 
     try {
+      // This scenario intentionally covers optional debugpy even though new
+      // sessions now default to the dependency-free experimental engine.
+      await engineConfiguration.update(
+        'engine',
+        'debugpy',
+        vscode.ConfigurationTarget.Global,
+      );
+      engineOverrideApplied = true;
+
       const extension = vscode.extensions.getExtension(EXTENSION_ID);
       assert.ok(extension, `extension ${EXTENSION_ID} not found`);
       if (!extension.isActive) {
@@ -257,6 +269,17 @@ describe('Feature: live MCP-to-Django debugger vertical flow', function () {
       assert.strictEqual(cleared.count, 0);
     } finally {
       sessionListener.dispose();
+      if (engineOverrideApplied) {
+        try {
+          await engineConfiguration.update(
+            'engine',
+            previousGlobalEngine,
+            vscode.ConfigurationTarget.Global,
+          );
+        } catch {
+          // Keep cleanup best-effort when the test host is already shutting down.
+        }
+      }
       if (client) {
         try {
           await client.callTool('django_breakpoints_update', { breakpoints: [] }, 5_000);

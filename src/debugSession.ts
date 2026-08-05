@@ -3,6 +3,7 @@ import { DebugpyInjector, isValidExperimentalAuthToken } from './debugpyInjector
 import { DebugEngine, DEFAULT_DEBUG_ENGINE, normalizeDebugEngine } from './debugEngine';
 import { log, logError, getLogger } from './logger';
 import { formatEndpoint } from './listeningEndpoint';
+import { presentAttachFailure } from './attachFailurePresentation';
 
 export const DEBUG_SESSION_LOCK_TOKEN_KEY = '__djangoProcessDebuggerLockToken';
 export const DEBUG_SESSION_AUTH_TOKEN_KEY = '__djangoProcessDebuggerAuthToken';
@@ -87,7 +88,7 @@ export class DjangoDebugConfigurationProvider
     try {
       pid = parseDebugSessionPid(config.pid);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = presentAttachFailure(err).message;
       logError('[DebugConfiguration] Invalid attach configuration', err);
       void vscode.window.showErrorMessage(message);
       return undefined;
@@ -142,7 +143,7 @@ export class DjangoDebugConfigurationProvider
       );
       return config;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = presentAttachFailure(err).message;
       logError('[DebugConfiguration] Experimental attach preparation failed', err);
       vscode.window.showErrorMessage(message, 'Show Logs').then((choice) => {
         if (choice === 'Show Logs') { getLogger().show(); }
@@ -176,7 +177,7 @@ export class DjangoDebugSessionFactory
     try {
       pid = parseDebugSessionPid(config.pid);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = presentAttachFailure(err).message;
       logError('[DebugSession] Invalid attach configuration', err);
       void vscode.window.showErrorMessage(msg);
       return null;
@@ -256,8 +257,9 @@ export class DjangoDebugSessionFactory
           logError('[DebugSession] Failed to release PID lock after activation failure', releaseErr);
         }
         logError(`[DebugSession] Activation failed`, err);
-        const msg = err instanceof Error ? err.message : String(err);
-        vscode.window.showErrorMessage(msg, 'Show Logs').then((c) => {
+        const presentation = presentAttachFailure(err);
+        const actions = presentation.actions.filter((action) => action === 'Show Logs');
+        vscode.window.showErrorMessage(presentation.message, ...actions).then((c) => {
           if (c === 'Show Logs') { getLogger().show(); }
         });
         return null;

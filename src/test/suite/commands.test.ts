@@ -86,7 +86,7 @@ describe('Feature: command registration', function () {
 
     const engine = props['djangoProcessDebugger.engine'];
     assert.strictEqual(engine.type, 'string');
-    assert.strictEqual(engine.default, 'debugpy');
+    assert.strictEqual(engine.default, 'experimental');
     assert.deepStrictEqual(engine.enum, ['debugpy', 'experimental']);
   });
 
@@ -111,7 +111,7 @@ describe('Feature: command registration', function () {
 
     const engine = debuggerContribution.configurationAttributes?.attach?.properties?.engine;
     assert.ok(engine, 'missing attach engine property');
-    assert.strictEqual(engine.default, 'debugpy');
+    assert.strictEqual(engine.default, 'experimental');
     assert.deepStrictEqual(engine.enum, ['debugpy', 'experimental']);
 
     const pid = debuggerContribution.configurationAttributes?.attach?.properties?.pid;
@@ -120,6 +120,6 @@ describe('Feature: command registration', function () {
     assert.strictEqual(pid.minimum, 1);
 
     const snippet = debuggerContribution.configurationSnippets?.[0]?.body;
-    assert.strictEqual(snippet?.engine, 'debugpy');
+    assert.strictEqual(snippet?.engine, 'experimental');
   });
 });

@@ -35,6 +35,7 @@ import {
   DjangoDebugSessionFactory,
   ensureDebugSessionLockToken,
 } from './debugSession';
+import { presentAttachFailure } from './attachFailurePresentation';
 import {
   DEFAULT_DEBUG_ENGINE,
   DebugEngine,
@@ -73,6 +74,11 @@ import {
   type McpWorkspaceFolderManifest,
 } from './mcp/windowRegistry';
 import type { McpTransportBackend } from './mcp/transport';
+import {
+  createExtensionTelemetry,
+  ExtensionTelemetry,
+  type TelemetryCommandId,
+} from './telemetry';
 
 const LOCK_DIR = '/tmp/django-process-debugger';
 const LEGACY_LOCK_FILE = path.join(LOCK_DIR, 'debug-session.lock');
@@ -81,6 +87,7 @@ const MCP_WINDOW_ID_VARIABLE = 'DJANGO_PROCESS_DEBUGGER_WINDOW_ID';
 const MCP_REGISTRY_DIR_VARIABLE = 'DJANGO_PROCESS_DEBUGGER_MCP_REGISTRY_DIR';
 let activeHotReloadShutdown: (() => Promise<void>) | undefined;
 let activeMcpShutdown: (() => Promise<void>) | undefined;
+let activeTelemetryShutdown: (() => Promise<void>) | undefined;
 
 export function mcpToolRequiresEvaluatePermission(name: string, args: unknown): boolean {
   if (name === 'django_expression_inspect') {
@@ -250,8 +257,36 @@ function targetEngineFromSession(session: vscode.DebugSession): DebugEngine {
   return normalizeDebugEngine(session.configuration.engine ?? getConfiguredDebugEngine());
 }
 
+/** Engine-less lock files predate the native-tracer default and mean debugpy. */
+function engineFromLock(lock: Pick<LockInfo, 'engine'> | null | undefined): DebugEngine {
+  return lock?.engine === undefined ? 'debugpy' : normalizeDebugEngine(lock.engine);
+}
+
 export function activate(context: vscode.ExtensionContext): DjangoProcessDebuggerPublicApiV1 {
   log('Extension activating...');
+
+  let telemetry: ExtensionTelemetry;
+  try {
+    telemetry = createExtensionTelemetry(context);
+  } catch (error) {
+    logError('[Telemetry] Reporter initialization failed; telemetry is disabled', error);
+    telemetry = new ExtensionTelemetry();
+  }
+  if (!telemetry.isConfigured) {
+    log('[Telemetry] Disabled: no publisher connection string is configured');
+  }
+  activeTelemetryShutdown = () => telemetry.shutdown();
+  context.subscriptions.push(telemetry);
+
+  function registerTelemetryCommand(
+    command: TelemetryCommandId,
+    callback: () => void | Promise<void>,
+  ): vscode.Disposable {
+    return vscode.commands.registerCommand(command, () => {
+      telemetry.sendCommandInvoked(command);
+      return callback();
+    });
+  }
 
   const processFinder = new DjangoProcessFinder();
   const injector = new DebugpyInjector();
@@ -708,7 +743,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       const reservation = await reservePidLock(lockInfoForTarget(session, target, 'pending'));
       if (!reservation.acquired) {
         const existingLock = reservation.conflict;
-        const lockedEngine = normalizeDebugEngine(existingLock?.engine);
+        const lockedEngine = engineFromLock(existingLock);
         return {
           allowed: false,
           message: existingLock
@@ -1041,16 +1076,14 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
           title: 'Preparing Django Process Debugger runtime...',
         },
         async (progress) => {
-          progress.report({ message: 'Preparing debugger backends...' });
-          debugpyInfo = await ensureDebugpy(selection.preflight.resolvedPythonPath);
+          progress.report({ message: 'Preparing debugger bootstrap...' });
+          if (getConfiguredDebugEngine() === 'debugpy') {
+            debugpyInfo = await ensureDebugpy(selection.preflight.resolvedPythonPath);
+          }
           progress.report({ message: `Installing bootstrap into ${selection.preflight.sitePackages}...` });
           await injector.installBootstrap(selection.preflight.sitePackages);
         },
       );
-
-      if (!debugpyInfo) {
-        throw new Error('Bundled debugpy was not prepared.');
-      }
 
       const profile = createSetupProfile(selection.candidate, selection.preflight, debugpyInfo, reason);
       await saveSetupProfile(context, profile);
@@ -1079,9 +1112,9 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       label: engine === 'experimental'
         ? '$(beaker) Experimental Native Tracer'
         : '$(debug-alt) debugpy',
-      description: engine === 'experimental' ? 'Experimental opt-in' : 'Stable default',
+      description: engine === 'experimental' ? 'Default engine' : 'Requires debugpy provisioning',
       detail: engine === 'experimental'
-        ? 'Limited feature set. Restart an already-activated target before switching engines.'
+        ? 'Built in; debugpy and pip are not needed for setup. Restart an already-activated target before switching engines.'
         : 'Full-featured stable backend.',
     });
 
@@ -1107,7 +1140,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       label: '$(debug-alt) Bundled debugpy',
       description: `${debugpyInfo.source}${debugpyInfo.version ? ` ${debugpyInfo.version}` : ''}`,
       detail: engine === 'experimental'
-        ? `Stable fallback • ${debugpyInfo.path}`
+        ? `Optional for explicit debugpy attaches • ${debugpyInfo.path}`
         : debugpyInfo.path,
     });
 
@@ -1136,7 +1169,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
   }
 
   // Command: Setup
-  const setupCmd = vscode.commands.registerCommand(
+  const setupCmd = registerTelemetryCommand(
     SETUP_COMMAND_ID,
     async () => {
       log('Command: setup');
@@ -1152,7 +1185,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
   );
 
   // Command: Show setup status
-  const statusCmd = vscode.commands.registerCommand(
+  const statusCmd = registerTelemetryCommand(
     STATUS_COMMAND_ID,
     async () => {
       log('Command: showSetupStatus');
@@ -1162,7 +1195,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
 
 
   // Command: Attach to process
-  const attachCmd = vscode.commands.registerCommand(
+  const attachCmd = registerTelemetryCommand(
     'djangoProcessDebugger.attachToProcess',
     async () => {
       const engine = getConfiguredDebugEngine();
@@ -1348,7 +1381,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         const lockValid = await isPidLockLive(existingLock);
 
         if (lockValid) {
-          const lockedEngine = normalizeDebugEngine(existingLock.engine);
+          const lockedEngine = engineFromLock(existingLock);
           log(
             `Active ${lockedEngine} debug session detected from workspace ` +
             `"${existingLock.workspaceName}" (PID ${existingLock.pid})`
@@ -1394,7 +1427,9 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         if (!bootstrapUpToDate) {
           log(`[Attach] Bootstrap outdated in ${sitePackages}, auto-updating...`);
           try {
-            await ensureDebugpy(resolvedPythonPath);
+            if (engine === 'debugpy') {
+              await ensureDebugpy(resolvedPythonPath);
+            }
             await injector.installBootstrap(sitePackages);
             log(`[Attach] Bootstrap auto-updated. Note: takes effect on next Django restart.`);
             vscode.window.showInformationMessage(
@@ -1402,10 +1437,22 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
             );
           } catch (updateErr) {
             logError('[Attach] Bootstrap auto-update failed', updateErr);
+            const presentation = presentAttachFailure(updateErr);
+            const choice = await vscode.window.showErrorMessage(presentation.message, ...presentation.actions);
+            if (choice === 'Show Status') { await showSetupStatus(); }
+            else if (choice === 'Show Logs') { getLogger().show(); }
+            else if (choice === 'Run Setup') { await vscode.commands.executeCommand(SETUP_COMMAND_ID); }
+            return;
           }
         }
       } catch (err) {
         logError(`[Attach] Failed to inspect runtime ${resolvedPythonPath}`, err);
+        const presentation = presentAttachFailure(err);
+        const choice = await vscode.window.showErrorMessage(presentation.message, ...presentation.actions);
+        if (choice === 'Show Status') { await showSetupStatus(); }
+        else if (choice === 'Show Logs') { getLogger().show(); }
+        else if (choice === 'Run Setup') { await vscode.commands.executeCommand(SETUP_COMMAND_ID); }
+        return;
       }
 
       if (engine === 'debugpy') {
@@ -1440,6 +1487,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       } catch (err) {
         logError(`Attach failed for PID=${pid}`, err);
 
+        const presentation = presentAttachFailure(err);
         if (err instanceof BootstrapNotInstalledError) {
           const choice = await vscode.window.showErrorMessage(
             `Debug bootstrap is not installed in the target runtime: ${resolvedPythonPath}`,
@@ -1482,13 +1530,10 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
             getLogger().show();
           }
         } else {
-          const msg = err instanceof Error ? err.message : String(err);
-          const choice = await vscode.window.showErrorMessage(
-            `Debugger attach failed: ${msg}`,
-            'Show Status',
-            'Show Logs',
-          );
-          if (choice === 'Show Status') {
+          const choice = await vscode.window.showErrorMessage(presentation.message, ...presentation.actions);
+          if (choice === 'Run Setup') {
+            await vscode.commands.executeCommand(SETUP_COMMAND_ID);
+          } else if (choice === 'Show Status') {
             await showSetupStatus();
           } else if (choice === 'Show Logs') {
             getLogger().show();
@@ -1548,7 +1593,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         timestamp: new Date().toISOString(),
       });
       if (!provisionalReservation.acquired) {
-        const lockedEngine = normalizeDebugEngine(provisionalReservation.conflict?.engine);
+        const lockedEngine = engineFromLock(provisionalReservation.conflict);
         vscode.window.showErrorMessage(
           `Cannot attach: PID ${pid} was claimed by another ${lockedEngine} debug session while preparing the target. ` +
           `Stop that session first.`
@@ -1586,7 +1631,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
   );
 
   // Command: Kill Django/Celery process
-  const killCmd = vscode.commands.registerCommand(
+  const killCmd = registerTelemetryCommand(
     'djangoProcessDebugger.killProcess',
     async () => {
       log('Command: killProcess');
@@ -1643,7 +1688,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
   );
 
   // Command: Reinstall debugpy
-  const reinstallCmd = vscode.commands.registerCommand(
+  const reinstallCmd = registerTelemetryCommand(
     'djangoProcessDebugger.reinstallDebugpy',
     async () => {
       log('Command: reinstallDebugpy');
@@ -1672,6 +1717,10 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
               return;
             }
             injector.setBundledDebugpyPath(debugpyInfo.path);
+            const profile = await getSetupProfile(context);
+            if (profile?.sitePackages) {
+              await injector.installBootstrap(profile.sitePackages);
+            }
           },
         );
         if (!debugpyInfo) {
@@ -1691,7 +1740,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
   );
 
   // Command: scoped cleanup for this workspace's saved runtime
-  const cleanLsCmd = vscode.commands.registerCommand(
+  const cleanLsCmd = registerTelemetryCommand(
     'djangoProcessDebugger.cleanPythonLanguageServer',
     async () => {
       log('Command: cleanThisWorkspace');
@@ -1927,7 +1976,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
     }
   }
 
-  const installMcpCmd = vscode.commands.registerCommand(
+  const installMcpCmd = registerTelemetryCommand(
     'djangoProcessDebugger.installMcp',
     async () => {
       const folder = await selectMcpWorkspaceFolder(
@@ -1938,7 +1987,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       }
     },
   );
-  const repairMcpCmd = vscode.commands.registerCommand(
+  const repairMcpCmd = registerTelemetryCommand(
     'djangoProcessDebugger.repairMcp',
     async () => {
       const folder = await selectMcpWorkspaceFolder('Select the MCP project to repair');
@@ -1947,7 +1996,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       }
     },
   );
-  const verifyMcpCmd = vscode.commands.registerCommand(
+  const verifyMcpCmd = registerTelemetryCommand(
     'djangoProcessDebugger.verifyMcp',
     async () => {
       const folder = await selectMcpWorkspaceFolder('Select the MCP project to verify');
@@ -1956,7 +2005,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       }
     },
   );
-  const mcpStatusCmd = vscode.commands.registerCommand(
+  const mcpStatusCmd = registerTelemetryCommand(
     'djangoProcessDebugger.showMcpStatus',
     async () => {
       const folder = await selectMcpWorkspaceFolder('Select the MCP project to inspect');
@@ -2421,6 +2470,19 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       mcpController.handleSessionStarted(session);
       const engine = session.type === 'django-process' ? targetEngineFromSession(session) : undefined;
       const sessionPid = session.type === 'django-process' ? targetPidFromSession(session) : undefined;
+      if (engine) {
+        const debuggerConfiguration = vscode.workspace.getConfiguration('djangoProcessDebugger');
+        telemetry.sendDebugSessionStarted(session.id, {
+          engine,
+          hotReloadEnabled: supportsHotReload(engine) && hotReloadLeaseManager.getState().enabled,
+          justMyCode: typeof session.configuration.justMyCode === 'boolean'
+            ? session.configuration.justMyCode
+            : debuggerConfiguration.get<boolean>('justMyCode', true),
+          redirectOutput: typeof session.configuration.redirectOutput === 'boolean'
+            ? session.configuration.redirectOutput
+            : debuggerConfiguration.get<boolean>('redirectOutput', true),
+        });
+      }
       const hotReloadLifecycleToken = session.type === 'django-process'
         ? ensureHotReloadLifecycleToken(session)
         : undefined;
@@ -2513,6 +2575,9 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
     }),
     vscode.debug.onDidTerminateDebugSession(async (session) => {
       log(`[DebugSession] Terminated: ${session.name}`);
+      if (session.type === 'django-process') {
+        telemetry.sendDebugSessionTerminated(session.id);
+      }
       await queueDebugSessionFinalization(session, 'VS Code terminate event');
     }),
   );
@@ -2746,6 +2811,14 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
     hotReloadStatusItem,
     getLogger(),
   );
+  const activationConfiguration = vscode.workspace.getConfiguration('djangoProcessDebugger');
+  telemetry.sendExtensionActivated({
+    engine: getConfiguredDebugEngine(),
+    hotReloadEnabled: activationConfiguration.get<boolean>('hotReload', true),
+    mcpEnabled: activationConfiguration.get<boolean>('mcp.enabled', true),
+    workspaceTrusted: vscode.workspace.isTrusted,
+    workspaceFolderCount: vscode.workspace.workspaceFolders?.length ?? 0,
+  });
   log('Extension activated');
   return DJANGO_PROCESS_DEBUGGER_PUBLIC_API;
 }
@@ -2769,10 +2842,13 @@ function findFreePort(): Promise<number> {
 export async function deactivate(): Promise<void> {
   const hotReloadShutdown = activeHotReloadShutdown;
   const mcpShutdown = activeMcpShutdown;
+  const telemetryShutdown = activeTelemetryShutdown;
   activeHotReloadShutdown = undefined;
   activeMcpShutdown = undefined;
+  activeTelemetryShutdown = undefined;
   await Promise.allSettled([
     hotReloadShutdown?.(),
     mcpShutdown?.(),
+    telemetryShutdown?.(),
   ].filter((operation): operation is Promise<void> => operation !== undefined));
 }
