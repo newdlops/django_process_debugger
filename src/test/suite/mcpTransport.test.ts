@@ -249,7 +249,10 @@ describe('Feature: window-local MCP Streamable HTTP transport', function () {
 
     const oversized = await request(server, {
       token: server.token,
-      body: 'x'.repeat(MCP_MAX_REQUEST_BODY_BYTES + 1),
+      // The server rejects this from Content-Length before reading a body.
+      // Keep the payload tiny so a correct early 413 cannot race a 1 MiB
+      // client write and surface as ECONNRESET in the test harness.
+      body: 'x',
       headers: { 'content-length': String(MCP_MAX_REQUEST_BODY_BYTES + 1) },
     });
     assert.strictEqual(oversized.statusCode, 413);
