@@ -24,6 +24,11 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
       - name: Install dependencies
         run: npm ci
 
@@ -42,4 +47,6 @@ jobs:
         run: npm run compile
 
       - name: Run extension tests
+        env:
+          DPD_TEST_PYTHON: python3
         run: npm test
