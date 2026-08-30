@@ -24,7 +24,7 @@ const TRACER_SOURCE_PATH = path.resolve(
   'python',
   'django_process_debugger_tracer.py',
 );
-export const BOOTSTRAP_VERSION = '2026.08.05.1';
+export const BOOTSTRAP_VERSION = '2026.08.30.1';
 export type DebugpyEndpoint = TcpListeningEndpoint & { authToken?: string };
 const ACTIVE_ENDPOINT_RECORD_VERSION = 3;
 type BootstrapRuntimeState = {
@@ -258,6 +258,14 @@ function makeBootstrapScript(bundledDebugpyPath: string | null): string {
     '        _runtime_id = _os.urandom(32).hex()',
     '        _control_socket_path = f"{_PORT_FILE_DIR}/{_bootstrap_pid}.control.sock"',
     '        _control_server_socket = None',
+    '        # /tmp can be cleared independently of the persistent venv install.',
+    '        # Recreate the private runtime directory before logging or binding',
+    '        # so the first target process after a reboot can initialize itself.',
+    '        _os.makedirs(_PORT_FILE_DIR, exist_ok=True)',
+    '        try:',
+    '            _os.chmod(_PORT_FILE_DIR, 0o700)',
+    '        except Exception:',
+    '            pass',
     '',
     '        def _dbg_log(msg):',
     '            try:',
@@ -1287,6 +1295,8 @@ export class DebugpyInjector {
    * Requires restarting the Django server after installation.
    */
   async installBootstrap(venvSitePackages: string): Promise<void> {
+    await ensurePrivatePortFileDir();
+
     // Warn (but allow) installing into global/system site-packages
     const parentDir = path.resolve(venvSitePackages, '..', '..', '..');
     const isVenv = await this.isVenvDir(parentDir);

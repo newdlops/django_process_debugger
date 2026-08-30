@@ -371,14 +371,6 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
     processFinder,
     windowId: mcpWindowId,
     getWorkspaceFolders: () => vscode.workspace.workspaceFolders,
-    startDebugging: async (folder, configuration) => {
-      try {
-        return await vscode.debug.startDebugging(folder, configuration);
-      } catch (error) {
-        logError('[MCP] VS Code startDebugging failed', error);
-        throw error;
-      }
-    },
     getEngine: getConfiguredDebugEngine,
     getJustMyCode: () => vscode.workspace
       .getConfiguration('djangoProcessDebugger')

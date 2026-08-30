@@ -21,9 +21,6 @@ async function main(): Promise<void> {
     await runTests({
       extensionDevelopmentPath,
       extensionTestsPath,
-      extensionTestsEnv: {
-        DPD_TEST_DIAGNOSTICS: '1',
-      },
       launchArgs: [
         workspacePath,
         `--user-data-dir=${path.join(profileRoot, 'user-data')}`,

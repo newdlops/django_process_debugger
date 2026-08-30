@@ -156,6 +156,15 @@ describe('Feature: debugpy injector bootstrap lifecycle', function () {
     assert.ok(content.includes('_thread.django_debugger_do_not_trace = True'));
     assert.ok(content.includes('owns this PID until restart'));
     assert.ok(content.includes('register_at_fork'));
+    const createRuntimeDirectory = content.indexOf(
+      '_os.makedirs(_PORT_FILE_DIR, exist_ok=True)',
+    );
+    const bindControlSocket = content.indexOf('_server.bind(_control_socket_path)');
+    assert.ok(createRuntimeDirectory >= 0, 'bootstrap must create its runtime directory');
+    assert.ok(
+      createRuntimeDirectory < bindControlSocket,
+      'bootstrap must create its runtime directory before binding the control socket',
+    );
     assert.ok(content.includes(
       'if isinstance(_request, dict) and _request.get("version") == 3:',
     ));
@@ -166,6 +175,67 @@ describe('Feature: debugpy injector bootstrap lifecycle', function () {
     assert.ok(!content.includes('_signal.signal('), 'fatal process signals must not be installed');
     assert.ok(!content.includes('SIGUSR1'));
     assert.ok(!content.includes('SIGUSR2'));
+  });
+
+  it('recreates a missing runtime directory before the first control-socket bind', async function () {
+    this.timeout(15_000);
+    if (process.platform === 'win32') { this.skip(); return; }
+    const python = await findSystemPython();
+    if (!python) { this.skip(); return; }
+
+    const installedPath = path.join(sitePackages, '_django_debug_bootstrap.py');
+    const runtimeDirectory = path.join(tmpDir, 'cold-start-runtime');
+    const relocatedPath = path.join(tmpDir, '_django_debug_bootstrap_cold_start.py');
+    const installed = await fs.readFile(installedPath, 'utf-8');
+    const relocated = installed.replace(
+      '_PORT_FILE_DIR = "/tmp/django-process-debugger"',
+      `_PORT_FILE_DIR = ${JSON.stringify(runtimeDirectory)}`,
+    );
+    assert.notStrictEqual(relocated, installed, 'test must relocate the runtime directory');
+    await fs.writeFile(relocatedPath, relocated, 'utf-8');
+    await assert.rejects(fs.access(runtimeDirectory));
+
+    const script = [
+      'import importlib.util',
+      'import json',
+      'import os',
+      'import sys',
+      'sys.orig_argv = [sys.executable, "manage.py", "runserver"]',
+      'spec = importlib.util.spec_from_file_location("_dpd_cold_start", sys.argv[1])',
+      'module = importlib.util.module_from_spec(spec)',
+      'sys.modules[spec.name] = module',
+      'spec.loader.exec_module(module)',
+      'print(json.dumps({"pid": os.getpid()}), flush=True)',
+    ].join('\n');
+    const { stdout } = await execFileAsync(
+      python,
+      ['-c', script, relocatedPath],
+      {
+        timeout: 10_000,
+        env: {
+          ...process.env,
+          PORT_MANAGER_HOOK: '0',
+          PORT_MANAGER_HOOK_DISABLED: '1',
+          DYLD_INSERT_LIBRARIES: undefined,
+          LD_PRELOAD: undefined,
+        },
+      },
+    );
+    const { pid } = JSON.parse(stdout.trim()) as { pid: number };
+    const state = JSON.parse(await fs.readFile(
+      path.join(runtimeDirectory, `${pid}.bootstrap.json`),
+      'utf-8',
+    )) as Record<string, unknown>;
+    assert.strictEqual(state.pid, pid);
+    assert.strictEqual(
+      state.controlSocket,
+      path.join(runtimeDirectory, `${pid}.control.sock`),
+    );
+    assert.strictEqual(
+      (await fs.stat(path.join(runtimeDirectory, `${pid}.control.sock`))).isSocket(),
+      true,
+    );
+    assert.strictEqual((await fs.stat(runtimeDirectory)).mode & 0o777, 0o700);
   });
 
   it('accepts only v3 active records bound to the current runtime identity', function () {

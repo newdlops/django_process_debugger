@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## [0.2.919] - 2026-08-30
+
+- Fixed first-run bootstrap activation after a reboot or temporary-directory cleanup by recreating the private runtime directory before binding the control socket. The bootstrap version is now `2026.08.30.1`, so existing targets must rerun setup and restart to load the fix.
+- Added a deterministic cold-start regression plus readiness-gated live MCP-to-Django debugging coverage, and pinned CI to Python 3.14 with short isolated VS Code profiles.
+
 ## [0.2.918] - 2026-08-30
 
 - The built-in experimental tracer is now the default for new setup, snippets, direct attaches, and MCP attaches. It installs a usable bootstrap without debugpy or pip; selecting debugpy explicitly still provisions it and requires a process restart after bootstrap changes.

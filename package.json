@@ -2,7 +2,7 @@
   "name": "django-process-debugger",
   "displayName": "Django Process Debugger",
   "description": "Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase",
-  "version": "0.2.918",
+  "version": "0.2.919",
   "publisher": "newdlops",
   "telemetry": {
     "connectionString": "InstrumentationKey=8d0ee22b-dc6c-48e6-b768-9d170188370a;IngestionEndpoint=https://koreacentral-0.in.applicationinsights.azure.com/;LiveEndpoint=https://koreacentral.livediagnostics.monitor.azure.com/;ApplicationId=4a2bf58b-d308-4e25-aaa9-8992843ef0a9"
