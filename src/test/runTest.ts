@@ -15,6 +15,7 @@ async function main(): Promise<void> {
       launchArgs: [
         workspacePath,
         '--disable-extensions',
+        '--disable-telemetry',
         '--disable-workspace-trust',
       ],
     });

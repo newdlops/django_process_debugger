@@ -2,8 +2,12 @@
 
 ## Unreleased
 
+## [0.2.918] - 2026-08-30
+
 - The built-in experimental tracer is now the default for new setup, snippets, direct attaches, and MCP attaches. It installs a usable bootstrap without debugpy or pip; selecting debugpy explicitly still provisions it and requires a process restart after bootstrap changes.
 - Discovery preserves worktree-launched targets and normalized loopback listener forms. Attach failures now provide a specific setup, status, log, or restart remedy instead of continuing after runtime inspection/update failures.
+- Telemetry now reports privacy-bounded command outcomes and funnel stages, MCP tool outcomes, allowlisted setting changes, hot-reload batch outcomes, and debug-session entry points. Reporter failures are isolated from extension behavior, incomplete session tracking is bounded, and schema-contract, 100,000-event regression, and reproducible multi-million-event durability benchmarks cover the telemetry boundary.
+- Release verification now runs on Node.js 22 with the current VS Code Extension Host launcher and disables production telemetry for every automated test host.
 
 ## [0.2.914] - 2026-07-13
 

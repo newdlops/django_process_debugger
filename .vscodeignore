@@ -5,6 +5,7 @@
 .codex/**
 .codeidx/**
 .lh/**
+.plan/**
 .portmanager/**
 .zoek-rs/**
 .mcp.json
@@ -26,3 +27,4 @@ CLAUDE.md
 out/test/**
 test-results/**
 optimization.md
+TELEMETRY_QUERIES.md

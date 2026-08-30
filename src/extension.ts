@@ -65,7 +65,10 @@ import {
 import { setupMcpWorkspace } from './mcp/setup';
 import { diagnoseMcpWorkspace, type McpWorkspaceDiagnostics } from './mcp/diagnostics';
 import { McpVerificationError, verifyMcpWorkspace } from './mcp/verification';
-import { DjangoMcpDebugController } from './mcp/debugController';
+import {
+  DJANGO_MCP_SESSION_REF_CONFIG_KEY,
+  DjangoMcpDebugController,
+} from './mcp/debugController';
 import { startMcpWindowHost, type StartedMcpWindowHost } from './mcp/windowHost';
 import {
   createMcpWindowId,
@@ -76,8 +79,12 @@ import {
 import type { McpTransportBackend } from './mcp/transport';
 import {
   createExtensionTelemetry,
+  type DebugSessionSource,
   ExtensionTelemetry,
+  type HotReloadOutcome,
   type TelemetryCommandId,
+  type TelemetryCommandStage,
+  type TelemetryOutcome,
 } from './telemetry';
 
 const LOCK_DIR = '/tmp/django-process-debugger';
@@ -135,6 +142,11 @@ interface LockInfo {
   workspaceId: string;
   workspaceName: string;
   timestamp: string;
+}
+
+interface CommandTelemetryScope {
+  setStage(stage: TelemetryCommandStage): void;
+  setResult(outcome: TelemetryOutcome, stage?: TelemetryCommandStage): void;
 }
 
 function lockFileForPid(pid: number): string {
@@ -257,6 +269,16 @@ function targetEngineFromSession(session: vscode.DebugSession): DebugEngine {
   return normalizeDebugEngine(session.configuration.engine ?? getConfiguredDebugEngine());
 }
 
+function telemetrySourceFromSession(session: vscode.DebugSession): DebugSessionSource {
+  if (typeof session.configuration[DJANGO_MCP_SESSION_REF_CONFIG_KEY] === 'string') {
+    return 'mcp';
+  }
+  const ownerToken = session.configuration[DEBUG_SESSION_LOCK_TOKEN_KEY];
+  return typeof ownerToken === 'string' && ownerToken.startsWith('attach:')
+    ? 'command'
+    : 'launchConfiguration';
+}
+
 /** Engine-less lock files predate the native-tracer default and mean debugpy. */
 function engineFromLock(lock: Pick<LockInfo, 'engine'> | null | undefined): DebugEngine {
   return lock?.engine === undefined ? 'debugpy' : normalizeDebugEngine(lock.engine);
@@ -267,7 +289,11 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
 
   let telemetry: ExtensionTelemetry;
   try {
-    telemetry = createExtensionTelemetry(context);
+    telemetry = createExtensionTelemetry(context, undefined, {
+      onError: (phase, error) => {
+        logError(`[Telemetry] Reporter ${phase} failed; extension behavior is unaffected`, error);
+      },
+    });
   } catch (error) {
     logError('[Telemetry] Reporter initialization failed; telemetry is disabled', error);
     telemetry = new ExtensionTelemetry();
@@ -280,11 +306,32 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
 
   function registerTelemetryCommand(
     command: TelemetryCommandId,
-    callback: () => void | Promise<void>,
+    callback: (scope: CommandTelemetryScope) => void | Promise<void>,
   ): vscode.Disposable {
-    return vscode.commands.registerCommand(command, () => {
+    return vscode.commands.registerCommand(command, async () => {
+      const startedAt = Date.now();
+      let outcome: TelemetryOutcome = 'succeeded';
+      let stage: TelemetryCommandStage = 'execution';
       telemetry.sendCommandInvoked(command);
-      return callback();
+      const scope: CommandTelemetryScope = {
+        setStage(nextStage) {
+          stage = nextStage;
+        },
+        setResult(nextOutcome, nextStage) {
+          outcome = nextOutcome;
+          if (nextStage !== undefined) {
+            stage = nextStage;
+          }
+        },
+      };
+      try {
+        await callback(scope);
+      } catch (error) {
+        outcome = 'failed';
+        throw error;
+      } finally {
+        telemetry.sendCommandCompleted(command, outcome, stage, Date.now() - startedAt);
+      }
     });
   }
 
@@ -1171,10 +1218,12 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
   // Command: Setup
   const setupCmd = registerTelemetryCommand(
     SETUP_COMMAND_ID,
-    async () => {
+    async (commandTelemetry) => {
+      commandTelemetry.setStage('setup');
       log('Command: setup');
       const profile = await installSetupForRuntime('manual-setup');
       if (!profile) {
+        commandTelemetry.setResult('noAction', 'setup');
         return;
       }
 
@@ -1197,7 +1246,8 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
   // Command: Attach to process
   const attachCmd = registerTelemetryCommand(
     'djangoProcessDebugger.attachToProcess',
-    async () => {
+    async (commandTelemetry) => {
+      commandTelemetry.setStage('discovery');
       const engine = getConfiguredDebugEngine();
       const engineName = debugEngineDisplayName(engine);
       log(`Command: attachToProcess (engine=${engine})`);
@@ -1205,6 +1255,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       const processes = await processFinder.findDjangoProcesses();
       log(`Found ${processes.length} Django process(es)`);
       if (processes.length === 0) {
+        commandTelemetry.setResult('noAction', 'discovery');
         vscode.window.showWarningMessage(
           'No running Django processes found. Start a Django server first.'
         );
@@ -1337,12 +1388,14 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       }));
 
       if (items.length === 0) {
+        commandTelemetry.setResult('noAction', 'discovery');
         vscode.window.showWarningMessage(
           'No attachable Django processes found with a host:port listener.'
         );
         return;
       }
 
+      commandTelemetry.setStage('selection');
       const selected = await vscode.window.showQuickPick(items, {
         placeHolder: `Select a Django process to attach ${engineName}`,
         matchOnDescription: true,
@@ -1350,10 +1403,12 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       });
 
       if (!selected) {
+        commandTelemetry.setResult('cancelled', 'selection');
         log('User cancelled process selection');
         return;
       }
 
+      commandTelemetry.setStage('preflight');
       const pid = selected.resolvedPid;
       const resolvedPythonPath = await injector.resolvePythonForPid(pid);
       const targetProcess: DjangoProcess = {
@@ -1381,6 +1436,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         const lockValid = await isPidLockLive(existingLock);
 
         if (lockValid) {
+          commandTelemetry.setResult('blocked', 'preflight');
           const lockedEngine = engineFromLock(existingLock);
           log(
             `Active ${lockedEngine} debug session detected from workspace ` +
@@ -1403,6 +1459,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         const sitePackages = await injector.resolveSitePackages(resolvedPythonPath);
         const bootstrapInstalled = await injector.isBootstrapInstalled(sitePackages);
         if (!bootstrapInstalled) {
+          commandTelemetry.setResult('noAction', 'setup');
           const choice = await vscode.window.showWarningMessage(
             `This runtime is not set up yet: ${resolvedPythonPath}`,
             'Install for Next Restart',
@@ -1436,6 +1493,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
               `Debugger bootstrap updated to v${BOOTSTRAP_VERSION}. Restart the Django server to load the new engine support.`
             );
           } catch (updateErr) {
+            commandTelemetry.setResult('failed', 'setup');
             logError('[Attach] Bootstrap auto-update failed', updateErr);
             const presentation = presentAttachFailure(updateErr);
             const choice = await vscode.window.showErrorMessage(presentation.message, ...presentation.actions);
@@ -1446,6 +1504,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
           }
         }
       } catch (err) {
+        commandTelemetry.setResult('failed', 'preflight');
         logError(`[Attach] Failed to inspect runtime ${resolvedPythonPath}`, err);
         const presentation = presentAttachFailure(err);
         const choice = await vscode.window.showErrorMessage(presentation.message, ...presentation.actions);
@@ -1459,6 +1518,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         try {
           await ensureDebugpy(resolvedPythonPath);
         } catch (err) {
+          commandTelemetry.setResult('failed', 'setup');
           logError('Failed to prepare bundled debugpy', err);
           const choice = await vscode.window.showErrorMessage(
             'Failed to prepare bundled debugpy.',
@@ -1478,6 +1538,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       }
 
       let debugEndpoint: DebugpyEndpoint;
+      commandTelemetry.setStage('activation');
       try {
         debugEndpoint = await injector.activateEndpoint(pid, port, engine);
         if (debugEndpoint.port !== port) {
@@ -1485,6 +1546,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         }
         log(`${engineName} activated for PID=${pid} on ${formatEndpoint(debugEndpoint)}`);
       } catch (err) {
+        commandTelemetry.setResult('failed', 'activation');
         logError(`Attach failed for PID=${pid}`, err);
 
         const presentation = presentAttachFailure(err);
@@ -1564,6 +1626,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       debugConfig[DEBUG_SESSION_LOCK_TOKEN_KEY] = ownerToken;
       if (engine === 'experimental') {
         if (!isValidExperimentalAuthToken(debugEndpoint.authToken)) {
+          commandTelemetry.setResult('failed', 'activation');
           vscode.window.showErrorMessage(
             'Experimental tracer did not publish a valid DAP authentication credential. ' +
             'Restart the target process after updating the bootstrap.'
@@ -1580,6 +1643,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
 
       // Claim atomically immediately before starting: activation/setup can take
       // long enough for a direct launch.json session to reserve this PID.
+      commandTelemetry.setStage('sessionStart');
       const provisionalReservation = await reservePidLock({
         pid,
         engine,
@@ -1593,6 +1657,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         timestamp: new Date().toISOString(),
       });
       if (!provisionalReservation.acquired) {
+        commandTelemetry.setResult('blocked', 'sessionStart');
         const lockedEngine = engineFromLock(provisionalReservation.conflict);
         vscode.window.showErrorMessage(
           `Cannot attach: PID ${pid} was claimed by another ${lockedEngine} debug session while preparing the target. ` +
@@ -1605,6 +1670,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       try {
         started = await vscode.debug.startDebugging(undefined, debugConfig);
       } catch (error) {
+        commandTelemetry.setResult('failed', 'sessionStart');
         await abandonPidOwnership(pid, undefined, ownerToken, 'startDebugging threw');
         logError('[DebugSession] VS Code startDebugging threw', error);
         const message = error instanceof Error ? error.message : String(error);
@@ -1617,10 +1683,12 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       log(`Debug session started: ${started}`);
 
       if (started) {
+        commandTelemetry.setResult('succeeded', 'sessionStart');
         vscode.window.showInformationMessage(
           `$(debug-alt) ${sessionLabel} (PID: ${pid}) attached with ${engineName} on ${formatEndpoint(debugEndpoint)}`
         );
       } else {
+        commandTelemetry.setResult('failed', 'sessionStart');
         await abandonPidOwnership(pid, undefined, ownerToken, 'startDebugging rejected');
         vscode.window.showErrorMessage(
           'Failed to start debug session. Check logs for details.',
@@ -1633,11 +1701,13 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
   // Command: Kill Django/Celery process
   const killCmd = registerTelemetryCommand(
     'djangoProcessDebugger.killProcess',
-    async () => {
+    async (commandTelemetry) => {
+      commandTelemetry.setStage('discovery');
       log('Command: killProcess');
 
       const processes = await processFinder.findDjangoProcesses();
       if (processes.length === 0) {
+        commandTelemetry.setResult('noAction', 'discovery');
         vscode.window.showWarningMessage('No running Django/Celery processes found.');
         return;
       }
@@ -1658,6 +1728,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         };
       });
 
+      commandTelemetry.setStage('selection');
       const selected = await vscode.window.showQuickPick(items, {
         placeHolder: 'Select a process to kill',
         canPickMany: true,
@@ -1666,16 +1737,20 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       });
 
       if (!selected || selected.length === 0) {
+        commandTelemetry.setResult('cancelled', 'selection');
         log('User cancelled process kill');
         return;
       }
 
+      commandTelemetry.setStage('execution');
+      let killFailed = false;
       for (const item of selected) {
         const pid = item.process.pid;
         try {
           process.kill(pid, 'SIGTERM');
           log(`Sent SIGTERM to PID=${pid}`);
         } catch (err) {
+          killFailed = true;
           logError(`Failed to kill PID=${pid}`, err);
           const msg = err instanceof Error ? err.message : String(err);
           vscode.window.showErrorMessage(`Failed to kill PID ${pid}: ${msg}`);
@@ -1684,13 +1759,17 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
 
       const pids = selected.map((s) => s.process.pid).join(', ');
       vscode.window.showInformationMessage(`Sent SIGTERM to PID: ${pids}`);
+      if (killFailed) {
+        commandTelemetry.setResult('failed', 'execution');
+      }
     }
   );
 
   // Command: Reinstall debugpy
   const reinstallCmd = registerTelemetryCommand(
     'djangoProcessDebugger.reinstallDebugpy',
-    async () => {
+    async (commandTelemetry) => {
+      commandTelemetry.setStage('setup');
       log('Command: reinstallDebugpy');
 
       try {
@@ -1724,12 +1803,14 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
           },
         );
         if (!debugpyInfo) {
+          commandTelemetry.setResult('cancelled', 'selection');
           return;
         }
         vscode.window.showInformationMessage(
           `Bundled debugpy reinstalled from ${debugpyInfo.source}${debugpyInfo.version ? ` ${debugpyInfo.version}` : ''}.`
         );
       } catch (err) {
+        commandTelemetry.setResult('failed', 'setup');
         logError('[Reinstall] Failed', err);
         const msg = err instanceof Error ? err.message : String(err);
         vscode.window.showErrorMessage(`Reinstall failed: ${msg}`, 'Show Logs').then((c) => {
@@ -1742,11 +1823,13 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
   // Command: scoped cleanup for this workspace's saved runtime
   const cleanLsCmd = registerTelemetryCommand(
     'djangoProcessDebugger.cleanPythonLanguageServer',
-    async () => {
+    async (commandTelemetry) => {
+      commandTelemetry.setStage('preflight');
       log('Command: cleanThisWorkspace');
       const activeSessions = hotReloadLeaseManager.getState().sessions;
       const liveClaims = [...claimedSessionsByPid.keys()].filter(isTargetProcessAlive);
       if (activeSessions.length > 0 || liveClaims.length > 0) {
+        commandTelemetry.setResult('blocked', 'preflight');
         await vscode.window.showWarningMessage(
           'Stop this workspace\'s Django Process Debugger sessions before cleaning its runtime.',
           { modal: true },
@@ -1765,6 +1848,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       };
       const preflight = await preflightCleanAll(scope);
       if (!preflight.safe) {
+        commandTelemetry.setResult('blocked', 'preflight');
         log(`[Clean] Safety preflight blocked cleanup: ${preflight.summary}`);
         for (const issue of preflight.issues) {
           log(`[Clean] ${issue.code}: ${issue.target} — ${issue.message}`);
@@ -1789,15 +1873,18 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         'No Python process will be stopped. Other runtimes, language-server caches, '
           + 'Python signatures, and shared debugpy storage will not be touched.',
       ].join('\n');
+      commandTelemetry.setStage('confirmation');
       const confirmed = await vscode.window.showWarningMessage(
         'Clean Django Process Debugger support for this workspace?',
         { modal: true, detail },
         'Clean This Workspace',
       );
       if (confirmed !== 'Clean This Workspace') {
+        commandTelemetry.setResult('cancelled', 'confirmation');
         return;
       }
 
+      commandTelemetry.setStage('execution');
       const result = await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
@@ -1815,6 +1902,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       }
 
       if (!result.ok) {
+        commandTelemetry.setResult('failed', 'execution');
         const choice = await vscode.window.showErrorMessage(
           `Workspace cleanup was incomplete: ${result.summary}`,
           'Show Logs',
@@ -1912,9 +2000,9 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
     }
   }
 
-  async function verifyMcpFolder(folder: vscode.WorkspaceFolder): Promise<void> {
+  async function verifyMcpFolder(folder: vscode.WorkspaceFolder): Promise<boolean> {
     if (!requireTrustedMcpWorkspace()) {
-      return;
+      return false;
     }
     let diagnostics: McpWorkspaceDiagnostics | undefined;
     try {
@@ -1929,7 +2017,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         );
         if (choice === 'Repair MCP') {
           if (!await installOrRepairMcpFolder(folder, 'repaired')) {
-            return;
+            return false;
           }
           diagnostics = await diagnoseMcpFolder(folder);
           if (!diagnostics.installed || diagnostics.repairNeeded) {
@@ -1937,9 +2025,9 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
           }
         } else if (choice === 'Show Logs') {
           getLogger().show();
-          return;
+          return false;
         } else {
-          return;
+          return false;
         }
       }
       const verified = await verifyMcpWorkspace({
@@ -1956,6 +2044,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       if (choice === 'Show Logs') {
         getLogger().show();
       }
+      return true;
     } catch (error) {
       logError('[MCP Verify] End-to-end verification failed', error);
       const message = error instanceof Error ? error.message : String(error);
@@ -1973,45 +2062,64 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       } else if (choice === 'Show Logs') {
         getLogger().show();
       }
+      return false;
     }
   }
 
   const installMcpCmd = registerTelemetryCommand(
     'djangoProcessDebugger.installMcp',
-    async () => {
+    async (commandTelemetry) => {
+      commandTelemetry.setStage('selection');
       const folder = await selectMcpWorkspaceFolder(
         'Select the project root where Claude/Codex MCP configuration should be installed',
       );
-      if (folder) {
-        await installOrRepairMcpFolder(folder, 'installed');
+      if (!folder) {
+        commandTelemetry.setResult('cancelled', 'selection');
+        return;
       }
+      commandTelemetry.setStage('execution');
+      const installed = await installOrRepairMcpFolder(folder, 'installed');
+      commandTelemetry.setResult(installed ? 'succeeded' : 'failed', 'execution');
     },
   );
   const repairMcpCmd = registerTelemetryCommand(
     'djangoProcessDebugger.repairMcp',
-    async () => {
+    async (commandTelemetry) => {
+      commandTelemetry.setStage('selection');
       const folder = await selectMcpWorkspaceFolder('Select the MCP project to repair');
-      if (folder) {
-        await installOrRepairMcpFolder(folder, 'repaired');
+      if (!folder) {
+        commandTelemetry.setResult('cancelled', 'selection');
+        return;
       }
+      commandTelemetry.setStage('execution');
+      const repaired = await installOrRepairMcpFolder(folder, 'repaired');
+      commandTelemetry.setResult(repaired ? 'succeeded' : 'failed', 'execution');
     },
   );
   const verifyMcpCmd = registerTelemetryCommand(
     'djangoProcessDebugger.verifyMcp',
-    async () => {
+    async (commandTelemetry) => {
+      commandTelemetry.setStage('selection');
       const folder = await selectMcpWorkspaceFolder('Select the MCP project to verify');
-      if (folder) {
-        await verifyMcpFolder(folder);
+      if (!folder) {
+        commandTelemetry.setResult('cancelled', 'selection');
+        return;
       }
+      commandTelemetry.setStage('verification');
+      const verified = await verifyMcpFolder(folder);
+      commandTelemetry.setResult(verified ? 'succeeded' : 'failed', 'verification');
     },
   );
   const mcpStatusCmd = registerTelemetryCommand(
     'djangoProcessDebugger.showMcpStatus',
-    async () => {
+    async (commandTelemetry) => {
+      commandTelemetry.setStage('selection');
       const folder = await selectMcpWorkspaceFolder('Select the MCP project to inspect');
       if (!folder) {
+        commandTelemetry.setResult('cancelled', 'selection');
         return;
       }
+      commandTelemetry.setStage('verification');
       try {
         const result = await diagnoseMcpFolder(folder);
         const issueCodes = result.issues.slice(0, 3).map((issue) => issue.code).join(', ');
@@ -2030,6 +2138,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
           getLogger().show();
         }
       } catch (error) {
+        commandTelemetry.setResult('failed', 'verification');
         logError('[MCP Status] Diagnostics failed', error);
         const message = error instanceof Error ? error.message : String(error);
         void vscode.window.showErrorMessage(`Could not inspect Django debugger MCP: ${message}`);
@@ -2286,6 +2395,8 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
       batch.inFlightFiles.add(filePath);
     }
     const signal = batch.abortController.signal;
+    const telemetryStartedAt = Date.now();
+    let telemetryOutcome: HotReloadOutcome = 'cancelled';
     log('[HotReload] Requesting reload for PID=' + pid + ': ' + files.join(', '));
     hotReloadStatusItem.text = '$(sync~spin) Reloading PID ' + pid + '...';
 
@@ -2345,6 +2456,13 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         const ok = results.filter((result) => result.startsWith('OK:'));
         const errors = results.filter((result) => result.startsWith('ERR:'));
         const skipped = results.filter((result) => result.startsWith('SKIP:'));
+        telemetryOutcome = errors.length > 0 && ok.length > 0
+          ? 'partial'
+          : errors.length > 0
+            ? 'failed'
+            : ok.length > 0
+              ? 'succeeded'
+              : 'skipped';
         if (ok.length > 0) {
           const modules = ok.map((result) => result.replace('OK:', ''));
           void vscode.window.showInformationMessage(
@@ -2364,13 +2482,20 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
           + ok.length + ' OK, ' + errors.length + ' ERR, '
           + skipped.length + ' SKIP');
       } else {
+        telemetryOutcome = 'timedOut';
         log('[HotReload] No result for ' + requestId + ' after extended wait');
       }
     } catch (error) {
+      telemetryOutcome = signal.aborted ? 'cancelled' : 'failed';
       if (!signal.aborted) {
         logError('[HotReload] Failed to reload PID=' + pid, error);
       }
     } finally {
+      telemetry.sendHotReloadCompleted({
+        outcome: telemetryOutcome,
+        fileCount: files.length,
+        durationMs: Date.now() - telemetryStartedAt,
+      });
       batch.inFlightFiles.clear();
       if (isCurrentHotReloadBatch(batch, generation)) {
         updateHotReloadStatus();
@@ -2474,6 +2599,7 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         const debuggerConfiguration = vscode.workspace.getConfiguration('djangoProcessDebugger');
         telemetry.sendDebugSessionStarted(session.id, {
           engine,
+          source: telemetrySourceFromSession(session),
           hotReloadEnabled: supportsHotReload(engine) && hotReloadLeaseManager.getState().enabled,
           justMyCode: typeof session.configuration.justMyCode === 'boolean'
             ? session.configuration.justMyCode
@@ -2599,6 +2725,34 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
     }),
   );
 
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      const configuration = vscode.workspace.getConfiguration('djangoProcessDebugger');
+      if (event.affectsConfiguration('djangoProcessDebugger.engine')) {
+        telemetry.sendConfigurationChanged(
+          'engine',
+          normalizeDebugEngine(configuration.get<unknown>('engine', DEFAULT_DEBUG_ENGINE)),
+        );
+      }
+      for (const setting of [
+        'justMyCode',
+        'redirectOutput',
+        'hotReload',
+        'mcp.enabled',
+        'mcp.allowControl',
+        'mcp.allowEvaluate',
+      ] as const) {
+        if (event.affectsConfiguration(`djangoProcessDebugger.${setting}`)) {
+          const defaultValue = setting === 'mcp.allowEvaluate' ? false : true;
+          telemetry.sendConfigurationChanged(
+            setting,
+            configuration.get<boolean>(setting, defaultValue) ? 'true' : 'false',
+          );
+        }
+      }
+    }),
+  );
+
   const mcpControlTools = new Set([
     'django_session_start',
     'django_breakpoints_update',
@@ -2608,41 +2762,56 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
   const mcpBackend: McpTransportBackend = {
     ...controllerBackend,
     async callTool(name, args, requestContext) {
-      const evaluateAllowed = vscode.workspace
-        .getConfiguration('djangoProcessDebugger')
-        .get<boolean>('mcp.allowEvaluate', false);
-      if (mcpToolRequiresEvaluatePermission(name, args) && !evaluateAllowed) {
-        const result = {
-          ok: false,
-          error: {
-            code: 'POLICY_DISABLED',
-            message: 'MCP expression evaluation is disabled by djangoProcessDebugger.mcp.allowEvaluate.',
-          },
-        };
-        return {
-          structuredContent: result,
-          text: JSON.stringify(result),
-          isError: true,
-        };
+      const startedAt = Date.now();
+      let outcome: Exclude<TelemetryOutcome, 'noAction'> = 'succeeded';
+      try {
+        const evaluateAllowed = vscode.workspace
+          .getConfiguration('djangoProcessDebugger')
+          .get<boolean>('mcp.allowEvaluate', false);
+        if (mcpToolRequiresEvaluatePermission(name, args) && !evaluateAllowed) {
+          outcome = 'blocked';
+          const result = {
+            ok: false,
+            error: {
+              code: 'POLICY_DISABLED',
+              message: 'MCP expression evaluation is disabled by djangoProcessDebugger.mcp.allowEvaluate.',
+            },
+          };
+          return {
+            structuredContent: result,
+            text: JSON.stringify(result),
+            isError: true,
+          };
+        }
+        const controlAllowed = vscode.workspace
+          .getConfiguration('djangoProcessDebugger')
+          .get<boolean>('mcp.allowControl', true);
+        if (mcpControlTools.has(name) && !controlAllowed) {
+          outcome = 'blocked';
+          const result = {
+            ok: false,
+            error: {
+              code: 'POLICY_DISABLED',
+              message: 'MCP debugger control is disabled by djangoProcessDebugger.mcp.allowControl.',
+            },
+          };
+          return {
+            structuredContent: result,
+            text: JSON.stringify(result),
+            isError: true,
+          };
+        }
+        const result = await controllerBackend.callTool(name, args, requestContext);
+        outcome = requestContext.signal.aborted
+          ? 'cancelled'
+          : result.isError ? 'failed' : 'succeeded';
+        return result;
+      } catch (error) {
+        outcome = requestContext.signal.aborted ? 'cancelled' : 'failed';
+        throw error;
+      } finally {
+        telemetry.sendMcpToolCompleted(name, outcome, Date.now() - startedAt);
       }
-      const controlAllowed = vscode.workspace
-        .getConfiguration('djangoProcessDebugger')
-        .get<boolean>('mcp.allowControl', true);
-      if (mcpControlTools.has(name) && !controlAllowed) {
-        const result = {
-          ok: false,
-          error: {
-            code: 'POLICY_DISABLED',
-            message: 'MCP debugger control is disabled by djangoProcessDebugger.mcp.allowControl.',
-          },
-        };
-        return {
-          structuredContent: result,
-          text: JSON.stringify(result),
-          isError: true,
-        };
-      }
-      return controllerBackend.callTool(name, args, requestContext);
     },
   };
 

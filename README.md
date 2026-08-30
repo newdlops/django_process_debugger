@@ -234,13 +234,11 @@ You can select **any** process in the tree — the extension walks down to the d
 
 Release builds can use the official [`@vscode/extension-telemetry`](https://github.com/microsoft/vscode-extension-telemetry) package to send a deliberately small set of usage events to the publisher's Application Insights resource. The reporter follows VS Code's global telemetry level automatically; set `telemetry.telemetryLevel` to `off` to disable transmission.
 
-The extension records successful activation with coarse feature settings, invocation of one of its fixed command identifiers, and Django debugger session start/termination with the selected engine, boolean debugger options, and elapsed duration. The telemetry package also supplies common product metadata such as the extension and VS Code versions, OS/architecture, a VS Code session identifier, and VS Code's pseudonymous machine identifier.
+The extension records successful activation with coarse feature settings; fixed command invocation, outcome, funnel stage, and duration; allowlisted setting changes; aggregate MCP tool outcomes and duration; aggregate hot-reload outcomes, batch size, and duration; and Django debugger session start/termination with its entry point, selected engine, boolean debugger options, and elapsed duration. The telemetry package also supplies common product metadata such as the extension and VS Code versions, OS/architecture, a VS Code session identifier, and VS Code's pseudonymous machine identifier.
 
-It does **not** send workspace names or paths, process IDs or ports, process command lines, Python/Django application data, source or breakpoint contents, evaluated expressions, debug values, error messages, or stack traces. The complete machine-readable event classification is in [`telemetry.json`](./telemetry.json).
+It does **not** send workspace names or paths, process IDs or ports, process command lines, MCP arguments/results/references or client identifiers, file or module names from hot reload, Python/Django application data, source or breakpoint contents, evaluated expressions, debug values, error messages, or stack traces. Unknown MCP tool names are normalized to the fixed value `unknown`. The complete machine-readable event classification is in [`telemetry.json`](./telemetry.json).
 
 Telemetry remains disabled when no publisher connection string is configured. A release manifest may provide it as `telemetry.connectionString`; local extension-host and CI runs may instead set `DJANGO_PROCESS_DEBUGGER_TELEMETRY_CONNECTION_STRING`. Application Insights connection strings identify the destination and are [not treated as secrets by the telemetry package](https://github.com/microsoft/vscode-extension-telemetry#setup).
-
-Publisher-side Application Insights diagnostics and usage queries are collected in [`TELEMETRY_QUERIES.md`](./TELEMETRY_QUERIES.md).
 
 ## Troubleshooting
 

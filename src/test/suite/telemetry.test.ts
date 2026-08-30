@@ -54,7 +54,7 @@ describe('Extension telemetry', function () {
   it('sends only the declared categorical properties and measurements', function () {
     const reporter = new FakeTelemetryReporter();
     let now = 1_000;
-    const telemetry = new ExtensionTelemetry(reporter, () => now);
+    const telemetry = new ExtensionTelemetry(reporter, { now: () => now });
 
     telemetry.sendExtensionActivated({
       engine: 'debugpy',
@@ -64,8 +64,22 @@ describe('Extension telemetry', function () {
       workspaceFolderCount: 2,
     });
     telemetry.sendCommandInvoked('djangoProcessDebugger.attachToProcess');
+    telemetry.sendCommandCompleted(
+      'djangoProcessDebugger.attachToProcess',
+      'succeeded',
+      'sessionStart',
+      125,
+    );
+    telemetry.sendConfigurationChanged('hotReload', 'false');
+    telemetry.sendMcpToolCompleted('django_state_snapshot', 'succeeded', 42);
+    telemetry.sendHotReloadCompleted({
+      outcome: 'partial',
+      fileCount: 3,
+      durationMs: 600,
+    });
     telemetry.sendDebugSessionStarted('private-session-id', {
       engine: 'experimental',
+      source: 'command',
       hotReloadEnabled: true,
       justMyCode: false,
       redirectOutput: false,
@@ -90,9 +104,34 @@ describe('Extension telemetry', function () {
         measurements: undefined,
       },
       {
+        eventName: 'commandCompleted',
+        properties: {
+          command: 'djangoProcessDebugger.attachToProcess',
+          outcome: 'succeeded',
+          stage: 'sessionStart',
+        },
+        measurements: { durationMs: 125 },
+      },
+      {
+        eventName: 'configurationChanged',
+        properties: { setting: 'hotReload', value: 'false' },
+        measurements: undefined,
+      },
+      {
+        eventName: 'mcpToolCompleted',
+        properties: { tool: 'django_state_snapshot', outcome: 'succeeded' },
+        measurements: { durationMs: 42 },
+      },
+      {
+        eventName: 'hotReloadCompleted',
+        properties: { outcome: 'partial' },
+        measurements: { fileCount: 3, durationMs: 600 },
+      },
+      {
         eventName: 'debugSessionStarted',
         properties: {
           engine: 'experimental',
+          source: 'command',
           hotReloadEnabled: 'true',
           justMyCode: 'false',
           redirectOutput: 'false',
@@ -101,7 +140,7 @@ describe('Extension telemetry', function () {
       },
       {
         eventName: 'debugSessionTerminated',
-        properties: { engine: 'experimental' },
+        properties: { engine: 'experimental', source: 'command' },
         measurements: { durationMs: 2_750 },
       },
     ]);

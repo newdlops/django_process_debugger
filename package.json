@@ -2,7 +2,7 @@
   "name": "django-process-debugger",
   "displayName": "Django Process Debugger",
   "description": "Attach debugpy to a running Django/Celery process for runtime debugging without modifying your codebase",
-  "version": "0.2.917",
+  "version": "0.2.918",
   "publisher": "newdlops",
   "telemetry": {
     "connectionString": "InstrumentationKey=8d0ee22b-dc6c-48e6-b768-9d170188370a;IngestionEndpoint=https://koreacentral-0.in.applicationinsights.azure.com/;LiveEndpoint=https://koreacentral.livediagnostics.monitor.azure.com/;ApplicationId=4a2bf58b-d308-4e25-aaa9-8992843ef0a9"
@@ -194,6 +194,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
+    "benchmark:telemetry": "npm run compile && node --expose-gc ./out/test/benchmarks/telemetryDurabilityBenchmark.js",
     "pretest": "npm run compile",
     "test": "node ./out/test/runTest.js"
   },
@@ -204,7 +205,7 @@
     "@types/vscode": "^1.85.0",
     "@typescript-eslint/eslint-plugin": "^6.0.0",
     "@typescript-eslint/parser": "^6.0.0",
-    "@vscode/test-electron": "^2.5.2",
+    "@vscode/test-electron": "^3.1.0",
     "eslint": "^8.0.0",
     "glob": "^10.5.0",
     "mocha": "^10.8.2",

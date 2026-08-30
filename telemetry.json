@@ -98,6 +98,86 @@
         "comment": "One of the command identifiers declared by this extension."
       }
     },
+    "commandCompleted": {
+      "owner": "newdlops",
+      "comment": "Reports the categorical result, final funnel stage, and elapsed time of a fixed extension command without error text or user data.",
+      "command": {
+        "classification": "PublicNonPersonalData",
+        "purpose": "FeatureInsight",
+        "comment": "One of the command identifiers declared by this extension."
+      },
+      "outcome": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "A fixed outcome: succeeded, cancelled, blocked, failed, or noAction."
+      },
+      "stage": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "The fixed command funnel stage reached before completion."
+      },
+      "durationMs": {
+        "classification": "SystemMetaData",
+        "purpose": "PerformanceAndHealth",
+        "comment": "Elapsed command duration in milliseconds.",
+        "isMeasurement": true
+      }
+    },
+    "configurationChanged": {
+      "owner": "newdlops",
+      "comment": "Reports changes to the extension's fixed categorical and boolean feature settings.",
+      "setting": {
+        "classification": "PublicNonPersonalData",
+        "purpose": "FeatureInsight",
+        "comment": "One of the extension settings explicitly allowlisted for telemetry."
+      },
+      "value": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "A fixed boolean string or debug engine identifier."
+      }
+    },
+    "mcpToolCompleted": {
+      "owner": "newdlops",
+      "comment": "Reports aggregate usage and reliability of an allowlisted Django debugger MCP tool without arguments, results, references, or client identifiers.",
+      "tool": {
+        "classification": "PublicNonPersonalData",
+        "purpose": "FeatureInsight",
+        "comment": "One of the fixed MCP tool identifiers, or unknown after allowlist normalization."
+      },
+      "outcome": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "A fixed outcome: succeeded, cancelled, blocked, or failed."
+      },
+      "durationMs": {
+        "classification": "SystemMetaData",
+        "purpose": "PerformanceAndHealth",
+        "comment": "Elapsed MCP tool duration in milliseconds.",
+        "isMeasurement": true
+      }
+    },
+    "hotReloadCompleted": {
+      "owner": "newdlops",
+      "comment": "Reports aggregate hot-reload outcomes without file names, module names, paths, process identifiers, or error text.",
+      "outcome": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "A fixed outcome: succeeded, partial, failed, skipped, timedOut, or cancelled."
+      },
+      "fileCount": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "Number of files in the reload batch.",
+        "isMeasurement": true
+      },
+      "durationMs": {
+        "classification": "SystemMetaData",
+        "purpose": "PerformanceAndHealth",
+        "comment": "Elapsed hot-reload batch duration in milliseconds.",
+        "isMeasurement": true
+      }
+    },
     "debugSessionStarted": {
       "owner": "newdlops",
       "comment": "Reports the categorical options of a Django Process Debugger session when VS Code starts it.",
@@ -105,6 +185,11 @@
         "classification": "SystemMetaData",
         "purpose": "FeatureInsight",
         "comment": "The session debug engine: debugpy or experimental."
+      },
+      "source": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "The fixed session entry point: command, mcp, or launchConfiguration."
       },
       "hotReloadEnabled": {
         "classification": "SystemMetaData",
@@ -129,6 +214,11 @@
         "classification": "SystemMetaData",
         "purpose": "FeatureInsight",
         "comment": "The session debug engine: debugpy or experimental."
+      },
+      "source": {
+        "classification": "SystemMetaData",
+        "purpose": "FeatureInsight",
+        "comment": "The fixed session entry point retained from session start: command, mcp, or launchConfiguration."
       },
       "durationMs": {
         "classification": "SystemMetaData",
