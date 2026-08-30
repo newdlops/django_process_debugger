@@ -376,9 +376,6 @@ export function activate(context: vscode.ExtensionContext): DjangoProcessDebugge
         return await vscode.debug.startDebugging(folder, configuration);
       } catch (error) {
         logError('[MCP] VS Code startDebugging failed', error);
-        if (context.extensionMode === vscode.ExtensionMode.Test) {
-          console.error('[MCP test diagnostics] VS Code startDebugging failed:', error);
-        }
         throw error;
       }
     },

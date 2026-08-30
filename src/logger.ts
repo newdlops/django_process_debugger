@@ -2,6 +2,18 @@ import * as vscode from 'vscode';
 
 let outputChannel: vscode.OutputChannel | undefined;
 
+function echoTestDiagnostic(message: string, error?: unknown): void {
+  if (process.env.DPD_TEST_DIAGNOSTICS !== '1'
+    || !/^(?:ERROR: )?\[(?:DebugSession|DebugConfiguration|MCP)\]/.test(message)) {
+    return;
+  }
+  if (error === undefined) {
+    console.error(`[Django Process Debugger test] ${message}`);
+  } else {
+    console.error(`[Django Process Debugger test] ${message}`, error);
+  }
+}
+
 export function getLogger(): vscode.OutputChannel {
   if (!outputChannel) {
     outputChannel = vscode.window.createOutputChannel('Django Process Debugger');
@@ -12,6 +24,7 @@ export function getLogger(): vscode.OutputChannel {
 export function log(message: string): void {
   const timestamp = new Date().toISOString();
   getLogger().appendLine(`[${timestamp}] ${message}`);
+  echoTestDiagnostic(message);
 }
 
 export function logError(message: string, err?: unknown): void {
@@ -39,6 +52,7 @@ export function logError(message: string, err?: unknown): void {
   } else if (err !== undefined) {
     logger.appendLine(`  ${String(err)}`);
   }
+  echoTestDiagnostic(`ERROR: ${message}`, err);
 }
 
 export function showAndLog(message: string): void {
