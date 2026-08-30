@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { describe, it } from 'mocha';
 import * as vscode from 'vscode';
-import { DebugpyInjector } from '../../debugpyInjector';
+import { BOOTSTRAP_VERSION, DebugpyInjector } from '../../debugpyInjector';
 import {
   allocateLoopbackPort,
   createTempVenv,
@@ -87,6 +87,46 @@ function allSnapshotVariables(snapshot: Record<string, unknown>): Record<string,
   return records(snapshot.scopes).flatMap((scope) => records(scope.variables));
 }
 
+async function waitForBootstrapRuntimeState(pid: number, timeoutMs: number): Promise<void> {
+  const statePath = `/tmp/django-process-debugger/${pid}.bootstrap.json`;
+  const deadline = Date.now() + timeoutMs;
+  let lastState: unknown;
+  while (Date.now() < deadline) {
+    try {
+      lastState = JSON.parse(await fs.readFile(statePath, 'utf8')) as unknown;
+      if (isRecord(lastState)
+        && lastState.pid === pid
+        && lastState.version === BOOTSTRAP_VERSION
+        && lastState.activationVersion === 2
+        && typeof lastState.pythonExecutable === 'string'
+        && typeof lastState.runtimeId === 'string'
+        && /^[a-f0-9]{64}$/i.test(lastState.runtimeId)
+        && lastState.controlSocket === `/tmp/django-process-debugger/${pid}.control.sock`
+        && Array.isArray(lastState.engines)
+        && lastState.engines.includes('debugpy')) {
+        return;
+      }
+    } catch {
+      // The bootstrap publishes state atomically; wait for its current identity.
+    }
+    await sleep(25);
+  }
+
+  const bootstrapLog = await fs.readFile(
+    '/tmp/django-process-debugger/bootstrap.log',
+    'utf8',
+  ).catch(() => '(bootstrap log unavailable)');
+  const pidLog = bootstrapLog
+    .split(/\r?\n/)
+    .filter((line) => line.includes(`[PID ${pid}]`))
+    .slice(-20)
+    .join('\n');
+  throw new Error(
+    `Timed out waiting for bootstrap runtime state for PID ${pid}: `
+    + `${JSON.stringify(lastState)}\n${pidLog || '(no PID-specific bootstrap log)'}`,
+  );
+}
+
 describe('Feature: live MCP-to-Django debugger vertical flow', function () {
   it('drives stdio bridge → HTTP MCP → VS Code → debugpy through a real breakpoint', async function () {
     this.timeout(120_000);
@@ -157,7 +197,7 @@ describe('Feature: live MCP-to-Django debugger vertical flow', function () {
           DPD_MCP_E2E_SOURCE: sourcePath,
         },
       });
-      await sleep(250);
+      await waitForBootstrapRuntimeState(server.pid, 10_000);
 
       const manifest = await waitForWindowManifest({
         workspacePath,
